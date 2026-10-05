@@ -3,9 +3,9 @@
 # Builds the image on first use; caches cargo registry and target dir on the host.
 set -euo pipefail
 cd "$(dirname "$0")"
-IMAGE=photo-stamp-dev
+IMAGE=photo-stamp-dev:$(sha256sum docker/Dockerfile | cut -c1-12)
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  docker build -q -t "$IMAGE" docker >/dev/null
+  docker build -q -t "$IMAGE" -f docker/Dockerfile docker >/dev/null
 fi
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/photo-stamp-dev"
 mkdir -p "$CACHE/cargo"

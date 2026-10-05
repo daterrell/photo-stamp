@@ -1,22 +1,142 @@
-//! The per-photo pipeline: read EXIF, build the caption, draw it, write the JPEG back.
+//! The per-photo pipeline: read metadata, build the caption, draw it, write the result.
 
+use std::fmt;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use image::ImageFormat;
-use image::codecs::jpeg::JpegEncoder;
-use image::metadata::Orientation;
-use img_parts::jpeg::{Jpeg, JpegSegment, markers};
-use img_parts::{Bytes, ImageEXIF};
+use image::DynamicImage;
 
+use crate::formats::{self, Kind};
 use crate::geo::{Geocoder, format_coords};
-use crate::metadata::{PhotoInfo, parse_exif, reset_orientation};
-use crate::render::{self, Line};
+use crate::localtime;
+use crate::metadata::{self, PhotoInfo};
+use crate::render::{Line, Renderer};
 
-/// JPEG comment written into stamped files so re-running never stamps twice.
-pub const MARKER: &[u8] = b"photo-stamp: caption burned in";
-const EXIF_PREFIX: &[u8] = b"Exif\0\0";
+/// Why a photo was left alone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Skip {
+    Unsupported,
+    NoMetadata,
+    AlreadyStamped,
+}
+
+impl fmt::Display for Skip {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Skip::Unsupported => "not a supported photo format",
+            Skip::NoMetadata => "no date or location in its metadata",
+            Skip::AlreadyStamped => "already stamped",
+        })
+    }
+}
+
+/// A photo that will be stamped, and with what.
+#[derive(Debug)]
+pub struct Job {
+    pub kind: Kind,
+    pub info: PhotoInfo,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug)]
+pub enum Prepared {
+    Skip(Skip),
+    Stamp(Job),
+}
+
+/// The place lookup failed (e.g. no network). Callers that can wait may retry later rather
+/// than settle for coordinates.
+#[derive(Debug)]
+pub struct GeoUnavailable(pub anyhow::Error);
+
+impl fmt::Display for GeoUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "place lookup failed: {:#}", self.0)
+    }
+}
+
+impl std::error::Error for GeoUnavailable {}
+
+/// Place line (if GPS) then time line (if any), top line first.
+/// With `strict_geo`, a failed lookup is an error ([`GeoUnavailable`]) instead of coordinates.
+pub fn caption_lines(info: &PhotoInfo, geo: &dyn Geocoder, strict_geo: bool) -> anyhow::Result<Vec<String>> {
+    let place = match info.gps {
+        None => None,
+        Some(at) => Some(match geo.place_name(at) {
+            Ok(Some(name)) => name,
+            Ok(None) => format_coords(at),
+            Err(e) if strict_geo => return Err(GeoUnavailable(e).into()),
+            Err(e) => {
+                eprintln!("warning: place lookup failed, using coordinates: {e:#}");
+                format_coords(at)
+            }
+        }),
+    };
+    let tz = info.gps.and_then(localtime::timezone_at);
+    let time = localtime::caption(info, tz);
+    Ok(place.into_iter().chain(time).collect())
+}
+
+/// Work out whether and how `path` should be stamped. Never modifies anything.
+pub fn prepare(path: &Path, geo: &dyn Geocoder, strict_geo: bool) -> anyhow::Result<Prepared> {
+    let Some(kind) = formats::classify(path) else { return Ok(Prepared::Skip(Skip::Unsupported)) };
+    let info = metadata::read(path)?;
+    if info.already_stamped {
+        return Ok(Prepared::Skip(Skip::AlreadyStamped));
+    }
+    if info.is_empty() {
+        return Ok(Prepared::Skip(Skip::NoMetadata));
+    }
+    let lines = caption_lines(&info, geo, strict_geo)?;
+    if lines.is_empty() {
+        return Ok(Prepared::Skip(Skip::NoMetadata));
+    }
+    Ok(Prepared::Stamp(Job { kind, info, lines }))
+}
+
+/// Burn the job's caption into the pixels of `img`.
+pub fn draw_caption(img: DynamicImage, lines: &[String], renderer: &mut Renderer) -> DynamicImage {
+    let rel_sizes = [1.0, 0.8];
+    let lines: Vec<Line> =
+        lines.iter().zip(rel_sizes).map(|(text, rel_size)| Line { text, rel_size }).collect();
+    if img.color().has_alpha() {
+        let mut rgba = img.into_rgba8();
+        renderer.stamp(&mut rgba, &lines);
+        DynamicImage::ImageRgba8(rgba)
+    } else {
+        let mut rgb = img.into_rgb8();
+        renderer.stamp(&mut rgb, &lines);
+        DynamicImage::ImageRgb8(rgb)
+    }
+}
+
+/// Write a stamped copy of `src` to `dest` (atomically via a temp file next to `dest`),
+/// carrying over its metadata.
+pub fn write_stamped(
+    src: &Path,
+    job: &Job,
+    renderer: &mut Renderer,
+    dest: &Path,
+    quality: u8,
+) -> anyhow::Result<()> {
+    let img = formats::decode(src, job.kind, job.info.orientation)?;
+    let img = draw_caption(img, &job.lines, renderer);
+
+    // Keep the real extension last: exiftool picks the file format from it.
+    let dest_name = dest.file_name().context("destination has no file name")?.to_string_lossy();
+    let tmp = dest.with_file_name(format!(".photo-stamp-{}-{dest_name}", std::process::id()));
+    let result = (|| {
+        formats::encode(&img, job.kind, &tmp, quality)?;
+        metadata::copy_to_stamped(src, &tmp, img.width(), img.height())?;
+        std::fs::rename(&tmp, dest)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -26,237 +146,221 @@ pub struct Options {
 
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
-    /// Caption burned in (or would be, on a dry run).
-    Stamped(Vec<String>),
-    NotJpeg,
-    NoExif,
-    /// EXIF present but no date or location in it.
-    NothingToStamp,
-    AlreadyStamped,
+    /// Caption burned in (or would be, on a dry run), written to the given path.
+    Stamped {
+        lines: Vec<String>,
+        dest: PathBuf,
+    },
+    Skipped(Skip),
 }
 
-/// "Wed 12 Jun 2024, 14:32" and/or a place name, top line first.
-pub fn caption_lines(info: &PhotoInfo, geo: &dyn Geocoder) -> Vec<String> {
-    let place = info.gps.map(|at| match geo.place_name(at) {
-        Ok(Some(name)) => name,
-        Ok(None) => format_coords(at),
-        Err(e) => {
-            eprintln!("warning: place lookup failed, using coordinates: {e:#}");
-            format_coords(at)
-        }
-    });
-    let date = info.taken.map(|t| t.format("%a %-d %b %Y, %H:%M").to_string());
-    place.into_iter().chain(date).collect()
-}
-
-/// Process an in-memory JPEG. Returns the outcome and, when stamped (not dry run), the new file bytes.
-pub fn process_bytes(
-    data: &[u8],
+/// Stamp a file in place, keeping permissions and modification time. RAW files are never
+/// modified; their stamped JPEG goes alongside ("IMG_1.CR3" → "IMG_1.CR3.jpg").
+pub fn stamp_in_place(
+    path: &Path,
     geo: &dyn Geocoder,
+    renderer: &mut Renderer,
     opts: Options,
-) -> anyhow::Result<(Outcome, Option<Vec<u8>>)> {
-    let Ok(original) = Jpeg::from_bytes(Bytes::copy_from_slice(data)) else {
-        return Ok((Outcome::NotJpeg, None));
+) -> anyhow::Result<Outcome> {
+    let job = match prepare(path, geo, false)? {
+        Prepared::Skip(s) => return Ok(Outcome::Skipped(s)),
+        Prepared::Stamp(job) => job,
     };
-    if original.segments().iter().any(|s| s.marker() == markers::COM && s.contents().starts_with(MARKER)) {
-        return Ok((Outcome::AlreadyStamped, None));
+    let dest = path.with_file_name(formats::output_name(path, job.kind));
+    if job.kind == Kind::Raw && dest.exists() {
+        return Ok(Outcome::Skipped(Skip::AlreadyStamped));
     }
-    let Some(exif) = original.exif() else { return Ok((Outcome::NoExif, None)) };
-    let info = match parse_exif(&exif) {
-        Ok(info) if !info.is_empty() => info,
-        _ => return Ok((Outcome::NothingToStamp, None)),
-    };
-
-    let lines = caption_lines(&info, geo);
-    if opts.dry_run {
-        return Ok((Outcome::Stamped(lines), None));
-    }
-
-    // Rotate pixels upright first so the caption sits at the bottom-left as the viewer sees it.
-    let mut img = image::load_from_memory_with_format(data, ImageFormat::Jpeg).context("decoding JPEG")?;
-    if let Some(o) = Orientation::from_exif(info.orientation) {
-        img.apply_orientation(o);
-    }
-    let mut rgb = img.into_rgb8();
-
-    let font = render::font();
-    let rel_sizes = [1.0, 0.8];
-    let render_lines: Vec<Line> =
-        lines.iter().zip(rel_sizes).map(|(text, rel_size)| Line { text, rel_size }).collect();
-    render::stamp(&mut rgb, &render_lines, &font);
-
-    let mut encoded = Vec::new();
-    JpegEncoder::new_with_quality(&mut encoded, opts.quality).encode_image(&rgb).context("encoding JPEG")?;
-
-    let out = carry_over_metadata(&original, Bytes::from(encoded))?;
-    Ok((Outcome::Stamped(lines), Some(out)))
-}
-
-/// Copy the original's APP1–APP15 segments (EXIF, XMP, ICC profile, IPTC…) into the freshly
-/// encoded JPEG, with EXIF orientation reset since the pixels are now upright, then add our marker.
-fn carry_over_metadata(original: &Jpeg, encoded: Bytes) -> anyhow::Result<Vec<u8>> {
-    let mut out = Jpeg::from_bytes(encoded).context("re-reading encoded JPEG")?;
-    let is_app_n = |s: &JpegSegment| (markers::APP1..=markers::APP15).contains(&s.marker());
-
-    let mut carried: Vec<JpegSegment> = original
-        .segments()
-        .iter()
-        .filter(|s| is_app_n(s))
-        .map(|s| {
-            if s.marker() == markers::APP1 && s.contents().starts_with(EXIF_PREFIX) {
-                let mut contents = s.contents().to_vec();
-                reset_orientation(&mut contents[EXIF_PREFIX.len()..]);
-                JpegSegment::new_with_contents(markers::APP1, contents.into())
-            } else {
-                s.clone()
-            }
-        })
-        .collect();
-    carried.push(JpegSegment::new_with_contents(markers::COM, Bytes::from_static(MARKER)));
-
-    let segments = out.segments_mut();
-    segments.retain(|s| !is_app_n(s));
-    let insert_at = segments.iter().position(|s| s.marker() != markers::APP0).unwrap_or(segments.len());
-    segments.splice(insert_at..insert_at, carried);
-
-    let mut buf = Vec::new();
-    out.encoder().write_to(&mut buf)?;
-    Ok(buf)
-}
-
-/// Process a file on disk, overwriting it in place (atomically, keeping permissions and mtime).
-pub fn process_file(path: &Path, geo: &dyn Geocoder, opts: Options) -> anyhow::Result<Outcome> {
-    let data = std::fs::read(path)?;
-    let (outcome, new_bytes) = process_bytes(&data, geo, opts)?;
-    let Some(new_bytes) = new_bytes else { return Ok(outcome) };
-
-    let meta = std::fs::metadata(path)?;
-    let file_name = path.file_name().context("path has no file name")?.to_string_lossy();
-    let tmp = path.with_file_name(format!(".{file_name}.photo-stamp.tmp"));
-    let write = || -> anyhow::Result<()> {
-        std::fs::write(&tmp, &new_bytes)?;
-        std::fs::set_permissions(&tmp, meta.permissions())?;
+    if !opts.dry_run {
+        let meta = std::fs::metadata(path)?;
+        write_stamped(path, &job, renderer, &dest, opts.quality)?;
+        std::fs::set_permissions(&dest, meta.permissions())?;
         if let Ok(mtime) = meta.modified() {
-            File::options().write(true).open(&tmp)?.set_modified(mtime)?;
+            File::options().write(true).open(&dest)?.set_modified(mtime)?;
         }
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    };
-    if let Err(e) = write() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
     }
-    Ok(outcome)
+    Ok(Outcome::Stamped { lines: job.lines, dest })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::geo::NoGeocoder;
     use crate::metadata::GpsPoint;
-    use crate::metadata::tests::{build_exif, eiffel_fields};
-    use image::{Rgb, RgbImage};
+    use image::{ImageFormat, Rgb, RgbImage};
+    use std::process::Command;
 
-    struct FixedPlace;
+    pub struct FixedPlace;
     impl Geocoder for FixedPlace {
         fn place_name(&self, _: GpsPoint) -> anyhow::Result<Option<String>> {
-            Ok(Some("Eiffel Tower, Paris".into()))
+            Ok(Some("Eiffel Tower (Tour Eiffel), Paris".into()))
         }
     }
 
-    struct FailingGeocoder;
+    pub struct FailingGeocoder;
     impl Geocoder for FailingGeocoder {
         fn place_name(&self, _: GpsPoint) -> anyhow::Result<Option<String>> {
             anyhow::bail!("network down")
         }
     }
 
-    const OPTS: Options = Options { dry_run: false, quality: 90 };
+    pub fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("photo-stamp-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
-    /// A 200x120 gradient JPEG, optionally carrying an EXIF block.
-    fn jpeg(exif: Option<Vec<u8>>) -> Vec<u8> {
-        let img = RgbImage::from_fn(200, 120, |x, y| Rgb([x as u8, y as u8, 128]));
-        let mut buf = Vec::new();
-        JpegEncoder::new_with_quality(&mut buf, 90).encode_image(&img).unwrap();
-        let mut j = Jpeg::from_bytes(buf.into()).unwrap();
-        j.set_exif(exif.map(Into::into));
-        let mut out = Vec::new();
-        j.encoder().write_to(&mut out).unwrap();
-        out
+    pub const EIFFEL_TAGS: &[&str] = &[
+        "-DateTimeOriginal=2024:06:12 14:32:05",
+        "-OffsetTimeOriginal=+02:00",
+        "-GPSLatitude=48.8584",
+        "-GPSLatitudeRef=N",
+        "-GPSLongitude=2.2945",
+        "-GPSLongitudeRef=E",
+        "-Orientation#=6",
+    ];
+
+    /// Write a 200x120 gradient photo in the format given by `path`'s extension, tagged with exiftool.
+    pub fn make_photo(path: &Path, tags: &[&str]) {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_fn(200, 120, |x, y| Rgb([x as u8, y as u8, 128])));
+        let kind = formats::classify(path).unwrap();
+        formats::encode(&img, kind, path, 90).unwrap();
+        if !tags.is_empty() {
+            let out = Command::new("exiftool")
+                .args(["-q", "-overwrite_original"])
+                .args(tags)
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+
+    fn exif_tag(path: &Path, tag: &str) -> String {
+        let out = Command::new("exiftool").args(["-s3", "-n", tag]).arg(path).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
     }
 
     #[test]
-    fn stamps_rotates_and_preserves_exif() {
-        let input = jpeg(Some(build_exif(&eiffel_fields(), false)));
-        let (outcome, out) = process_bytes(&input, &FixedPlace, OPTS).unwrap();
-        assert_eq!(
-            outcome,
-            Outcome::Stamped(vec!["Eiffel Tower, Paris".into(), "Wed 12 Jun 2024, 14:32".into()])
+    fn stamps_every_writable_format_in_place() {
+        let dir = temp_dir("formats");
+        let mut renderer = Renderer::new();
+        let opts = Options { dry_run: false, quality: 90 };
+        let mut exts = vec!["jpg", "png", "webp", "tif"];
+        if cfg!(feature = "heif") {
+            exts.push("heic");
+        }
+        for ext in exts {
+            let path = dir.join(format!("photo.{ext}"));
+            make_photo(&path, EIFFEL_TAGS);
+            let before = std::fs::read(&path).unwrap();
+
+            let outcome = stamp_in_place(&path, &FixedPlace, &mut renderer, opts).unwrap();
+            assert_eq!(
+                outcome,
+                Outcome::Stamped {
+                    lines: vec![
+                        "Eiffel Tower (Tour Eiffel), Paris".into(),
+                        "Wed 12 Jun 2024, 14:32 CEST".into()
+                    ],
+                    dest: path.clone(),
+                },
+                "{ext}"
+            );
+            assert_ne!(std::fs::read(&path).unwrap(), before, "{ext}: file unchanged");
+
+            // Orientation 6 = rotate 90° to view: pixels are now upright and tagged as such.
+            let info = metadata::read(&path).unwrap();
+            assert_eq!(info.orientation, 1, "{ext}");
+            assert!(info.already_stamped, "{ext}: marker missing");
+            assert!(info.taken.is_some() && info.gps.is_some(), "{ext}: metadata lost");
+            // HEIF rotation lives in the container (irot), which libheif applies; per the HEIF
+            // spec the EXIF Orientation tag is ignored there.
+            let expected_size = if ext == "heic" { "200 120" } else { "120 200" };
+            assert_eq!(exif_tag(&path, "-ImageSize"), expected_size, "{ext}: wrong rotation");
+
+            // Running again is a no-op.
+            let again = stamp_in_place(&path, &FixedPlace, &mut renderer, opts).unwrap();
+            assert_eq!(again, Outcome::Skipped(Skip::AlreadyStamped), "{ext}");
+        }
+        assert!(
+            std::fs::read_dir(&dir).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with('.')),
+            "temp file left behind"
         );
-        let out = out.unwrap();
-
-        // Orientation 6 means "rotate 90° CW to view": pixels are now upright and tagged as such.
-        let img = image::load_from_memory(&out).unwrap();
-        assert_eq!((img.width(), img.height()), (120, 200));
-        let parsed = Jpeg::from_bytes(out.clone().into()).unwrap();
-        let info = parse_exif(&parsed.exif().unwrap()).unwrap();
-        assert_eq!(info.orientation, 1);
-        assert!(info.taken.is_some() && info.gps.is_some());
-
-        // Running again is a no-op.
-        assert_eq!(process_bytes(&out, &FixedPlace, OPTS).unwrap(), (Outcome::AlreadyStamped, None));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn no_exif_means_untouched() {
-        assert_eq!(process_bytes(&jpeg(None), &FixedPlace, OPTS).unwrap(), (Outcome::NoExif, None));
-    }
+    fn untouched_without_metadata() {
+        let dir = temp_dir("nometa");
+        let mut renderer = Renderer::new();
+        let opts = Options { dry_run: false, quality: 90 };
 
-    #[test]
-    fn exif_without_date_or_place_means_untouched() {
-        use crate::metadata::tests::{ascii, field};
-        let exif = build_exif(&[field(exif::Tag::Make, ascii("Acme"))], false);
-        let result = process_bytes(&jpeg(Some(exif)), &FixedPlace, OPTS).unwrap();
-        assert_eq!(result, (Outcome::NothingToStamp, None));
-    }
+        let bare = dir.join("bare.jpg");
+        make_photo(&bare, &[]);
+        let camera_only = dir.join("camera.png");
+        make_photo(&camera_only, &["-Make=Acme"]);
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, "hi").unwrap();
 
-    #[test]
-    fn non_jpeg_is_skipped() {
-        assert_eq!(process_bytes(b"\x89PNG....", &FixedPlace, OPTS).unwrap(), (Outcome::NotJpeg, None));
+        for (path, why) in
+            [(&bare, Skip::NoMetadata), (&camera_only, Skip::NoMetadata), (&text, Skip::Unsupported)]
+        {
+            let before = std::fs::read(path).unwrap();
+            assert_eq!(
+                stamp_in_place(path, &FixedPlace, &mut renderer, opts).unwrap(),
+                Outcome::Skipped(why)
+            );
+            assert_eq!(std::fs::read(path).unwrap(), before);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn dry_run_writes_nothing() {
-        let input = jpeg(Some(build_exif(&eiffel_fields(), true)));
-        let (outcome, out) = process_bytes(&input, &FixedPlace, Options { dry_run: true, ..OPTS }).unwrap();
-        assert!(matches!(outcome, Outcome::Stamped(_)));
-        assert!(out.is_none());
+        let dir = temp_dir("dry");
+        let path = dir.join("p.jpg");
+        make_photo(&path, EIFFEL_TAGS);
+        let before = std::fs::read(&path).unwrap();
+        let opts = Options { dry_run: true, quality: 90 };
+        let outcome = stamp_in_place(&path, &FixedPlace, &mut Renderer::new(), opts).unwrap();
+        assert!(matches!(outcome, Outcome::Stamped { .. }));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn falls_back_to_coordinates() {
-        let info = parse_exif(&build_exif(&eiffel_fields(), false)).unwrap();
+    fn geo_failures() {
+        let info = PhotoInfo {
+            gps: Some(GpsPoint { lat: 48.8584, lon: 2.2945 }),
+            gps_time: Some(chrono::DateTime::from_timestamp(1_718_195_525, 0).unwrap()),
+            ..Default::default()
+        };
         for geo in [&NoGeocoder as &dyn Geocoder, &FailingGeocoder] {
-            let lines = caption_lines(&info, geo);
-            assert!(lines[0].starts_with("48.858"), "{lines:?}");
-            assert_eq!(lines.len(), 2);
+            let lines = caption_lines(&info, geo, false).unwrap();
+            assert_eq!(lines, ["48.85840° N, 2.29450° E", "Wed 12 Jun 2024, 14:32 CEST"]);
         }
+        let err = caption_lines(&info, &FailingGeocoder, true).unwrap_err();
+        assert!(err.downcast_ref::<GeoUnavailable>().is_some());
     }
 
     #[test]
-    fn process_file_overwrites_in_place() {
-        let dir = std::env::temp_dir().join(format!("photo-stamp-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("photo.jpg");
-        let input = jpeg(Some(build_exif(&eiffel_fields(), false)));
-        std::fs::write(&path, &input).unwrap();
-        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-
-        let outcome = process_file(&path, &FixedPlace, OPTS).unwrap();
-        assert!(matches!(outcome, Outcome::Stamped(_)));
-        assert_ne!(std::fs::read(&path).unwrap(), input);
-        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "temp file left behind");
+    fn raster_kinds_round_trip() {
+        // Guard against a format silently losing its encoder.
+        let dir = temp_dir("roundtrip");
+        for (ext, fmt) in [("jpg", ImageFormat::Jpeg), ("png", ImageFormat::Png), ("webp", ImageFormat::WebP)]
+        {
+            let p = dir.join(format!("x.{ext}"));
+            make_photo(&p, &[]);
+            assert_eq!(
+                image::ImageReader::open(&p).unwrap().with_guessed_format().unwrap().format(),
+                Some(fmt)
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

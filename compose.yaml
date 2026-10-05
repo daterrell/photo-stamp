@@ -1,0 +1,29 @@
+# Usage:  mkdir -p photos && docker compose up -d --build
+# Then drop photos into ./photos/inbox — stamped copies appear in ./photos/stamped.
+services:
+  photo-stamp:
+    build: .
+    image: photo-stamp
+    init: true                       # forwards `docker stop` signals for a quick shutdown
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"   # files are created as this host user
+    environment:
+      # Set to true if the photos folder is on a network share or a Windows drive (/mnt/c under WSL),
+      # where filesystem events aren't delivered.
+      PHOTO_STAMP_POLL: "false"
+      PHOTO_STAMP_LANG: "en"
+      PHOTO_STAMP_QUALITY: "92"
+    volumes:
+      - photos:/photos
+      - cache:/cache
+
+volumes:
+  # The photos volume is backed by a host folder so you can drop files into it directly.
+  photos:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "${PHOTOS_DIR:-${PWD}/photos}"
+  # Place-name lookups, kept across container rebuilds.
+  cache:

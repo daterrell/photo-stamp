@@ -1,15 +1,29 @@
-//! Extracting the bits of EXIF we care about, and patching the raw TIFF block.
+//! Photo metadata via `exiftool`, which understands EXIF/XMP in every format we handle
+//! (JPEG, PNG, WebP, TIFF, HEIC and camera RAW files alike).
 
-use chrono::NaiveDateTime;
-use exif::{In, Reader, Tag, Value};
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::{Context, bail};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
+use serde_json::Value;
+
+/// XMP keyword added to every stamped photo so it is never stamped twice.
+pub const MARKER: &str = "photo-stamp";
 
 /// What the photo tells us about when and where it was taken.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PhotoInfo {
+    /// Camera clock reading when the photo was taken (no zone attached).
     pub taken: Option<NaiveDateTime>,
+    /// The camera clock's UTC offset, if it recorded one (`OffsetTimeOriginal`).
+    pub offset: Option<FixedOffset>,
+    /// Satellite time of the GPS fix, always UTC.
+    pub gps_time: Option<DateTime<Utc>>,
     pub gps: Option<GpsPoint>,
     /// EXIF orientation (1..=8); 1 when absent.
     pub orientation: u8,
+    pub already_stamped: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,30 +35,63 @@ pub struct GpsPoint {
 impl PhotoInfo {
     /// True when there is nothing worth burning in.
     pub fn is_empty(&self) -> bool {
-        self.taken.is_none() && self.gps.is_none()
+        self.taken.is_none() && self.gps_time.is_none() && self.gps.is_none()
     }
 }
 
-/// Parse a raw TIFF/EXIF block (no `Exif\0\0` prefix).
-pub fn parse_exif(tiff: &[u8]) -> anyhow::Result<PhotoInfo> {
-    let exif = Reader::new().read_raw(tiff.to_vec())?;
+/// Fail early with a helpful message if exiftool is missing.
+pub fn check_exiftool() -> anyhow::Result<()> {
+    let out = Command::new("exiftool").arg("-ver").output().context(
+        "exiftool not found: install it (e.g. `apt install libimage-exiftool-perl`) or use the Docker image",
+    )?;
+    if !out.status.success() {
+        bail!("exiftool -ver failed");
+    }
+    Ok(())
+}
 
-    let taken = [Tag::DateTimeOriginal, Tag::DateTimeDigitized, Tag::DateTime]
-        .iter()
-        .find_map(|&tag| exif.get_field(tag, In::PRIMARY).and_then(|f| parse_datetime(&f.value)));
+fn exiftool(args: &[&std::ffi::OsStr]) -> anyhow::Result<Vec<u8>> {
+    let out = Command::new("exiftool").args(args).output().context("running exiftool")?;
+    if !out.status.success() {
+        bail!("exiftool failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(out.stdout)
+}
 
-    let coord = |value_tag, ref_tag, negative: &[u8]| -> Option<f64> {
-        let deg = dms_to_degrees(&exif.get_field(value_tag, In::PRIMARY)?.value)?;
-        let is_negative = match &exif.get_field(ref_tag, In::PRIMARY)?.value {
-            Value::Ascii(v) => v.first().and_then(|s| s.first()).is_some_and(|c| negative.contains(c)),
-            _ => false,
-        };
-        Some(if is_negative { -deg } else { deg })
-    };
-    let gps = match (
-        coord(Tag::GPSLatitude, Tag::GPSLatitudeRef, b"Ss"),
-        coord(Tag::GPSLongitude, Tag::GPSLongitudeRef, b"Ww"),
-    ) {
+/// Read the metadata we care about from any supported file.
+pub fn read(path: &Path) -> anyhow::Result<PhotoInfo> {
+    let tags = [
+        "-DateTimeOriginal",
+        "-CreateDate",
+        "-OffsetTimeOriginal",
+        "-OffsetTime",
+        "-Composite:GPSLatitude",
+        "-Composite:GPSLongitude",
+        "-Composite:GPSDateTime",
+        "-Orientation",
+        "-XMP-dc:Subject",
+    ];
+    let mut args: Vec<&std::ffi::OsStr> = ["-json", "-n"].iter().chain(&tags).map(|s| s.as_ref()).collect();
+    args.extend(["--".as_ref(), path.as_os_str()]);
+    parse_json(&String::from_utf8_lossy(&exiftool(&args)?))
+}
+
+/// Parse `exiftool -json -n` output for a single file.
+pub fn parse_json(json: &str) -> anyhow::Result<PhotoInfo> {
+    let all: Value = serde_json::from_str(json).context("parsing exiftool output")?;
+    let tags = &all[0];
+    let text = |k: &str| tags[k].as_str().map(str::trim).filter(|s| !s.is_empty());
+
+    let (taken, embedded_offset) =
+        text("DateTimeOriginal").or_else(|| text("CreateDate")).map(parse_exif_datetime).unwrap_or_default();
+    let offset =
+        text("OffsetTimeOriginal").or_else(|| text("OffsetTime")).and_then(parse_offset).or(embedded_offset);
+    let gps_time = text("GPSDateTime").and_then(|s| {
+        let (naive, _) = parse_exif_datetime(s.trim_end_matches('Z'));
+        naive.map(|n| n.and_utc())
+    });
+
+    let gps = match (tags["GPSLatitude"].as_f64(), tags["GPSLongitude"].as_f64()) {
         // Exactly 0,0 is what many cameras write when they have no fix.
         (Some(lat), Some(lon)) if lat.abs() <= 90.0 && lon.abs() <= 180.0 && (lat, lon) != (0.0, 0.0) => {
             Some(GpsPoint { lat, lon })
@@ -52,163 +99,126 @@ pub fn parse_exif(tiff: &[u8]) -> anyhow::Result<PhotoInfo> {
         _ => None,
     };
 
-    let orientation = exif
-        .get_field(Tag::Orientation, In::PRIMARY)
-        .and_then(|f| f.value.get_uint(0))
-        .filter(|o| (1..=8).contains(o))
-        .map_or(1, |o| o as u8);
+    let orientation = tags["Orientation"].as_u64().filter(|o| (1..=8).contains(o)).map_or(1, |o| o as u8);
 
-    Ok(PhotoInfo { taken, gps, orientation })
-}
-
-fn parse_datetime(value: &Value) -> Option<NaiveDateTime> {
-    let Value::Ascii(parts) = value else { return None };
-    let dt = exif::DateTime::from_ascii(parts.first()?).ok()?;
-    chrono::NaiveDate::from_ymd_opt(dt.year.into(), dt.month.into(), dt.day.into())?.and_hms_opt(
-        dt.hour.into(),
-        dt.minute.into(),
-        dt.second.into(),
-    )
-}
-
-fn dms_to_degrees(value: &Value) -> Option<f64> {
-    let Value::Rational(r) = value else { return None };
-    let part = |i: usize| r.get(i).filter(|x| x.denom != 0).map(|x| x.to_f64());
-    let deg = part(0)? + part(1).unwrap_or(0.0) / 60.0 + part(2).unwrap_or(0.0) / 3600.0;
-    deg.is_finite().then_some(deg)
-}
-
-/// Rewrite IFD0's Orientation tag to 1 ("upright") in place.
-/// Returns false if the tag isn't present or the block is malformed.
-pub fn reset_orientation(tiff: &mut [u8]) -> bool {
-    let big_endian = match tiff.get(..2) {
-        Some(b"MM") => true,
-        Some(b"II") => false,
-        _ => return false,
-    };
-    let u16_at = |b: &[u8], at: usize| -> Option<u16> {
-        let bytes: [u8; 2] = b.get(at..at + 2)?.try_into().ok()?;
-        Some(if big_endian { u16::from_be_bytes(bytes) } else { u16::from_le_bytes(bytes) })
-    };
-    let u32_at = |b: &[u8], at: usize| -> Option<u32> {
-        let bytes: [u8; 4] = b.get(at..at + 4)?.try_into().ok()?;
-        Some(if big_endian { u32::from_be_bytes(bytes) } else { u32::from_le_bytes(bytes) })
+    let already_stamped = match &tags["Subject"] {
+        Value::String(s) => s == MARKER,
+        Value::Array(items) => items.iter().any(|v| v.as_str() == Some(MARKER)),
+        _ => false,
     };
 
-    let Some(ifd0) = u32_at(tiff, 4).map(|o| o as usize) else { return false };
-    let Some(count) = u16_at(tiff, ifd0) else { return false };
-    for i in 0..count as usize {
-        let entry = ifd0 + 2 + i * 12;
-        // Tag 0x0112 (Orientation), type 3 (SHORT): value lives in the first 2 bytes of the value field.
-        if u16_at(tiff, entry) == Some(0x0112) && u16_at(tiff, entry + 2) == Some(3) {
-            let one = if big_endian { 1u16.to_be_bytes() } else { 1u16.to_le_bytes() };
-            return match tiff.get_mut(entry + 8..entry + 10) {
-                Some(slot) => {
-                    slot.copy_from_slice(&one);
-                    true
-                }
-                None => false,
-            };
+    Ok(PhotoInfo { taken, offset, gps_time, gps, orientation, already_stamped })
+}
+
+/// "2024:06:12 14:32:05", optionally followed by fractional seconds and/or "+02:00" (XMP style).
+fn parse_exif_datetime(s: &str) -> (Option<NaiveDateTime>, Option<FixedOffset>) {
+    let Some(head) = s.get(..19) else { return (None, None) };
+    let naive = NaiveDateTime::parse_from_str(head, "%Y:%m:%d %H:%M:%S").ok();
+    let rest = s[19..].trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    (naive, parse_offset(rest))
+}
+
+fn parse_offset(s: &str) -> Option<FixedOffset> {
+    let s = s.trim();
+    if s == "Z" {
+        return FixedOffset::east_opt(0);
+    }
+    let sign = match s.chars().next()? {
+        '+' => 1,
+        '-' => -1,
+        _ => return None,
+    };
+    let (h, m) = s[1..].split_once(':')?;
+    let secs = h.parse::<i32>().ok()? * 3600 + m.parse::<i32>().ok()? * 60;
+    FixedOffset::east_opt(sign * secs)
+}
+
+/// Copy all metadata from `src` onto the freshly encoded `dest`, describing its new pixels:
+/// upright orientation, new dimensions, no stale thumbnail, plus our marker keyword.
+pub fn copy_to_stamped(src: &Path, dest: &Path, width: u32, height: u32) -> anyhow::Result<()> {
+    let w = format!("-ExifImageWidth={width}");
+    let h = format!("-ExifImageHeight={height}");
+    let marker = format!("-XMP-dc:Subject+={MARKER}");
+    let args: [&std::ffi::OsStr; 13] = [
+        "-q".as_ref(),
+        "-overwrite_original".as_ref(),
+        "-TagsFromFile".as_ref(),
+        src.as_os_str(),
+        "-all:all".as_ref(),
+        "-unsafe".as_ref(),
+        "-icc_profile".as_ref(),
+        "-Orientation#=1".as_ref(),
+        "-ThumbnailImage=".as_ref(),
+        w.as_ref(),
+        h.as_ref(),
+        marker.as_ref(),
+        dest.as_os_str(),
+    ];
+    exiftool(&args).map(drop)
+}
+
+/// The biggest JPEG preview embedded in a camera RAW file.
+pub fn raw_preview(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut best: Vec<u8> = Vec::new();
+    for tag in ["-JpgFromRaw", "-PreviewImage", "-OtherImage"] {
+        if let Ok(bytes) = exiftool(&[tag.as_ref(), "-b".as_ref(), "--".as_ref(), path.as_os_str()])
+            && bytes.len() > best.len()
+        {
+            best = bytes;
         }
     }
-    false
+    if best.is_empty() {
+        bail!("no embedded preview image found in RAW file");
+    }
+    Ok(best)
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    use exif::experimental::Writer;
-    use exif::{Field, Rational};
-
-    pub fn field(tag: Tag, value: Value) -> Field {
-        Field { tag, ifd_num: In::PRIMARY, value }
-    }
-
-    pub fn ascii(s: &str) -> Value {
-        Value::Ascii(vec![s.as_bytes().to_vec()])
-    }
-
-    pub fn dms(deg: u32, min: u32, sec_x100: u32) -> Value {
-        Value::Rational(vec![
-            Rational { num: deg, denom: 1 },
-            Rational { num: min, denom: 1 },
-            Rational { num: sec_x100, denom: 100 },
-        ])
-    }
-
-    /// Build a TIFF/EXIF block from fields.
-    pub fn build_exif(fields: &[Field], big_endian: bool) -> Vec<u8> {
-        let mut w = Writer::new();
-        for f in fields {
-            w.push_field(f);
-        }
-        let mut out = std::io::Cursor::new(Vec::new());
-        w.write(&mut out, !big_endian).unwrap();
-        out.into_inner()
-    }
-
-    pub fn eiffel_fields() -> Vec<Field> {
-        vec![
-            field(Tag::Orientation, Value::Short(vec![6])),
-            field(Tag::DateTimeOriginal, ascii("2024:06:12 14:32:05")),
-            field(Tag::GPSLatitudeRef, ascii("N")),
-            field(Tag::GPSLatitude, dms(48, 51, 3024)),
-            field(Tag::GPSLongitudeRef, ascii("E")),
-            field(Tag::GPSLongitude, dms(2, 17, 4020)),
-        ]
-    }
 
     #[test]
-    fn parses_date_gps_orientation() {
-        let info = parse_exif(&build_exif(&eiffel_fields(), false)).unwrap();
+    fn parses_phone_style_metadata() {
+        let info = parse_json(
+            r#"[{"SourceFile":"x.heic","DateTimeOriginal":"2024:06:12 14:32:05","OffsetTimeOriginal":"+02:00",
+                 "GPSLatitude":48.8584,"GPSLongitude":2.2945,"GPSDateTime":"2024:06:12 12:31:59Z",
+                 "Orientation":6}]"#,
+        )
+        .unwrap();
         assert_eq!(info.taken.unwrap().to_string(), "2024-06-12 14:32:05");
-        let gps = info.gps.unwrap();
-        assert!((gps.lat - 48.8584).abs() < 1e-4, "{gps:?}");
-        assert!((gps.lon - 2.2945).abs() < 1e-4, "{gps:?}");
+        assert_eq!(info.offset.unwrap().local_minus_utc(), 7200);
+        assert_eq!(info.gps_time.unwrap().to_rfc3339(), "2024-06-12T12:31:59+00:00");
+        assert_eq!(info.gps, Some(GpsPoint { lat: 48.8584, lon: 2.2945 }));
         assert_eq!(info.orientation, 6);
+        assert!(!info.already_stamped);
     }
 
     #[test]
-    fn southern_western_hemispheres_are_negative() {
-        let fields = [
-            field(Tag::GPSLatitudeRef, ascii("S")),
-            field(Tag::GPSLatitude, dms(33, 51, 0)),
-            field(Tag::GPSLongitudeRef, ascii("W")),
-            field(Tag::GPSLongitude, dms(70, 0, 0)),
-        ];
-        let gps = parse_exif(&build_exif(&fields, true)).unwrap().gps.unwrap();
-        assert!(gps.lat < 0.0 && gps.lon < 0.0);
+    fn xmp_style_dates_and_fallbacks() {
+        let info =
+            parse_json(r#"[{"CreateDate":"2021:08:15 21:10:00.123-04:00","GPSLatitude":-33.9}]"#).unwrap();
+        assert_eq!(info.taken.unwrap().to_string(), "2021-08-15 21:10:00");
+        assert_eq!(info.offset.unwrap().local_minus_utc(), -4 * 3600);
+        assert_eq!(info.gps, None, "latitude alone isn't a position");
+        assert_eq!(info.orientation, 1);
     }
 
     #[test]
-    fn zero_island_and_blank_dates_are_ignored() {
-        let fields = [
-            field(Tag::DateTimeOriginal, ascii("0000:00:00 00:00:00")),
-            field(Tag::GPSLatitudeRef, ascii("N")),
-            field(Tag::GPSLatitude, dms(0, 0, 0)),
-            field(Tag::GPSLongitudeRef, ascii("E")),
-            field(Tag::GPSLongitude, dms(0, 0, 0)),
-            field(Tag::Make, ascii("Acme")),
-        ];
-        let info = parse_exif(&build_exif(&fields, false)).unwrap();
+    fn blank_dates_and_zero_island_are_empty() {
+        let info = parse_json(
+            r#"[{"DateTimeOriginal":"0000:00:00 00:00:00","GPSLatitude":0,"GPSLongitude":0,"Make":"Acme"}]"#,
+        )
+        .unwrap();
         assert!(info.is_empty(), "{info:?}");
+        assert!(parse_json("[{}]").unwrap().is_empty());
     }
 
     #[test]
-    fn reset_orientation_both_byte_orders() {
-        for big_endian in [false, true] {
-            let mut tiff = build_exif(&eiffel_fields(), big_endian);
-            assert!(reset_orientation(&mut tiff));
-            let info = parse_exif(&tiff).unwrap();
-            assert_eq!(info.orientation, 1);
-            assert!(info.taken.is_some() && info.gps.is_some());
+    fn detects_marker() {
+        for subject in [r#""photo-stamp""#, r#"["holiday","photo-stamp"]"#] {
+            let info = parse_json(&format!(r#"[{{"Subject":{subject}}}]"#)).unwrap();
+            assert!(info.already_stamped, "{subject}");
         }
-    }
-
-    #[test]
-    fn reset_orientation_rejects_garbage() {
-        assert!(!reset_orientation(&mut [1, 2, 3]));
-        let mut no_orientation = build_exif(&[field(Tag::Make, ascii("Acme"))], false);
-        assert!(!reset_orientation(&mut no_orientation));
+        assert!(!parse_json(r#"[{"Subject":["holiday"]}]"#).unwrap().already_stamped);
     }
 }

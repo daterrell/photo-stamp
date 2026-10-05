@@ -1,19 +1,27 @@
 [package]
 name = "photo-stamp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Burn when/where a photo was taken into the image, using its EXIF data"
 license = "MIT"
 
 [dependencies]
-ab_glyph = "0.2.32"
 anyhow = "1.0.104"
 chrono = "0.4.45"
-clap = { version = "4.6.7", features = ["derive"] }
+chrono-tz = "0.10.4"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+cosmic-text = "0.19.0"
 image = "0.25.10"
-imageproc = "0.27.0"
-img-parts = "0.4.0"
-kamadak-exif = "0.6.1"
+imageproc = { version = "0.27.0", default-features = false }
+libheif-rs = { version = "3.0.0", optional = true }
+notify = "8.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+tzf-rs = "2.1.2"
 ureq = "3.4.2"
+walkdir = "2.5.0"
+
+[features]
+default = ["heif"]
+# HEIC/HEIF support via the system libheif (needs libheif-dev to build).
+heif = ["dep:libheif-rs"]

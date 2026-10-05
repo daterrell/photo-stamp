@@ -3,7 +3,8 @@
 //! Strategy: ask Overpass for notable named features (landmarks, museums, parks, peaks…)
 //! close to the point and pick the best by category, notability and distance. Separately
 //! reverse-geocode with Nominatim for the neighbourhood/town. Combine the two into a label
-//! like "Eiffel Tower, Paris", or "Gros-Caillou, Paris" when no landmark is near.
+//! like "Eiffel Tower (Tour Eiffel), Paris", or "Minato (港区), Tokyo (東京都)" when no
+//! landmark is near: names in the preferred language, local names in parentheses.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -68,7 +69,7 @@ impl OsmGeocoder {
         let cache_path = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-            .map(|d| d.join("photo-stamp").join("places.json"));
+            .map(|d| d.join("photo-stamp").join("places-v2.json"));
         let cache = cache_path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -98,21 +99,21 @@ impl OsmGeocoder {
         *last = Some(Instant::now());
     }
 
-    fn nominatim(&self, at: GpsPoint) -> anyhow::Result<Value> {
+    /// Reverse geocode; `lang: None` returns names in the local language.
+    fn nominatim(&self, at: GpsPoint, lang: Option<&str>) -> anyhow::Result<Value> {
         self.throttle();
-        let body = self
+        let mut req = self
             .agent
             .get(NOMINATIM_URL)
             .query("format", "jsonv2")
             .query("lat", at.lat.to_string())
             .query("lon", at.lon.to_string())
             .query("zoom", "16")
-            .query("addressdetails", "1")
-            .query("accept-language", &self.lang)
-            .call()
-            .context("Nominatim reverse geocode")?
-            .body_mut()
-            .read_to_string()?;
+            .query("addressdetails", "1");
+        if let Some(lang) = lang {
+            req = req.query("accept-language", lang);
+        }
+        let body = req.call().context("Nominatim reverse geocode")?.body_mut().read_to_string()?;
         Ok(serde_json::from_str(&body)?)
     }
 
@@ -150,7 +151,9 @@ impl Geocoder for OsmGeocoder {
             return Ok(Some(hit.clone()));
         }
 
-        let area = area_from_nominatim(&self.nominatim(at)?);
+        let preferred = self.nominatim(at, Some(&self.lang))?;
+        let local = self.nominatim(at, None)?;
+        let area = Area::from_nominatim(&preferred, &local);
         // A failed POI lookup shouldn't throw away a perfectly good town name.
         let poi = match self.overpass(at) {
             Ok(resp) => best_poi(&resp, at, &self.lang),
@@ -159,7 +162,7 @@ impl Geocoder for OsmGeocoder {
                 None
             }
         };
-        let Some(label) = combine_label(poi.as_deref(), &area) else { return Ok(None) };
+        let Some(label) = combine_label(poi.as_ref(), &area) else { return Ok(None) };
 
         self.cache.lock().unwrap().insert(key, label.clone());
         self.save_cache();
@@ -167,53 +170,87 @@ impl Geocoder for OsmGeocoder {
     }
 }
 
-/// Neighbourhood / town / region names pulled out of a Nominatim reverse response.
-#[derive(Debug, Default, PartialEq)]
-pub struct Area {
-    pub district: Option<String>,
-    pub locality: Option<String>,
-    pub region: Option<String>,
-    pub country: Option<String>,
+/// A name in the preferred language plus the local-language name when it differs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Name {
+    pub preferred: String,
+    pub local: Option<String>,
 }
 
-pub fn area_from_nominatim(resp: &Value) -> Area {
-    let addr = &resp["address"];
-    let first = |keys: &[&str]| keys.iter().find_map(|k| addr[*k].as_str().map(str::to_owned));
-    Area {
-        district: first(&["neighbourhood", "quarter", "suburb", "city_district"]),
-        locality: first(&["city", "town", "village", "hamlet", "municipality"]),
-        region: first(&["county", "state", "region"]),
-        country: first(&["country"]),
+impl Name {
+    pub fn new(preferred: Option<&str>, local: Option<&str>) -> Option<Self> {
+        let preferred = preferred.or(local)?.trim().to_owned();
+        let local =
+            local.map(str::trim).filter(|l| !l.is_empty() && !preferred.contains(l)).map(str::to_owned);
+        Some(Self { preferred, local })
+    }
+
+    /// "Munich (München)", or just "Paris".
+    pub fn display(&self) -> String {
+        match &self.local {
+            Some(l) => format!("{} ({l})", self.preferred),
+            None => self.preferred.clone(),
+        }
+    }
+}
+
+/// Neighbourhood / town / region names pulled out of Nominatim reverse responses.
+#[derive(Debug, Default, PartialEq)]
+pub struct Area {
+    pub district: Option<Name>,
+    pub locality: Option<Name>,
+    pub region: Option<Name>,
+    pub country: Option<Name>,
+}
+
+impl Area {
+    /// `preferred` and `local` are the same lookup made in the preferred and the local language.
+    pub fn from_nominatim(preferred: &Value, local: &Value) -> Area {
+        // Take the first key present in either response, so both names describe the same thing.
+        let pick = |keys: &[&str]| {
+            keys.iter().find_map(|k| {
+                let p = preferred["address"][*k].as_str();
+                let l = local["address"][*k].as_str();
+                Name::new(p, l)
+            })
+        };
+        Area {
+            district: pick(&["neighbourhood", "quarter", "suburb", "city_district"]),
+            locality: pick(&["city", "town", "village", "hamlet", "municipality"]),
+            region: pick(&["county", "state", "region"]),
+            // Country names are recognisable enough in the preferred language alone.
+            country: pick(&["country"]).map(|c| Name { local: None, ..c }),
+        }
     }
 }
 
 /// Build the one-line place label from the best landmark (if any) and the surrounding area.
-pub fn combine_label(poi: Option<&str>, area: &Area) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
+pub fn combine_label(poi: Option<&Name>, area: &Area) -> Option<String> {
+    let mut parts: Vec<&Name> = Vec::new();
     if let Some(poi) = poi {
         parts.push(poi);
-        if let Some(loc) = area.locality.as_deref().or(area.region.as_deref()) {
+        if let Some(loc) = area.locality.as_ref().or(area.region.as_ref()) {
             parts.push(loc);
         }
     } else {
-        if let Some(d) = area.district.as_deref() {
+        if let Some(d) = &area.district {
             parts.push(d);
         }
-        if let Some(place) = area.locality.as_deref().or(area.region.as_deref()).or(area.country.as_deref()) {
+        if let Some(place) = area.locality.as_ref().or(area.region.as_ref()).or(area.country.as_ref()) {
             parts.push(place);
         }
         // A lone town reads better with its country: "Hallstatt, Austria".
         if parts.len() == 1
-            && let Some(c) = area.country.as_deref().filter(|c| *c != parts[0])
+            && let Some(c) = area.country.as_ref().filter(|c| c.preferred != parts[0].preferred)
         {
             parts.push(c);
         }
     }
     // "Paris, Paris" or "Musée de Paris, Paris" → drop the redundant town.
-    if parts.len() == 2 && parts[0].contains(parts[1]) {
+    if parts.len() == 2 && parts[0].preferred.contains(&parts[1].preferred) {
         parts.pop();
     }
-    (!parts.is_empty()).then(|| parts.join(", "))
+    (!parts.is_empty()).then(|| parts.iter().map(|n| n.display()).collect::<Vec<_>>().join(", "))
 }
 
 fn overpass_query(at: GpsPoint, radius: f64) -> String {
@@ -328,14 +365,16 @@ fn score(el: &OverpassElement, at: GpsPoint) -> f64 {
     s - dist / 75.0
 }
 
-pub fn best_poi(resp: &OverpassResponse, at: GpsPoint, lang: &str) -> Option<String> {
+pub fn best_poi(resp: &OverpassResponse, at: GpsPoint, lang: &str) -> Option<Name> {
     let lang_key = format!("name:{lang}");
     resp.elements
         .iter()
         .map(|el| (score(el, at), el))
         .filter(|(s, _)| *s >= MIN_POI_SCORE)
         .max_by(|a, b| a.0.total_cmp(&b.0))
-        .and_then(|(_, el)| el.tags.get(&lang_key).or_else(|| el.tags.get("name")).cloned())
+        .and_then(|(_, el)| {
+            Name::new(el.tags.get(&lang_key).map(String::as_str), el.tags.get("name").map(String::as_str))
+        })
 }
 
 #[cfg(test)]
@@ -349,6 +388,10 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    fn name(p: &str, l: &str) -> Name {
+        Name::new(Some(p), Some(l)).unwrap()
+    }
+
     #[test]
     fn famous_landmark_beats_nearer_obscure_feature() {
         let resp = overpass(json!({"elements": [
@@ -358,8 +401,8 @@ mod tests {
              "tags": {"name": "Tour Eiffel", "name:en": "Eiffel Tower", "tourism": "attraction",
                       "man_made": "tower", "wikidata": "Q243", "wikipedia": "fr:Tour Eiffel"}},
         ]}));
-        assert_eq!(best_poi(&resp, EIFFEL, "en").as_deref(), Some("Eiffel Tower"));
-        assert_eq!(best_poi(&resp, EIFFEL, "de").as_deref(), Some("Tour Eiffel"));
+        assert_eq!(best_poi(&resp, EIFFEL, "en"), Some(name("Eiffel Tower", "Tour Eiffel")));
+        assert_eq!(best_poi(&resp, EIFFEL, "de").unwrap().display(), "Tour Eiffel");
     }
 
     #[test]
@@ -373,19 +416,40 @@ mod tests {
     }
 
     #[test]
+    fn bilingual_names() {
+        assert_eq!(name("Munich", "München").display(), "Munich (München)");
+        assert_eq!(name("Paris", "Paris").display(), "Paris");
+        assert_eq!(name("Tokyo Tower", "東京タワー").display(), "Tokyo Tower (東京タワー)");
+        // No English form: the local name is used once, not repeated in parentheses.
+        assert_eq!(Name::new(None, Some("Gros-Caillou")).unwrap().display(), "Gros-Caillou");
+        assert_eq!(Name::new(None, None), None);
+    }
+
+    #[test]
     fn labels() {
-        let area = area_from_nominatim(&json!({"address": {
-            "suburb": "Gros-Caillou", "city": "Paris", "state": "Île-de-France", "country": "France"}}));
-        assert_eq!(combine_label(Some("Eiffel Tower"), &area).as_deref(), Some("Eiffel Tower, Paris"));
+        let en = json!({"address": {"suburb": "Minato", "city": "Tokyo", "country": "Japan"}});
+        let local = json!({"address": {"suburb": "港区", "city": "東京都", "country": "日本"}});
+        let area = Area::from_nominatim(&en, &local);
+        assert_eq!(combine_label(None, &area).as_deref(), Some("Minato (港区), Tokyo (東京都)"));
+        let tower = name("Tokyo Tower", "東京タワー");
+        // The landmark's name already says where it is.
+        assert_eq!(combine_label(Some(&tower), &area).as_deref(), Some("Tokyo Tower (東京タワー)"));
+        let temple = name("Senso-ji", "浅草寺");
+        assert_eq!(combine_label(Some(&temple), &area).as_deref(), Some("Senso-ji (浅草寺), Tokyo (東京都)"));
+
+        let paris = json!({"address": {"suburb": "Gros-Caillou", "city": "Paris", "country": "France"}});
+        let area = Area::from_nominatim(&paris, &paris);
+        let eiffel = name("Eiffel Tower", "Tour Eiffel");
+        assert_eq!(combine_label(Some(&eiffel), &area).as_deref(), Some("Eiffel Tower (Tour Eiffel), Paris"));
         assert_eq!(combine_label(None, &area).as_deref(), Some("Gros-Caillou, Paris"));
-        assert_eq!(combine_label(Some("Musée de Paris"), &area).as_deref(), Some("Musée de Paris"));
 
-        let village =
-            area_from_nominatim(&json!({"address": {"village": "Hallstatt", "country": "Austria"}}));
-        assert_eq!(combine_label(None, &village).as_deref(), Some("Hallstatt, Austria"));
+        let village = json!({"address": {"village": "Hallstatt", "country": "Austria"}});
+        let village_local = json!({"address": {"village": "Hallstatt", "country": "Österreich"}});
+        let area = Area::from_nominatim(&village, &village_local);
+        assert_eq!(combine_label(None, &area).as_deref(), Some("Hallstatt, Austria"));
 
-        let sea = area_from_nominatim(&json!({"error": "Unable to geocode"}));
-        assert_eq!(combine_label(None, &sea), None);
+        let sea = json!({"error": "Unable to geocode"});
+        assert_eq!(combine_label(None, &Area::from_nominatim(&sea, &sea)), None);
     }
 
     #[test]
