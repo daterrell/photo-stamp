@@ -56,17 +56,17 @@ enum Command {
         #[arg(env = "PHOTO_STAMP_ROOT")]
         root: PathBuf,
 
-        /// Poll for changes instead of using filesystem events (for network/Windows mounts)
-        #[arg(long, env = "PHOTO_STAMP_POLL")]
-        poll: bool,
-
         /// Seconds a file must stay unchanged before it's processed
         #[arg(long, default_value_t = 3, env = "PHOTO_STAMP_SETTLE_SECS")]
         settle_secs: u64,
 
-        /// Seconds between full rescans of the inbox
-        #[arg(long, default_value_t = 30, env = "PHOTO_STAMP_RESCAN_SECS")]
-        rescan_secs: u64,
+        /// Seconds between polls of the inbox (backup for filesystem events)
+        #[arg(long, default_value_t = 5, env = "PHOTO_STAMP_POLL_SECS")]
+        poll_secs: u64,
+
+        /// Don't use filesystem events; rely on polling alone
+        #[arg(long, env = "PHOTO_STAMP_NO_EVENTS")]
+        no_events: bool,
     },
 }
 
@@ -83,11 +83,11 @@ fn main() -> ExitCode {
         Command::Stamp { paths, dry_run } => {
             stamp_paths(&paths, geo.as_ref(), Options { dry_run, quality: cli.common.quality })
         }
-        Command::Watch { root, poll, settle_secs, rescan_secs } => {
+        Command::Watch { root, settle_secs, poll_secs, no_events } => {
             let config = watch::Config {
                 settle: Duration::from_secs(settle_secs),
-                rescan: Duration::from_secs(rescan_secs.max(1)),
-                poll,
+                poll_interval: Duration::from_secs(poll_secs.max(1)),
+                events: !no_events,
                 quality: cli.common.quality,
             };
             match watch::Inbox::new(&root, config, geo.as_ref()).and_then(|inbox| inbox.run()) {

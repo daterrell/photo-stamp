@@ -54,7 +54,9 @@ photos/
   skipped/    not stamped: no date/location, unsupported, already stamped, or unreadable
 ```
 
-Files are picked up once they've stopped changing for 3 s, so large copies are safe. If OpenStreetMap is
+New files are noticed instantly via filesystem events, with the inbox also polled every 5 s as a backup (for
+network shares, `/mnt/c` under WSL, or missed events). They're processed once they've stopped changing for 3 s,
+so large copies are safe. If OpenStreetMap is
 unreachable, a photo waits in the inbox and is retried (1, 2, 4 min) before falling back to coordinates. Name
 clashes become `photo (2).jpg`. Watch progress with `docker compose logs -f`.
 
@@ -64,7 +66,7 @@ Settings (in `compose.yaml` / environment):
 |-----------------------|------------------|----------------------------------------------------------------|
 | `PHOTOS_DIR`          | `$PWD/photos`    | Host folder backing the `photos` volume (absolute path)        |
 | `PUID` / `PGID`       | `1000`           | Host user/group that output files belong to                    |
-| `PHOTO_STAMP_POLL`    | `false`          | `true` for network shares or `/mnt/c` under WSL (no inotify)   |
+| `PHOTO_STAMP_POLL_SECS` | `5`            | Backup polling interval (filesystem events are also used)      |
 | `PHOTO_STAMP_LANG`    | `en`             | Main language for place names                                   |
 | `PHOTO_STAMP_QUALITY` | `92`             | Quality for lossy re-encoding                                   |
 | `PHOTO_STAMP_OFFLINE` | `false`          | Never contact OpenStreetMap                                     |
@@ -74,7 +76,7 @@ Place lookups are cached in the `cache` volume and throttled to 1 request/second
 ## Command line
 
 ```sh
-photo-stamp watch <ROOT> [--poll] [--settle-secs 3] [--rescan-secs 30]
+photo-stamp watch <ROOT> [--poll-secs 5] [--settle-secs 3] [--no-events]
 photo-stamp stamp [-n|--dry-run] <PATHS>...     # IN PLACE; RAW → "<name>.jpg" alongside
   global: --offline  --lang <LANG>  --quality <Q>
 ```

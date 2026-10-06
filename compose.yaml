@@ -8,9 +8,9 @@ services:
     restart: unless-stopped
     user: "${PUID:-1000}:${PGID:-1000}"   # files are created as this host user
     environment:
-      # Set to true if the photos folder is on a network share or a Windows drive (/mnt/c under WSL),
-      # where filesystem events aren't delivered.
-      PHOTO_STAMP_POLL: "false"
+      # Filesystem events give instant pickup; polling every few seconds is the backup
+      # (e.g. network shares or /mnt/c under WSL, where events aren't delivered).
+      PHOTO_STAMP_POLL_SECS: "5"
       PHOTO_STAMP_LANG: "en"
       PHOTO_STAMP_QUALITY: "92"
     volumes:

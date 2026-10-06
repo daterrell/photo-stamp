@@ -7,8 +7,10 @@
 //! skipped/    files that weren't stamped (no metadata, unsupported, already stamped, broken)
 //! ```
 //!
-//! Filesystem events (inotify etc.) trigger a scan, and a periodic rescan catches anything the
-//! events missed (e.g. network shares or Windows drives under WSL, which don't deliver them).
+//! Two mechanisms run side by side: filesystem events (inotify etc.) pick new files up immediately,
+//! and polling rescans the inbox every few seconds as a backup for anything the events miss
+//! (network shares and Windows drives under WSL don't deliver them; queues can overflow). If
+//! events can't be set up at all, polling carries on alone.
 //! A file is only processed once its size and mtime have stopped changing, so half-copied
 //! files are left alone.
 
@@ -18,7 +20,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
-use notify::{PollWatcher, RecursiveMode, Watcher};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use walkdir::WalkDir;
 
 use crate::formats;
@@ -34,10 +36,10 @@ const GEO_RETRY_BASE: Duration = Duration::from_secs(60);
 pub struct Config {
     /// How long a file must stay unchanged before it's processed.
     pub settle: Duration,
-    /// How often to rescan even without filesystem events.
-    pub rescan: Duration,
-    /// Use polling instead of native filesystem events.
-    pub poll: bool,
+    /// How often to poll the inbox, as a backup to filesystem events.
+    pub poll_interval: Duration,
+    /// Listen for filesystem events (polling always runs too).
+    pub events: bool,
     pub quality: u8,
 }
 
@@ -102,41 +104,57 @@ impl<'a> Inbox<'a> {
     }
 
     /// Watch forever.
-    pub fn run(mut self) -> anyhow::Result<()> {
+    pub fn run(self) -> anyhow::Result<()> {
+        self.run_until(|| false)
+    }
+
+    /// Watch until `stop` returns true (checked after every scan).
+    pub fn run_until(mut self, stop: impl Fn() -> bool) -> anyhow::Result<()> {
         let (tx, rx) = mpsc::channel();
-        let _watcher: Box<dyn Watcher> = if self.config.poll {
-            let cfg = notify::Config::default().with_poll_interval(Duration::from_secs(2));
-            let mut w = PollWatcher::new(tx, cfg)?;
-            w.watch(&self.layout.inbox, RecursiveMode::Recursive)?;
-            Box::new(w)
-        } else {
-            let mut w = notify::recommended_watcher(tx)?;
-            w.watch(&self.layout.inbox, RecursiveMode::Recursive)?;
-            Box::new(w)
-        };
+        // Kept alive for the whole loop; dropping it would stop the events.
+        let mut _watcher: Option<RecommendedWatcher> = None;
+        if self.config.events {
+            match start_event_watcher(&self.layout.inbox, tx) {
+                Ok(w) => _watcher = Some(w),
+                Err(e) => eprintln!("warning: filesystem events unavailable ({e:#}); relying on polling"),
+            }
+        }
+        let mut events = _watcher.is_some();
         println!(
-            "watching {} (settle {:?}, rescan every {:?}{})",
+            "watching {} (filesystem events: {}, polling every {:?}, settle {:?})",
             self.layout.inbox.display(),
+            if events { "on" } else { "off" },
+            self.config.poll_interval,
             self.config.settle,
-            self.config.rescan,
-            if self.config.poll { ", polling" } else { "" }
         );
 
         loop {
             self.scan_once();
-            // Sleep until an event, the next settle check, or the periodic rescan.
+            if stop() {
+                return Ok(());
+            }
+            // Next scan: on an event, when a pending file may have settled, or at the poll interval.
             let wait = if self.seen.is_empty() && self.deferred.is_empty() {
-                self.config.rescan
+                self.config.poll_interval
             } else {
-                self.config.settle.min(self.config.rescan).max(Duration::from_millis(250))
+                self.config.settle.min(self.config.poll_interval).max(Duration::from_millis(250))
             };
+            if !events {
+                std::thread::sleep(wait);
+                continue;
+            }
             match rx.recv_timeout(wait) {
-                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Error events (e.g. a queue overflow) also just mean "go and look".
+                Ok(_) => {
                     // Let a burst of events (a big copy) coalesce before scanning.
                     std::thread::sleep(Duration::from_millis(250));
                     while rx.try_recv().is_ok() {}
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("filesystem watcher stopped"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    eprintln!("warning: filesystem events stopped; relying on polling");
+                    events = false;
+                }
             }
         }
     }
@@ -235,6 +253,15 @@ impl<'a> Inbox<'a> {
     }
 }
 
+fn start_event_watcher(
+    dir: &Path,
+    tx: mpsc::Sender<notify::Result<notify::Event>>,
+) -> notify::Result<RecommendedWatcher> {
+    let mut w = notify::recommended_watcher(tx)?;
+    w.watch(dir, RecursiveMode::Recursive)?;
+    Ok(w)
+}
+
 /// Partial downloads, editor temp files, our own temp files, dotfiles.
 fn is_temporary(path: &Path) -> bool {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -276,7 +303,7 @@ mod tests {
     use crate::stamp::tests::{EIFFEL_TAGS, FailingGeocoder, FixedPlace, make_photo, temp_dir};
 
     fn config() -> Config {
-        Config { settle: Duration::ZERO, rescan: Duration::from_secs(1), poll: false, quality: 90 }
+        Config { settle: Duration::ZERO, poll_interval: Duration::from_secs(1), events: true, quality: 90 }
     }
 
     fn files_under(dir: &Path) -> Vec<String> {
@@ -342,6 +369,44 @@ mod tests {
         inbox.scan_once();
         assert_eq!(files_under(&root.join("stamped")), ["a.jpg"]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Run the watcher, drop a photo into the inbox once it's running, and return how long
+    /// it took to be stamped (the watcher stops as soon as it is, or after 20 s).
+    fn time_to_stamp(config: Config) -> Duration {
+        let root = temp_dir(&format!("live-{}-{}", config.events, config.poll_interval.as_millis()));
+        let staged = root.join("staged.jpg");
+        make_photo(&staged, EIFFEL_TAGS);
+        let inbox = Inbox::new(&root, config, &FixedPlace).unwrap();
+        let dropped = root.join("inbox/a.jpg");
+        let stamped = root.join("stamped/a.jpg");
+        let start = Instant::now();
+        let dropper = std::thread::spawn({
+            let (staged, dropped) = (staged.clone(), dropped.clone());
+            // Rename in, so the watcher never sees a half-written file.
+            move || {
+                std::thread::sleep(Duration::from_millis(500));
+                std::fs::rename(staged, dropped).unwrap();
+            }
+        });
+        inbox.run_until(|| stamped.exists() || start.elapsed() > Duration::from_secs(20)).unwrap();
+        dropper.join().unwrap();
+        assert!(stamped.exists(), "never stamped");
+        std::fs::remove_dir_all(&root).unwrap();
+        start.elapsed()
+    }
+
+    #[test]
+    fn events_pick_files_up_without_waiting_for_a_poll() {
+        let took = time_to_stamp(Config { poll_interval: Duration::from_secs(60), ..config() });
+        assert!(took < Duration::from_secs(10), "took {took:?}: events not working");
+    }
+
+    #[test]
+    fn polling_alone_still_picks_files_up() {
+        let took =
+            time_to_stamp(Config { events: false, poll_interval: Duration::from_millis(200), ..config() });
+        assert!(took < Duration::from_secs(10), "took {took:?}");
     }
 
     #[test]
