@@ -155,17 +155,21 @@ impl Geocoder for OsmGeocoder {
         let local = self.nominatim(at, None)?;
         let area = Area::from_nominatim(&preferred, &local);
         // A failed POI lookup shouldn't throw away a perfectly good town name.
-        let poi = match self.overpass(at) {
-            Ok(resp) => best_poi(&resp, at, &self.lang),
+        let (poi, complete) = match self.overpass(at) {
+            Ok(resp) => (best_poi(&resp, at, &self.lang), true),
             Err(e) => {
                 eprintln!("warning: landmark lookup failed, using area name only: {e:#}");
-                None
+                (None, false)
             }
         };
         let Some(label) = combine_label(poi.as_ref(), &area) else { return Ok(None) };
 
-        self.cache.lock().unwrap().insert(key, label.clone());
-        self.save_cache();
+        // Only remember complete answers: after an Overpass outage the next photo here should
+        // get another chance at the landmark name.
+        if complete {
+            self.cache.lock().unwrap().insert(key, label.clone());
+            self.save_cache();
+        }
         Ok(Some(label))
     }
 }
