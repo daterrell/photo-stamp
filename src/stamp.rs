@@ -58,20 +58,24 @@ impl fmt::Display for GeoUnavailable {
 
 impl std::error::Error for GeoUnavailable {}
 
-/// Place line (if GPS) then time line (if any), top line first.
-/// With `strict_geo`, a failed lookup is an error ([`GeoUnavailable`]) instead of coordinates.
+/// Place lines (if GPS) then the time line (if any), top line first.
+/// With `strict_geo`, a failed or partial lookup is an error ([`GeoUnavailable`]) rather than
+/// settling for coordinates or a less specific name.
 pub fn caption_lines(info: &PhotoInfo, geo: &dyn Geocoder, strict_geo: bool) -> anyhow::Result<Vec<String>> {
-    let place = match info.gps {
-        None => None,
-        Some(at) => Some(match geo.place_name(at) {
-            Ok(Some(name)) => name,
-            Ok(None) => format_coords(at),
+    let place: Vec<String> = match info.gps {
+        None => Vec::new(),
+        Some(at) => match geo.place(at) {
+            Ok(Some(place)) if strict_geo && !place.complete => {
+                return Err(GeoUnavailable(anyhow::anyhow!("venue/landmark lookup incomplete")).into());
+            }
+            Ok(Some(place)) => place.lines(),
+            Ok(None) => vec![format_coords(at)],
             Err(e) if strict_geo => return Err(GeoUnavailable(e).into()),
             Err(e) => {
                 eprintln!("warning: place lookup failed, using coordinates: {e:#}");
-                format_coords(at)
+                vec![format_coords(at)]
             }
-        }),
+        },
     };
     let tz = info.gps.and_then(localtime::timezone_at);
     let time = localtime::caption(info, tz);
@@ -97,7 +101,8 @@ pub fn prepare(path: &Path, geo: &dyn Geocoder, strict_geo: bool) -> anyhow::Res
 
 /// Burn the job's caption into the pixels of `img`.
 pub fn draw_caption(img: DynamicImage, lines: &[String], renderer: &mut Renderer) -> DynamicImage {
-    let rel_sizes = [1.0, 0.8];
+    // The main place line is largest; supporting lines are smaller.
+    let rel_sizes = std::iter::once(1.0).chain(std::iter::repeat(0.75));
     let lines: Vec<Line> =
         lines.iter().zip(rel_sizes).map(|(text, rel_size)| Line { text, rel_size }).collect();
     if img.color().has_alpha() {
@@ -184,21 +189,38 @@ pub fn stamp_in_place(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::geo::NoGeocoder;
+    use crate::geo::{NoGeocoder, Place};
     use crate::metadata::GpsPoint;
     use image::{ImageFormat, Rgb, RgbImage};
     use std::process::Command;
 
+    fn eiffel(complete: bool) -> Place {
+        Place {
+            primary: "Eiffel Tower (Tour Eiffel)".into(),
+            near: None,
+            context: Some("Paris, France".into()),
+            complete,
+        }
+    }
+
     pub struct FixedPlace;
     impl Geocoder for FixedPlace {
-        fn place_name(&self, _: GpsPoint) -> anyhow::Result<Option<String>> {
-            Ok(Some("Eiffel Tower (Tour Eiffel), Paris".into()))
+        fn place(&self, _: GpsPoint) -> anyhow::Result<Option<Place>> {
+            Ok(Some(eiffel(true)))
+        }
+    }
+
+    /// Nominatim answered but Overpass didn't.
+    pub struct PartialPlace;
+    impl Geocoder for PartialPlace {
+        fn place(&self, _: GpsPoint) -> anyhow::Result<Option<Place>> {
+            Ok(Some(Place { primary: "Gros-Caillou".into(), ..eiffel(false) }))
         }
     }
 
     pub struct FailingGeocoder;
     impl Geocoder for FailingGeocoder {
-        fn place_name(&self, _: GpsPoint) -> anyhow::Result<Option<String>> {
+        fn place(&self, _: GpsPoint) -> anyhow::Result<Option<Place>> {
             anyhow::bail!("network down")
         }
     }
@@ -260,7 +282,8 @@ pub(crate) mod tests {
                 outcome,
                 Outcome::Stamped {
                     lines: vec![
-                        "Eiffel Tower (Tour Eiffel), Paris".into(),
+                        "Eiffel Tower (Tour Eiffel)".into(),
+                        "Paris, France".into(),
                         "Wed 12 Jun 2024, 14:32 CEST".into()
                     ],
                     dest: path.clone(),
@@ -345,6 +368,12 @@ pub(crate) mod tests {
             assert_eq!(lines, ["48.85840° N, 2.29450° E", "Wed 12 Jun 2024, 14:32 CEST"]);
         }
         let err = caption_lines(&info, &FailingGeocoder, true).unwrap_err();
+        assert!(err.downcast_ref::<GeoUnavailable>().is_some());
+
+        // A partial answer is good enough when we can't wait, but not when we can.
+        let lines = caption_lines(&info, &PartialPlace, false).unwrap();
+        assert_eq!(lines, ["Gros-Caillou", "Paris, France", "Wed 12 Jun 2024, 14:32 CEST"]);
+        let err = caption_lines(&info, &PartialPlace, true).unwrap_err();
         assert!(err.downcast_ref::<GeoUnavailable>().is_some());
     }
 

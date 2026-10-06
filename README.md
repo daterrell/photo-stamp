@@ -3,16 +3,21 @@
 Burns **where** and **when** a photo was taken into its bottom-left corner, using the photo's own metadata.
 
 ```
-Tokyo Tower (東京タワー), Minato (港区)
-Wed 12 Jun 2024, 22:32 JST
+Pebble Beach Golf Course
+Pebble Beach, California, United States
+Tue 3 Jun 2025, 15:10 PDT
 ```
 
-- **Where**: GPS coordinates turned into a place name with OpenStreetMap, in English with the local name in
-  parentheses:
-  - [Overpass](https://overpass-api.de) finds notable named features within 250 m (attractions, museums,
-    monuments, castles, peaks, parks, towers…), scored by category, Wikipedia/Wikidata presence and distance.
-  - Otherwise [Nominatim](https://nominatim.org) reverse geocoding gives a neighbourhood and town:
-    "Brixton, Greater London", "Hallstatt, Austria".
+- **Where**: GPS coordinates turned into place names with OpenStreetMap, in English with local names in
+  parentheses, on up to three lines:
+  1. The **venue you're inside** (golf course, park, zoo, stadium, campus, castle, museum, airport, beach…), found
+     with Overpass `is_in` — "Pebble Beach Golf Course". Venue types and notability (Wikipedia/Wikidata) are
+     weighed against size, so a stadium beats the park around it and a course beats a garden within it. If you're
+     not inside a venue, the most notable **landmark within 250 m** is used instead — "Eiffel Tower (Tour Eiffel)".
+  2. "near …" a clearly famous landmark close by, when line 1 is a venue.
+  3. **Neighbourhood, town, region, country** from [Nominatim](https://nominatim.org) — "Pebble Beach,
+     California, United States".
+  - Overpass requests fail over between public mirrors (override with `PHOTO_STAMP_OVERPASS_URLS`).
   - With no network (or `--offline`) the raw coordinates are used: "48.85840° N, 2.29450° E".
 - **When**: the *local time at the place the photo was taken*, with its zone. The true instant comes from
   `OffsetTimeOriginal` (phones record it) or the GPS timestamp, and is converted to the timezone at the GPS
@@ -57,7 +62,8 @@ photos/
 New files are noticed instantly via filesystem events, with the inbox also polled every 5 s as a backup (for
 network shares, `/mnt/c` under WSL, or missed events). They're processed once they've stopped changing for 3 s,
 so large copies are safe. If OpenStreetMap is
-unreachable, a photo waits in the inbox and is retried (1, 2, 4 min) before falling back to coordinates. Name
+unreachable or only partly answers, a photo waits in the inbox and is retried (1, 2, 4 min) before settling for
+what it has (town name, or coordinates). Name
 clashes become `photo (2).jpg`. Watch progress with `docker compose logs -f`.
 
 Settings (in `compose.yaml` / environment):
