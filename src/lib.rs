@@ -4,6 +4,7 @@ pub mod formats;
 pub mod geo;
 pub mod localtime;
 pub mod metadata;
+pub mod paths;
 pub mod render;
 pub mod stamp;
 pub mod watch;

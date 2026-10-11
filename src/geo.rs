@@ -72,7 +72,6 @@ const NOMINATIM_URL: &str = "https://nominatim.openstreetmap.org/reverse";
 const OVERPASS_MIRRORS: &[&str] = &[
     "https://overpass-api.de/api/interpreter",
     "https://overpass.private.coffee/api/interpreter",
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
 ];
 /// How far from the camera a landmark may be and still be "where the photo was taken".
@@ -115,10 +114,7 @@ impl OsmGeocoder {
             })
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| OVERPASS_MIRRORS.iter().map(|s| s.to_string()).collect());
-        let cache_path = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-            .map(|d| d.join("photo-stamp").join("places-v3.json"));
+        let cache_path = crate::paths::data_dir().map(|d| d.join("places-v3.json"));
         let cache = cache_path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
@@ -781,6 +777,11 @@ mod tests {
         let (inside, around) = resp.split_inside_around();
         assert_eq!(inside.elements.len(), 1);
         assert_eq!(around.elements.len(), 2);
+    }
+
+    #[test]
+    fn no_russian_mirrors() {
+        assert!(OVERPASS_MIRRORS.iter().all(|m| !m.contains(".ru/")), "{OVERPASS_MIRRORS:?}");
     }
 
     #[test]
