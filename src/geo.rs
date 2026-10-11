@@ -202,7 +202,7 @@ impl OsmGeocoder {
             std::fs::write(path, serde_json::to_vec_pretty(&*cache)?)
         };
         if let Err(e) = write() {
-            eprintln!("warning: couldn't save place cache {}: {e}", path.display());
+            log::warn!("couldn't save place cache {}: {e}", path.display());
         }
     }
 }
@@ -225,7 +225,7 @@ impl Geocoder for OsmGeocoder {
                 (Some(inside), Some(around), true)
             }
             Err(e) => {
-                eprintln!("warning: venue/landmark lookup failed: {e:#}");
+                log::warn!("venue/landmark lookup failed: {e:#}");
                 (None, None, false)
             }
         };

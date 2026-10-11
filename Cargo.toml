@@ -14,6 +14,7 @@ cosmic-text = "0.19.0"
 image = "0.25.10"
 imageproc = { version = "0.27.0", default-features = false }
 libheif-rs = { version = "3.0.0", optional = true }
+log = "0.4.34"
 notify = "8.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -25,3 +26,6 @@ walkdir = "2.5.0"
 default = ["heif"]
 # HEIC/HEIF support via the system libheif (needs libheif-dev to build).
 heif = ["dep:libheif-rs"]
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging", "Win32_Security"] }

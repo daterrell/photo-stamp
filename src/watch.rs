@@ -263,7 +263,7 @@ fn start_event_watcher(
 }
 
 /// Partial downloads, editor temp files, our own temp files, dotfiles.
-fn is_temporary(path: &Path) -> bool {
+pub fn is_temporary(path: &Path) -> bool {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     name.starts_with('.')
         || name.starts_with('~')

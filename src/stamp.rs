@@ -72,7 +72,7 @@ pub fn caption_lines(info: &PhotoInfo, geo: &dyn Geocoder, strict_geo: bool) -> 
             Ok(None) => vec![format_coords(at)],
             Err(e) if strict_geo => return Err(GeoUnavailable(e).into()),
             Err(e) => {
-                eprintln!("warning: place lookup failed, using coordinates: {e:#}");
+                log::warn!("place lookup failed, using coordinates: {e:#}");
                 vec![format_coords(at)]
             }
         },

@@ -1,7 +1,8 @@
 //! Photo metadata via `exiftool`, which understands EXIF/XMP in every format we handle
 //! (JPEG, PNG, WebP, TIFF, HEIC and camera RAW files alike).
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, bail};
@@ -39,23 +40,68 @@ impl PhotoInfo {
     }
 }
 
-/// Fail early with a helpful message if exiftool is missing.
-pub fn check_exiftool() -> anyhow::Result<()> {
-    let out = Command::new("exiftool").arg("-ver").output().context(
-        "exiftool not found: install it (e.g. `apt install libimage-exiftool-perl`) or use the Docker image",
-    )?;
-    if !out.status.success() {
-        bail!("exiftool -ver failed");
-    }
-    Ok(())
+/// The bundled exiftool (`photo-stamp-files/exiftool[.exe]` beside our own executable), or the
+/// one on `PATH`.
+fn exiftool_program() -> PathBuf {
+    let name = if cfg!(windows) { "exiftool.exe" } else { "exiftool" };
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(crate::inplace::SUPPORT_DIR).join(name)))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("exiftool"))
 }
 
-fn exiftool(args: &[&std::ffi::OsStr]) -> anyhow::Result<Vec<u8>> {
-    let out = Command::new("exiftool").args(args).output().context("running exiftool")?;
+/// Fail early with a helpful message if exiftool is missing.
+pub fn check_exiftool() -> anyhow::Result<()> {
+    exiftool(&["-ver".as_ref()]).map(drop).context(if cfg!(windows) {
+        "exiftool not found: keep the photo-stamp-files folder next to photo-stamp.exe"
+    } else {
+        "exiftool not found: install it (e.g. `apt install libimage-exiftool-perl`) or use the Docker image"
+    })
+}
+
+fn exiftool(args: &[&OsStr]) -> anyhow::Result<Vec<u8>> {
+    let out = run_exiftool(args).context("running exiftool")?;
     if !out.status.success() {
         bail!("exiftool failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(out.stdout)
+}
+
+#[cfg(not(windows))]
+fn run_exiftool(args: &[&OsStr]) -> anyhow::Result<std::process::Output> {
+    Ok(Command::new(exiftool_program()).args(args).output()?)
+}
+
+/// Windows exiftool reads its command line in the ANSI code page, which mangles file names like
+/// "Café.jpg" or "東京.jpg". Arguments go through a UTF-8 argument file instead, and no console
+/// window is flashed up for each call.
+#[cfg(windows)]
+fn run_exiftool(args: &[&OsStr]) -> anyhow::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let mut lines = String::new();
+    for a in args {
+        let a = a.to_str().context("argument isn't valid Unicode")?;
+        anyhow::ensure!(!a.contains(['\n', '\r']), "argument contains a line break");
+        lines.push_str(a);
+        lines.push('\n');
+    }
+    let argfile = std::env::temp_dir().join(format!(
+        "photo-stamp-args-{}-{}.txt",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&argfile, lines)?;
+    let out = Command::new(exiftool_program())
+        .args(["-charset".as_ref(), "filename=utf8".as_ref(), "-@".as_ref(), argfile.as_os_str()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let _ = std::fs::remove_file(&argfile);
+    Ok(out?)
 }
 
 /// Read the metadata we care about from any supported file.
@@ -71,7 +117,7 @@ pub fn read(path: &Path) -> anyhow::Result<PhotoInfo> {
         "-Orientation",
         "-XMP-dc:Subject",
     ];
-    let mut args: Vec<&std::ffi::OsStr> = ["-json", "-n"].iter().chain(&tags).map(|s| s.as_ref()).collect();
+    let mut args: Vec<&OsStr> = ["-json", "-n"].iter().chain(&tags).map(|s| s.as_ref()).collect();
     args.extend(["--".as_ref(), path.as_os_str()]);
     parse_json(&String::from_utf8_lossy(&exiftool(&args)?))
 }
@@ -139,7 +185,7 @@ pub fn copy_to_stamped(src: &Path, dest: &Path, width: u32, height: u32) -> anyh
     let w = format!("-ExifImageWidth={width}");
     let h = format!("-ExifImageHeight={height}");
     let marker = format!("-XMP-dc:Subject+={MARKER}");
-    let args: [&std::ffi::OsStr; 13] = [
+    let args: [&OsStr; 13] = [
         "-q".as_ref(),
         "-overwrite_original".as_ref(),
         "-TagsFromFile".as_ref(),

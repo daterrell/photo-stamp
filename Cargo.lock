@@ -1313,12 +1313,14 @@ dependencies = [
  "image",
  "imageproc",
  "libheif-rs",
+ "log",
  "notify",
  "serde",
  "serde_json",
  "tzf-rs",
  "ureq",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
