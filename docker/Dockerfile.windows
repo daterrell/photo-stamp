@@ -1,0 +1,57 @@
+# Cross-builds photo-stamp.exe for 64-bit Windows with HEIC support compiled in: libde265 (decode),
+# x265 (encode) and libheif are built as static libraries, so the exe needs no codec DLLs.
+# Used by scripts/build-windows.sh; build context is the repository root.
+
+FROM rust:1-slim AS toolchain
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        mingw-w64 cmake nasm pkg-config make curl ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+RUN rustup target add x86_64-pc-windows-gnu
+COPY docker/mingw.cmake /opt/mingw.cmake
+# pkg-config must only ever see the Windows libraries.
+ENV PKG_CONFIG_LIBDIR=/opt/win/lib/pkgconfig PKG_CONFIG_ALLOW_CROSS=1
+
+FROM toolchain AS codecs
+ARG LIBDE265=1.1.3
+ARG X265=4.2
+ARG LIBHEIF=1.23.6
+WORKDIR /build
+RUN curl -fsSL https://github.com/strukturag/libde265/releases/download/v${LIBDE265}/libde265-${LIBDE265}.tar.gz | tar xz \
+ && cmake -S libde265-${LIBDE265} -B de265 -DCMAKE_TOOLCHAIN_FILE=/opt/mingw.cmake -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/win -DBUILD_SHARED_LIBS=OFF -DENABLE_SDL=OFF -DENABLE_DECODER=OFF -DENABLE_ENCODER=OFF \
+ && cmake --build de265 -j"$(nproc)" && cmake --install de265
+RUN curl -fsSL https://download.videolan.org/pub/videolan/x265/x265_${X265}.tar.gz | tar xz \
+ && cmake -S x265_${X265}/source -B x265 -DCMAKE_TOOLCHAIN_FILE=/opt/mingw.cmake -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/win -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DENABLE_ASSEMBLY=ON \
+ && cmake --build x265 -j"$(nproc)" && cmake --install x265
+RUN curl -fsSL https://github.com/strukturag/libheif/releases/download/v${LIBHEIF}/libheif-${LIBHEIF}.tar.gz | tar xz \
+ && cmake -S libheif-${LIBHEIF} -B heif -DCMAKE_TOOLCHAIN_FILE=/opt/mingw.cmake -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/opt/win -DCMAKE_PREFIX_PATH=/opt/win -DBUILD_SHARED_LIBS=OFF \
+      -DCMAKE_C_FLAGS=-DLIBDE265_STATIC_BUILD -DCMAKE_CXX_FLAGS=-DLIBDE265_STATIC_BUILD \
+      -DENABLE_PLUGIN_LOADING=OFF -DBUILD_TESTING=OFF -DWITH_EXAMPLES=OFF -DWITH_GDK_PIXBUF=OFF \
+      -DWITH_LIBDE265=ON -DWITH_X265=ON \
+      -DWITH_X264=OFF -DWITH_OpenH264_DECODER=OFF -DWITH_AOM_DECODER=OFF -DWITH_AOM_ENCODER=OFF \
+      -DWITH_DAV1D=OFF -DWITH_RAV1E=OFF -DWITH_SvtEnc=OFF -DWITH_KVAZAAR=OFF -DWITH_FFMPEG_DECODER=OFF \
+      -DWITH_JPEG_DECODER=OFF -DWITH_JPEG_ENCODER=OFF -DWITH_OpenJPEG_DECODER=OFF -DWITH_OpenJPEG_ENCODER=OFF \
+      -DWITH_OPENJPH_ENCODER=OFF -DWITH_LIBSHARPYUV=OFF -DWITH_HEADER_COMPRESSION=OFF -DWITH_UNCOMPRESSED_CODEC=OFF \
+ && cmake --build heif -j"$(nproc)" && cmake --install heif
+
+FROM codecs AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY assets assets
+COPY src src
+COPY tests tests
+# Link everything (libheif, codecs, libstdc++, libgcc, winpthread) statically into the exe. The
+# codecs' pkg-config files ask for -lstdc++/-lgcc_s by name, and the linker would pick the DLL
+# import libraries; a search directory holding only the static archives, placed first, prevents that.
+RUN mkdir /opt/staticlibs \
+ && cp "$(x86_64-w64-mingw32-gcc-posix -print-file-name=libstdc++.a)" /opt/staticlibs/ \
+ && cp "$(x86_64-w64-mingw32-gcc-posix -print-file-name=libgcc_eh.a)" /opt/staticlibs/libgcc_s.a \
+ && cp /usr/x86_64-w64-mingw32/lib/libwinpthread.a /usr/x86_64-w64-mingw32/lib/libpthread.a /opt/staticlibs/
+ENV SYSTEM_DEPS_LIBHEIF_LINK=static \
+    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc-posix \
+    CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++-posix \
+    CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc-posix \
+    RUSTFLAGS="-L native=/opt/staticlibs -C link-arg=-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++"
+RUN cargo build --release --locked --target x86_64-pc-windows-gnu

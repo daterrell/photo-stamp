@@ -42,6 +42,42 @@ All metadata (EXIF, XMP, IPTC, ICC profile) is copied to the stamped file, with 
 rotated upright before drawing) and the XMP keyword `photo-stamp` added, which is how already-stamped photos
 are recognised and never stamped twice.
 
+## Windows: stamp photos in place
+
+A standalone `photo-stamp.exe` that watches **the folder it's in, and all its subfolders**, and replaces
+each **new** photo with the same photo plus the stamp, under the same name and with the same file dates.
+There's no backup copy. Camera RAW files are never modified; a stamped `<name>.jpg` is written beside them.
+
+- **New photos only.** Photos already in the folder when it first starts are left alone. "New" is judged by
+  the file's creation time, because Explorer keeps a copied photo's original modified date. It keeps a
+  heartbeat (`%LOCALAPPDATA%\photo-stamp\state-*.json`), so photos added while it wasn't running are caught
+  when it next starts.
+- **Runs in the background:** no window, one instance per folder. It logs to
+  `%LOCALAPPDATA%\photo-stamp\photo-stamp.log`.
+- **Filesystem events** give instant pickup, with a scan every 30 s as backup. Files open in another program
+  (or mid-sync) are retried, as are photos whose place lookup fails because OpenStreetMap is unavailable.
+- **HEIC** (iPhone) support is compiled in, so no codec packs are needed. exiftool is bundled in
+  `photo-stamp-files\` beside the exe, which the watcher ignores.
+
+Setup: copy `photo-stamp.exe` and `photo-stamp-files\` into the folder, then double-click the exe. From a
+terminal in that folder:
+
+```
+photo-stamp.exe --install-startup     # start at login (HKCU Run entry) and start now
+photo-stamp.exe --uninstall-startup
+photo-stamp.exe --stop
+photo-stamp.exe stamp <files>         # one-off
+```
+
+Build it (Docker only; produces `dist/photo-stamp-windows/` and `dist/photo-stamp-windows.zip`):
+
+```sh
+scripts/build-windows.sh
+```
+
+`docker/Dockerfile.windows` cross-compiles libde265, x265 and libheif as static libraries with mingw-w64,
+then builds the exe against them. The script adds the portable exiftool release, verified by checksum.
+
 ## Watch folder (Docker)
 
 ```sh
