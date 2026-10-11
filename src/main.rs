@@ -1,4 +1,5 @@
-// A background app on Windows: no console window (one is attached when run from a terminal).
+// A background app on Windows: no console window. One-shot commands (--stop, stamp, --help…)
+// print to the terminal they were run from.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
@@ -108,33 +109,36 @@ enum Command {
 }
 
 /// Whether output can be seen: always on Linux; on Windows only when started from a terminal.
-fn console_attached() -> bool {
-    #[cfg(windows)]
-    return photo_stamp::winsys::attach_parent_console();
-    #[cfg(not(windows))]
-    true
+/// On Windows this attaches to that terminal, so it's only called when there's something to say:
+/// the background watcher itself never attaches (it would hold the terminal and print into it).
+fn console() -> bool {
+    static ATTACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ATTACHED.get_or_init(|| {
+        #[cfg(windows)]
+        return photo_stamp::winsys::attach_parent_console();
+        #[cfg(not(windows))]
+        true
+    })
 }
 
-/// Tell the user something: on the console if there is one, otherwise in a message box (Windows).
-fn tell(console: bool, text: &str, is_error: bool) {
+/// Tell the user something: on the terminal if started from one, otherwise in a message box.
+fn tell(text: &str, is_error: bool) {
     #[cfg(windows)]
-    if !console {
+    if !console() {
         photo_stamp::winsys::message_box(text, is_error);
         return;
     }
-    let _ = console;
     if is_error { eprintln!("{text}") } else { println!("{text}") }
 }
 
 fn main() -> ExitCode {
-    let console = console_attached();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
-            if console {
+            if console() {
                 let _ = e.print();
             } else {
-                tell(false, &e.to_string(), e.use_stderr());
+                tell(&e.to_string(), e.use_stderr());
             }
             return if e.use_stderr() { ExitCode::FAILURE } else { ExitCode::SUCCESS };
         }
@@ -143,8 +147,9 @@ fn main() -> ExitCode {
         if cli.common.offline { Box::new(NoGeocoder) } else { Box::new(OsmGeocoder::new(&cli.common.lang)) };
 
     match cli.command {
-        None => here(cli.here, &cli.common, geo.as_ref(), console),
+        None => here(cli.here, &cli.common, geo.as_ref()),
         Some(command) => {
+            console();
             let _ = logging::init(None, true);
             if let Err(e) = metadata::check_exiftool() {
                 eprintln!("error: {e:#}");
@@ -175,12 +180,12 @@ fn main() -> ExitCode {
 }
 
 /// The default action: stamp new photos in place in this program's folder (or `--root`).
-fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder, console: bool) -> ExitCode {
+fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder) -> ExitCode {
     let exe = std::env::current_exe().ok();
     let root = match args.root.clone().or_else(|| exe.as_ref().and_then(|e| e.parent().map(Path::to_owned))) {
         Some(r) => std::fs::canonicalize(&r).unwrap_or(r),
         None => {
-            tell(console, "Can't tell which folder to watch; use --root.", true);
+            tell("Can't tell which folder to watch; use --root.", true);
             return ExitCode::FAILURE;
         }
     };
@@ -188,31 +193,33 @@ fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder, console: bool) -> E
     let root = PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\").to_owned());
 
     if args.stop || args.install_startup || args.uninstall_startup {
-        return manage(&args, &root, exe.as_deref(), console);
+        return manage(&args, &root, exe.as_deref());
     }
 
     let data = paths::data_dir();
     let log_file = data.as_ref().map(|d| d.join("photo-stamp.log"));
-    if let Err(e) = logging::init(log_file.as_deref(), console) {
-        tell(console, &format!("Couldn't start logging: {e:#}"), true);
+    // The watcher logs to its file (and the terminal on Linux); on Windows it never attaches to a
+    // terminal, as it keeps running long after the command that started it.
+    if let Err(e) = logging::init(log_file.as_deref(), cfg!(not(windows))) {
+        tell(&format!("Couldn't start logging: {e:#}"), true);
     }
 
     #[cfg(windows)]
     let _instance = match photo_stamp::winsys::single_instance(&root) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
-            tell(console, &format!("photo-stamp is already watching {}.", root.display()), false);
+            tell(&format!("photo-stamp is already watching {}.", root.display()), false);
             return ExitCode::SUCCESS;
         }
         Err(e) => {
-            tell(console, &format!("Couldn't check for another photo-stamp: {e}"), true);
+            tell(&format!("Couldn't check for another photo-stamp: {e}"), true);
             return ExitCode::FAILURE;
         }
     };
 
     if let Err(e) = metadata::check_exiftool() {
         error!("{e:#}");
-        tell(console, &format!("{e:#}"), true);
+        tell(&format!("{e:#}"), true);
         return ExitCode::FAILURE;
     }
 
@@ -227,7 +234,7 @@ fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder, console: bool) -> E
         Ok(w) => w,
         Err(e) => {
             error!("{e:#}");
-            tell(console, &format!("{e:#}"), true);
+            tell(&format!("{e:#}"), true);
             return ExitCode::FAILURE;
         }
     };
@@ -249,7 +256,7 @@ fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder, console: bool) -> E
 
 /// --stop / --install-startup / --uninstall-startup.
 #[cfg(windows)]
-fn manage(args: &HereArgs, root: &Path, exe: Option<&Path>, console: bool) -> ExitCode {
+fn manage(args: &HereArgs, root: &Path, exe: Option<&Path>) -> ExitCode {
     use photo_stamp::winsys;
     let result: anyhow::Result<String> = (|| {
         if args.stop {
@@ -272,12 +279,21 @@ fn manage(args: &HereArgs, root: &Path, exe: Option<&Path>, console: bool) -> Ex
             command.push_str(&format!(" --root \"{}\"", root.display()));
         }
         winsys::install_startup(root, &command)?;
-        // And start it now, detached, unless it's already running.
+        // And start it now, fully detached from this terminal (if it's already running, the new
+        // copy notices and exits).
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
         let mut start = std::process::Command::new(exe);
         if args.root.is_some() {
             start.arg("--root").arg(root);
         }
-        start.spawn()?;
+        start
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(DETACHED_PROCESS)
+            .spawn()?;
         Ok(format!(
             "photo-stamp will start at login and is now watching {}.\nNew photos there are stamped in place.",
             root.display()
@@ -285,18 +301,18 @@ fn manage(args: &HereArgs, root: &Path, exe: Option<&Path>, console: bool) -> Ex
     })();
     match result {
         Ok(msg) => {
-            tell(console, &msg, false);
+            tell(&msg, false);
             ExitCode::SUCCESS
         }
         Err(e) => {
-            tell(console, &format!("{e:#}"), true);
+            tell(&format!("{e:#}"), true);
             ExitCode::FAILURE
         }
     }
 }
 
 #[cfg(not(windows))]
-fn manage(_: &HereArgs, _: &Path, _: Option<&Path>, _: bool) -> ExitCode {
+fn manage(_: &HereArgs, _: &Path, _: Option<&Path>) -> ExitCode {
     eprintln!("--stop and --install-startup are Windows features; on Linux use your service manager.");
     ExitCode::FAILURE
 }
