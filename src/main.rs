@@ -171,6 +171,7 @@ fn main() -> ExitCode {
                         events: !no_events,
                         quality: cli.common.quality,
                     };
+                    geo.warm_up();
                     match watch::Inbox::new(&root, config, geo.as_ref()).and_then(|inbox| inbox.run()) {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(e) => {
@@ -248,6 +249,7 @@ fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder) -> ExitCode {
         quality: common.quality,
         state_file: data.map(|d| d.join(format!("state-{}.json", paths::folder_key(&root)))),
     };
+    geo.warm_up();
     let watcher = match InPlace::new(&root, config, geo) {
         Ok(w) => w,
         Err(e) => {

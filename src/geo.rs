@@ -49,6 +49,9 @@ impl Place {
 /// Anything that can name a location. A trait so tests and `--offline` can avoid the network.
 pub trait Geocoder {
     fn place(&self, at: GpsPoint) -> anyhow::Result<Option<Place>>;
+
+    /// Prepare in the background (e.g. download indexes) so the first lookup is quick.
+    fn warm_up(&self) {}
 }
 
 /// Never looks anything up.

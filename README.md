@@ -34,8 +34,9 @@ Tue 3 Jun 2025, 15:10 PDT
   score for ~1M places from [Wikidata](https://www.wikidata.org). Always available, so the town line never waits.
 - **Overture Maps** is read on demand: just the few row groups around each photo, fetched as plain byte ranges
   from Overture's public files on AWS (Azure as fallback), and kept in a disk cache (400 MB cap,
-  `PHOTO_STAMP_OVERTURE_CACHE_MB`). The first lookup of each Overture release (roughly monthly) downloads about
-  60 MB of file indexes; after that a new spot costs a few MB and repeat spots are instant and offline. If
+  `PHOTO_STAMP_OVERTURE_CACHE_MB`). Each Overture release (roughly monthly) needs about 70 MB of file indexes,
+  downloaded in the background when the watcher starts; after that a new spot costs about 10–20 MB and a few
+  seconds, and repeat spots are instant and offline. If
   Overture can't be reached, photos still get town/region/country and nearby famous landmarks (watch mode first
   retries for a few minutes). `--offline` uses the bundled data only.
 - **When**: the *local time at the place the photo was taken*, with its zone. The true instant comes from

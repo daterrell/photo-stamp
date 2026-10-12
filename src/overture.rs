@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -71,6 +72,11 @@ impl Dataset {
             Dataset::Infrastructure => "infrastructure",
             Dataset::Division => "division",
         }
+    }
+
+    /// Point datasets: the bounding box *is* the location, so the geometry column isn't read.
+    fn is_points(self) -> bool {
+        matches!(self, Dataset::Places | Dataset::Division)
     }
 
     /// Top-level columns we read (besides names, bbox and geometry).
@@ -136,6 +142,8 @@ pub struct Overture {
     cache: RangeCache,
     state: Mutex<Option<ReleaseState>>,
     indexes: Mutex<HashMap<(String, Dataset), DatasetIndex>>,
+    /// Bytes fetched over the network (for logging what a lookup cost).
+    downloaded: AtomicU64,
 }
 
 fn now_secs() -> u64 {
@@ -201,6 +209,7 @@ impl Overture {
             cache: RangeCache::new(&dir.join("cache"), cap_mb * 1024 * 1024)?,
             state: Mutex::new(state),
             indexes: Mutex::new(HashMap::new()),
+            downloaded: AtomicU64::new(0),
         })
     }
 
@@ -227,6 +236,7 @@ impl Overture {
             match attempt() {
                 Ok(b) => {
                     self.cache.put(key, start, len, &b);
+                    self.downloaded.fetch_add(len as u64, Ordering::Relaxed);
                     return Ok(b);
                 }
                 Err(e) => last_err = Some(e),
@@ -346,12 +356,40 @@ impl Overture {
 
     /// A file's parquet metadata, from its footer (cached like any other range).
     fn metadata(&self, key: &str, size: u64) -> anyhow::Result<ParquetMetaData> {
+        Ok(self.metadata_with_footer(key, size)?.0)
+    }
+
+    /// The metadata plus the footer byte ranges it came from (the parquet reader wants them again).
+    fn metadata_with_footer(
+        &self,
+        key: &str,
+        size: u64,
+    ) -> anyhow::Result<(ParquetMetaData, Vec<(u64, Bytes)>)> {
         let tail = self.range(key, size - 8, 8)?;
         anyhow::ensure!(&tail[4..] == b"PAR1", "{key} isn't a parquet file");
         let meta_len = u32::from_le_bytes(tail[..4].try_into().unwrap()) as u64;
         let footer = self.range(key, size - 8 - meta_len, meta_len as usize)?;
-        let sparse = SparseFile::new(size, vec![(size - 8 - meta_len, footer), (size - 8, tail)]);
-        Ok(ParquetMetaDataReader::new().parse_and_finish(&sparse)?)
+        let ranges = vec![(size - 8 - meta_len, footer), (size - 8, tail)];
+        let meta = ParquetMetaDataReader::new().parse_and_finish(&SparseFile::new(size, ranges.clone()))?;
+        Ok((meta, ranges))
+    }
+
+    /// Build the release's indexes now (e.g. in the background at startup), so the first photo
+    /// doesn't wait for them.
+    pub fn warm_up(&self) -> anyhow::Result<()> {
+        let release = self.release()?;
+        std::thread::scope(|s| {
+            let jobs: Vec<_> = Dataset::ALL
+                .iter()
+                .map(|&ds| {
+                    s.spawn({
+                        let release = &release;
+                        move || self.index(release, ds).map(drop)
+                    })
+                })
+                .collect();
+            jobs.into_iter().try_for_each(|j| j.join().map_err(|_| anyhow!("index worker panicked"))?)
+        })
     }
 
     /// Named features of `ds` whose bounding box comes within `radius_m` of `at`.
@@ -359,52 +397,80 @@ impl Overture {
         let release = self.release()?;
         let index = self.index(&release, ds)?;
         let q = query_box(at, radius_m);
+        let hits: Vec<(&FileIndex, Vec<usize>)> = index
+            .iter()
+            .map(|f| {
+                (f, (0..f.row_groups.len()).filter(|&i| overlaps(f.row_groups[i], q)).collect::<Vec<_>>())
+            })
+            .filter(|(_, groups)| !groups.is_empty())
+            .collect();
+        // Usually one to three files; read them side by side.
+        let out = std::thread::scope(|s| {
+            let jobs: Vec<_> = hits
+                .iter()
+                .map(|(file, groups)| s.spawn(move || self.read_file(file, groups, ds, at, q)))
+                .collect();
+            let mut out = Vec::new();
+            for j in jobs {
+                out.extend(j.join().map_err(|_| anyhow!("reader panicked"))??);
+            }
+            anyhow::Ok(out)
+        })?;
+        Ok(out)
+    }
+
+    /// Total bytes fetched over the network so far.
+    pub fn downloaded_bytes(&self) -> u64 {
+        self.downloaded.load(Ordering::Relaxed)
+    }
+
+    /// Decode the matching row groups of one file, fetching just the columns we need.
+    fn read_file(
+        &self,
+        file: &FileIndex,
+        groups: &[usize],
+        ds: Dataset,
+        at: GpsPoint,
+        q: [f64; 4],
+    ) -> anyhow::Result<Vec<Feature>> {
+        let (meta, footer) = self.metadata_with_footer(&file.key, file.size)?;
+        let mask = projection(&meta, ds);
+        let mut wanted: Vec<(u64, u64)> = groups
+            .iter()
+            .flat_map(|&g| meta.row_group(g).columns().iter().enumerate())
+            .filter(|(i, _)| mask.leaf_included(*i))
+            .map(|(_, c)| c.byte_range())
+            .collect();
+        // Column chunks of a row group sit next to each other: merge them (and small gaps) into a
+        // few larger requests instead of one round trip per column.
+        wanted.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (start, len) in wanted {
+            match merged.last_mut() {
+                Some((s, l)) if start <= *s + *l + MERGE_GAP => *l = (*l).max(start + len - *s),
+                _ => merged.push((start, len)),
+            }
+        }
+        let mut ranges = footer;
+        for (start, len) in merged {
+            ranges.push((start, self.range(&file.key, start, len as usize)?));
+        }
+        let sparse = SparseFile::new(file.size, ranges);
+        let arrow_meta = ArrowReaderMetadata::try_new(Arc::new(meta), ArrowReaderOptions::new())?;
+        let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(sparse, arrow_meta)
+            .with_row_groups(groups.to_vec())
+            .with_projection(mask)
+            .build()?;
         let mut out = Vec::new();
-        for file in index.iter() {
-            let groups: Vec<usize> =
-                (0..file.row_groups.len()).filter(|&i| overlaps(file.row_groups[i], q)).collect();
-            if groups.is_empty() {
-                continue;
-            }
-            let meta = self.metadata(&file.key, file.size)?;
-            let mask = projection(&meta, ds);
-            // Fetch exactly the column chunks we'll decode, then decode from memory.
-            let mut ranges: Vec<(u64, Bytes)> = Vec::new();
-            for &g in &groups {
-                for (i, col) in meta.row_group(g).columns().iter().enumerate() {
-                    if mask.leaf_included(i) {
-                        let (start, len) = col.byte_range();
-                        ranges.push((start, self.range(&file.key, start, len as usize)?));
-                    }
-                }
-            }
-            let footer_start = file.size - 8 - meta_footer_len(&meta, file.size);
-            ranges.push((
-                footer_start,
-                self.range(&file.key, footer_start, (file.size - footer_start) as usize)?,
-            ));
-            let sparse = SparseFile::new(file.size, ranges);
-            let arrow_meta = ArrowReaderMetadata::try_new(Arc::new(meta), ArrowReaderOptions::new())?;
-            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(sparse, arrow_meta)
-                .with_row_groups(groups)
-                .with_projection(mask)
-                .build()?;
-            for batch in reader {
-                collect_features(&batch?, ds, at, q, &mut out)?;
-            }
+        for batch in reader {
+            collect_features(&batch?, ds, at, q, &mut out)?;
         }
         Ok(out)
     }
 }
 
-fn meta_footer_len(meta: &ParquetMetaData, file_size: u64) -> u64 {
-    // Everything after the last column chunk is footer metadata.
-    let end = (0..meta.num_row_groups())
-        .flat_map(|g| meta.row_group(g).columns().iter().map(|c| c.byte_range()).map(|(s, l)| s + l))
-        .max()
-        .unwrap_or(4);
-    file_size - 8 - end
-}
+/// Column chunks closer together than this are fetched in one request.
+const MERGE_GAP: u64 = 256 * 1024;
 
 /// xmin, xmax, ymin, ymax around a point.
 fn query_box(at: GpsPoint, radius_m: f64) -> [f64; 4] {
@@ -444,7 +510,7 @@ fn projection(meta: &ParquetMetaData, ds: Dataset) -> ProjectionMask {
         path == "names.primary"
             || path.starts_with("names.common.")
             || path.starts_with("bbox.")
-            || path == "geometry"
+            || (path == "geometry" && !ds.is_points())
             || ds.extra_columns().contains(&path.as_str())
     });
     ProjectionMask::leaves(schema, leaves)

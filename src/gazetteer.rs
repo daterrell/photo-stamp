@@ -10,7 +10,7 @@
 //! later), but town/region/country and bundled landmarks are still there.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::geo::{Geocoder, Name, Place};
 use crate::metadata::GpsPoint;
@@ -247,14 +247,14 @@ fn same(a: &Name, b: &Name) -> bool {
 /// The geocoder used by photo-stamp: bundled data plus Overture on demand.
 pub struct Gazetteer {
     places: PlacesDb,
-    overture: Option<Overture>,
+    overture: Option<Arc<Overture>>,
     cache: Mutex<HashMap<String, Place>>,
 }
 
 impl Gazetteer {
     /// `overture: None` means fully offline (bundled data only).
     pub fn new(places: PlacesDb, overture: Option<Overture>) -> Self {
-        Self { places, overture, cache: Mutex::new(HashMap::new()) }
+        Self { places, overture: overture.map(Arc::new), cache: Mutex::new(HashMap::new()) }
     }
 
     fn lookup_overture(
@@ -262,9 +262,18 @@ impl Gazetteer {
         ov: &Overture,
         at: GpsPoint,
     ) -> anyhow::Result<(Vec<Feature>, Vec<Feature>, Vec<Feature>)> {
-        let mut features = ov.features_near(Dataset::LandUse, at, SEARCH_M)?;
-        features.extend(ov.features_near(Dataset::Infrastructure, at, SEARCH_M)?);
-        let divisions = ov.features_near(Dataset::Division, at, DIVISION_SEARCH_M)?;
+        let (land, infra, divisions) = std::thread::scope(|s| {
+            let land = s.spawn(|| ov.features_near(Dataset::LandUse, at, SEARCH_M));
+            let infra = s.spawn(|| ov.features_near(Dataset::Infrastructure, at, SEARCH_M));
+            let divisions = ov.features_near(Dataset::Division, at, DIVISION_SEARCH_M);
+            let join = |h: std::thread::ScopedJoinHandle<'_, anyhow::Result<Vec<Feature>>>| {
+                h.join().map_err(|_| anyhow::anyhow!("Overture lookup panicked"))?
+            };
+            (join(land), join(infra), divisions)
+        });
+        let mut features = land?;
+        features.extend(infra?);
+        let divisions = divisions?;
         // Points of interest only matter when there's no venue: skip the download otherwise.
         let inside_venue = features.iter().any(|f| f.contains && venue_weight(f) > 0.0);
         let places = if inside_venue { Vec::new() } else { ov.features_near(Dataset::Places, at, SEARCH_M)? };
@@ -273,6 +282,24 @@ impl Gazetteer {
 }
 
 impl Geocoder for Gazetteer {
+    fn warm_up(&self) {
+        let Some(ov) = self.overture.clone() else { return };
+        std::thread::spawn(move || {
+            let before = ov.downloaded_bytes();
+            match ov.warm_up() {
+                Ok(()) => {
+                    let mb = (ov.downloaded_bytes() - before) as f64 / 1_048_576.0;
+                    if mb > 0.0 {
+                        log::info!("Overture: indexes ready ({mb:.0} MB downloaded)");
+                    }
+                }
+                Err(e) => log::warn!(
+                    "Overture: couldn't prepare indexes now (will retry on the first photo): {e:#}"
+                ),
+            }
+        });
+    }
+
     fn place(&self, at: GpsPoint) -> anyhow::Result<Option<Place>> {
         // ~11 m: photos from the same spot share a result.
         let key = format!("{:.4},{:.4}", at.lat, at.lon);
@@ -283,13 +310,21 @@ impl Geocoder for Gazetteer {
         let landmarks = self.places.landmarks_near(at, LANDMARK_MAX_REACH_M)?;
         let (features, places, divisions, complete) = match &self.overture {
             None => (Vec::new(), Vec::new(), Vec::new(), true),
-            Some(ov) => match self.lookup_overture(ov, at) {
-                Ok((f, p, d)) => (f, p, d, true),
-                Err(e) => {
-                    log::warn!("Overture lookup failed, using bundled data only: {e:#}");
-                    (Vec::new(), Vec::new(), Vec::new(), false)
+            Some(ov) => {
+                let before = ov.downloaded_bytes();
+                let result = self.lookup_overture(ov, at);
+                let fetched = ov.downloaded_bytes() - before;
+                if fetched > 0 {
+                    log::info!("Overture: downloaded {:.1} MB for this spot", fetched as f64 / 1_048_576.0);
                 }
-            },
+                match result {
+                    Ok((f, p, d)) => (f, p, d, true),
+                    Err(e) => {
+                        log::warn!("Overture lookup failed, using bundled data only: {e:#}");
+                        (Vec::new(), Vec::new(), Vec::new(), false)
+                    }
+                }
+            }
         };
         let big_city = self.places.big_city(at)?;
         let surroundings = Surroundings {
