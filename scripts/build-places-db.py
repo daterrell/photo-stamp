@@ -8,7 +8,7 @@
   landmark                  The notable ones among those (not towns or admin areas), with English and
                             local names, so famous landmarks can be named fully offline.
 
-Uses only the Python standard library. Downloads are cached (default ~/.cache/photo-stamp-dev/places-src).
+Uses only the Python standard library. Downloads are reused for 30 days (default ~/.cache/photo-stamp-dev/places-src).
 
   scripts/build-places-db.py OUT.sqlite
   scripts/build-places-db.py --near 36.56,-121.94 --near 48.858,2.294 --radius-km 30 \
@@ -42,7 +42,7 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-def fetch(url: str, dest: Path, data: bytes | None = None, max_age_days: float = 7) -> Path:
+def fetch(url: str, dest: Path, data: bytes | None = None, max_age_days: float = 30) -> Path:
     """Download `url` to `dest` unless a fresh enough copy is already there."""
     if dest.exists() and time.time() - dest.stat().st_mtime < max_age_days * 86400:
         return dest
