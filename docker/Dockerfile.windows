@@ -55,3 +55,7 @@ ENV SYSTEM_DEPS_LIBHEIF_LINK=static \
     CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc-posix \
     RUSTFLAGS="-L native=/opt/staticlibs -C link-arg=-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++"
 RUN cargo build --release --locked --target x86_64-pc-windows-gnu
+
+# Just the exe, for `docker buildx build --target exe --output type=local,dest=…` (used by CI).
+FROM scratch AS exe
+COPY --from=build /src/target/x86_64-pc-windows-gnu/release/photo-stamp.exe /photo-stamp.exe

@@ -1,6 +1,17 @@
 # photo-stamp
 
+[![CI](https://github.com/daterrell/photo-stamp/actions/workflows/ci.yml/badge.svg)](https://github.com/daterrell/photo-stamp/actions/workflows/ci.yml)
+
 Burns **where** and **when** a photo was taken into its bottom-left corner, using the photo's own metadata.
+
+**Downloads**
+- **Windows:** `photo-stamp-windows-<version>.zip` on the [Releases](https://github.com/daterrell/photo-stamp/releases)
+  page. Every CI run on `main` also has a `photo-stamp-windows` artifact with the latest build.
+- **Docker:** `docker pull ghcr.io/daterrell/photo-stamp:latest` (or `:main` for the newest build). It's a
+  private package, so log in first with `docker login ghcr.io`.
+
+To release, bump `version` in `Cargo.toml`, then tag and push the tag (`git tag v0.4.0 && git push origin v0.4.0`).
+CI builds and attaches the Windows zip, and publishes the Docker image.
 
 ```
 Pebble Beach Golf Course

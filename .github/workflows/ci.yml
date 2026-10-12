@@ -1,0 +1,176 @@
+name: CI
+
+# Checks every push and pull request; on success builds the Windows zip. Pushes to main and
+# version tags also publish the Docker image, and v* tags create a GitHub Release.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Tests, clippy, rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/photo-stamp-dev/cargo/registry
+            ~/.cache/photo-stamp-dev/cargo/git
+            target
+          key: check-${{ hashFiles('Cargo.lock', 'docker/Dockerfile') }}
+          restore-keys: check-
+      # dev.sh runs everything in the dev image, which has the exiftool, libheif and fonts the
+      # tests need.
+      - name: rustfmt
+        run: ./dev.sh cargo fmt --check
+      - name: clippy
+        run: ./dev.sh cargo clippy --all-targets --locked -- -D warnings
+      - name: tests
+        run: ./dev.sh cargo test --locked
+
+  check-windows:
+    name: Clippy (Windows target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64
+          rustup toolchain install stable --profile minimal --component clippy --target x86_64-pc-windows-gnu
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: check-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: check-windows-
+      # HEIC (libheif) is linked statically in the real build; without it this still checks all the
+      # Windows-only code.
+      - run: cargo clippy --target x86_64-pc-windows-gnu --no-default-features --all-targets --locked -- -D warnings
+
+  windows:
+    name: Windows zip
+    needs: [check, check-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      # The static libde265/x265/libheif build takes ~10 minutes; the layer cache skips it.
+      - name: Build photo-stamp.exe
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.windows
+          target: exe
+          outputs: type=local,dest=build-out
+          cache-from: type=gha,scope=windows
+          cache-to: type=gha,scope=windows,mode=max
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/photo-stamp-dev/downloads
+          key: downloads-${{ hashFiles('scripts/build-windows.sh') }}
+      - name: Package with exiftool
+        run: scripts/build-windows.sh
+        env:
+          PHOTO_STAMP_EXE: build-out/photo-stamp.exe
+      - name: Only Windows system DLLs
+        run: |
+          sudo apt-get install -y --no-install-recommends binutils-mingw-w64-x86-64 >/dev/null
+          x86_64-w64-mingw32-objdump -p dist/photo-stamp-windows/photo-stamp.exe | grep "DLL Name" | sort -uf | tee dlls.txt
+          if grep -iE "libgcc|libstdc|libwinpthread|libheif|libde265|x265" dlls.txt; then
+            echo "::error::photo-stamp.exe depends on non-system DLLs"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: photo-stamp-windows
+          path: dist/photo-stamp-windows/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: photo-stamp-windows-zip
+          path: dist/photo-stamp-windows.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  docker:
+    name: Docker image
+    needs: check
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=docker
+          cache-to: type=gha,scope=docker,mode=max
+
+  release:
+    name: GitHub Release
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag matches Cargo.toml
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v8
+        with:
+          name: photo-stamp-windows-zip
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip="photo-stamp-windows-${GITHUB_REF_NAME}.zip"
+          mv photo-stamp-windows.zip "$zip"
+          {
+            echo "Unzip, copy \`photo-stamp.exe\` and the \`photo-stamp-files\` folder into the folder you want"
+            echo "stamped, and double-click \`photo-stamp.exe\`. See README.txt inside the zip."
+            echo
+            echo "Docker image: \`ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME#v}\`"
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" "$zip" --title "photo-stamp $GITHUB_REF_NAME" \
+            --notes-file notes.md --generate-notes

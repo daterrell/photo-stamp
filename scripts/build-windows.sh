@@ -8,6 +8,7 @@
 #   dist/photo-stamp-windows.zip
 #
 # Needs only Docker. The exe is cross-compiled with HEIC support linked in statically.
+# Set PHOTO_STAMP_EXE to package an exe that was already built.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,14 +20,19 @@ DIST=dist/photo-stamp-windows
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/photo-stamp-dev/downloads"
 mkdir -p "$CACHE"
 
-echo "building photo-stamp.exe…"
-docker build -q --target build -t photo-stamp-win-build -f docker/Dockerfile.windows . >/dev/null
-
 rm -rf "$DIST" dist/photo-stamp-windows.zip
 mkdir -p "$DIST/photo-stamp-files"
-container=$(docker create photo-stamp-win-build)
-trap 'docker rm -f "$container" >/dev/null' EXIT
-docker cp "$container:/src/target/x86_64-pc-windows-gnu/release/photo-stamp.exe" "$DIST/photo-stamp.exe"
+
+if [ -n "${PHOTO_STAMP_EXE:-}" ]; then
+  # Already built (CI builds it with a layer cache, see .github/workflows/ci.yml).
+  cp "$PHOTO_STAMP_EXE" "$DIST/photo-stamp.exe"
+else
+  echo "building photo-stamp.exe…"
+  docker build -q --target build -t photo-stamp-win-build -f docker/Dockerfile.windows . >/dev/null
+  container=$(docker create photo-stamp-win-build)
+  trap 'docker rm -f "$container" >/dev/null' EXIT
+  docker cp "$container:/src/target/x86_64-pc-windows-gnu/release/photo-stamp.exe" "$DIST/photo-stamp.exe"
+fi
 
 zip="$CACHE/exiftool-${EXIFTOOL_VERSION}_64.zip"
 if [ ! -f "$zip" ]; then
