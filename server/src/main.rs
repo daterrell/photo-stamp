@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use photo_stamp_server::import::{self, ImportOptions};
+use photo_stamp_server::overture::Dataset;
 use photo_stamp_server::service::{Data, Layout, Service};
 use photo_stamp_server::store::Store;
 
@@ -38,6 +39,9 @@ enum Command {
         /// Only mirror Overture files covering this box: west,east,south,north (degrees)
         #[arg(long, value_parser = parse_bbox)]
         bbox: Option<[f64; 4]>,
+        /// Only mirror these Overture datasets (places, land_use, infrastructure, division)
+        #[arg(long, value_delimiter = ',', value_parser = parse_dataset)]
+        datasets: Vec<Dataset>,
         /// Don't touch the Overture mirror
         #[arg(long)]
         skip_overture: bool,
@@ -48,7 +52,11 @@ enum Command {
         #[arg(long)]
         skip_places: bool,
         /// The places database builder
-        #[arg(long, env = "PHOTO_STAMP_PLACES_SCRIPT", default_value = "/usr/share/photo-stamp/build-places-db.py")]
+        #[arg(
+            long,
+            env = "PHOTO_STAMP_PLACES_SCRIPT",
+            default_value = "/usr/share/photo-stamp/build-places-db.py"
+        )]
         places_script: PathBuf,
     },
     /// Manage the people who use this server
@@ -87,8 +95,14 @@ enum DeviceAction {
     Revoke { device: String },
 }
 
+fn parse_dataset(s: &str) -> Result<Dataset, String> {
+    Dataset::from_slug(s.trim())
+        .ok_or_else(|| format!("{s}: expected places, land_use, infrastructure or division"))
+}
+
 fn parse_bbox(s: &str) -> Result<[f64; 4], String> {
-    let v: Vec<f64> = s.split(',').map(|x| x.trim().parse::<f64>()).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+    let v: Vec<f64> =
+        s.split(',').map(|x| x.trim().parse::<f64>()).collect::<Result<_, _>>().map_err(|e| e.to_string())?;
     match v.as_slice() {
         &[w, e, s, n] if w < e && s < n => Ok([w, e, s, n]),
         _ => Err("expected west,east,south,north".into()),
@@ -112,9 +126,14 @@ fn run(command: Command, layout: &Layout) -> anyhow::Result<()> {
     let store = || Store::open(&layout.app_db());
     match command {
         Command::Serve { listen, offline } => {
-            let data = Data::load(layout, offline).map_err(|e| {
-                e.context("no place data yet: run `photo-stamp-server import` first")
-            })?;
+            // A new server has no place data until its first import finishes.
+            if !layout.places().is_file() {
+                log::info!("waiting for place data: run `photo-stamp-server import` (the compose file does)");
+                while !layout.places().is_file() {
+                    std::thread::sleep(Duration::from_secs(30));
+                }
+            }
+            let data = Data::load(layout, offline)?;
             data.gazetteer.warm_up();
             let service = Arc::new(Service::new(store()?, data, layout.clone(), offline));
             service.watch_for_new_data(Duration::from_secs(60));
@@ -128,10 +147,12 @@ fn run(command: Command, layout: &Layout) -> anyhow::Result<()> {
             photo_stamp_http::serve(listener, Arc::new(move |req| service.handle(req)));
             Ok(())
         }
-        Command::Import { bbox, skip_overture, places_from, skip_places, places_script } => import::run(
-            layout,
-            &ImportOptions { bbox, skip_overture, places_from, skip_places, places_script },
-        ),
+        Command::Import { bbox, datasets, skip_overture, places_from, skip_places, places_script } => {
+            import::run(
+                layout,
+                &ImportOptions { bbox, datasets, skip_overture, places_from, skip_places, places_script },
+            )
+        }
         Command::User { action: UserAction::Add { name } } => {
             store()?.add_user(&name)?;
             println!("Added {name}. Next: photo-stamp-server device add {name} <device name>");
@@ -152,7 +173,8 @@ fn run(command: Command, layout: &Layout) -> anyhow::Result<()> {
         Command::Device { action: DeviceAction::List } => {
             for d in store()?.devices()? {
                 let seen = d.last_seen.map_or("never".to_owned(), |t| {
-                    chrono::DateTime::from_timestamp(t, 0).map_or(t.to_string(), |d| d.format("%Y-%m-%d %H:%M").to_string())
+                    chrono::DateTime::from_timestamp(t, 0)
+                        .map_or(t.to_string(), |d| d.format("%Y-%m-%d %H:%M").to_string())
                 });
                 println!(
                     "{}  {}/{}  history {}  last seen {seen}{}",

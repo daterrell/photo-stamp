@@ -113,7 +113,10 @@ mod tests {
             context: Some("Pebble Beach, California, United States".into()),
             complete: true,
         };
-        assert_eq!(p.lines(), ["Pebble Beach Golf Course", "near Lone Cypress", "Pebble Beach, California, United States"]);
+        assert_eq!(
+            p.lines(),
+            ["Pebble Beach Golf Course", "near Lone Cypress", "Pebble Beach, California, United States"]
+        );
         assert_eq!(format_coords(GpsPoint { lat: -33.8568, lon: 151.2153 }), "33.85680° S, 151.21530° E");
         assert_eq!(GpsPoint { lat: 36.565462, lon: -121.945278 }.cache_key(), "36.5655,-121.9453");
         assert!(!GpsPoint { lat: 91.0, lon: 0.0 }.is_valid());

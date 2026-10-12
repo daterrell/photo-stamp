@@ -201,7 +201,10 @@ impl<'a> Outbox<'a> {
             }
             self.stamp_now.insert(p);
         }
-        info!("stamping now with local place data: {}", rel.map_or("every waiting photo".into(), |r| r.display().to_string()));
+        info!(
+            "stamping now with local place data: {}",
+            rel.map_or("every waiting photo".into(), |r| r.display().to_string())
+        );
     }
 
     /// Whether `path` has waited for the place server longer than the person allows.
@@ -511,14 +514,14 @@ impl<'a> Outbox<'a> {
             let put_aside = match &self.config.originals {
                 Some(o) => {
                     let odir = o.join(rel.parent().unwrap_or(Path::new("")));
-                    std::fs::create_dir_all(&odir)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|()| {
-                            let kept = free_name(&odir, &name, None);
-                            move_file(path, &kept).map(|()| Some(kept))
-                        })
+                    std::fs::create_dir_all(&odir).map_err(anyhow::Error::from).and_then(|()| {
+                        let kept = free_name(&odir, &name, None);
+                        move_file(path, &kept).map(|()| Some(kept))
+                    })
                 }
-                None => std::fs::remove_file(path).map(|()| None).with_context(|| format!("removing {}", path.display())),
+                None => std::fs::remove_file(path)
+                    .map(|()| None)
+                    .with_context(|| format!("removing {}", path.display())),
             };
             match put_aside {
                 Ok(kept) => original = kept,
@@ -557,13 +560,22 @@ impl<'a> Outbox<'a> {
         let overdue = self.overdue(path);
         let strict_geo = !forced && !overdue;
         if overdue && !forced && geo_attempts > 0 {
-            info!("waited long enough for the place server: stamping {} with local place data", self.show(path));
+            info!(
+                "waited long enough for the place server: stamping {} with local place data",
+                self.show(path)
+            );
         }
 
         let rel = self.show(path);
         let id = self.status.start(&rel);
         let result = self.deliver(path, id, strict_geo);
-        let entry = |outcome, reason, caption, output: Option<String>, thumbs, original: Option<String>, gps: Option<GpsPoint>| Entry {
+        let entry = |outcome,
+                     reason,
+                     caption,
+                     output: Option<String>,
+                     thumbs,
+                     original: Option<String>,
+                     gps: Option<GpsPoint>| Entry {
             id,
             path: rel.clone(),
             outcome,
@@ -629,7 +641,15 @@ impl<'a> Outbox<'a> {
                 warn!("couldn't stamp {}: {e:#}; leaving it here", self.show(path));
                 self.settle(path);
                 self.stamp_now.remove(path);
-                self.status.finish(entry(Outcome::Failed, Some(format!("{e:#}")), Vec::new(), None, false, None, None));
+                self.status.finish(entry(
+                    Outcome::Failed,
+                    Some(format!("{e:#}")),
+                    Vec::new(),
+                    None,
+                    false,
+                    None,
+                    None,
+                ));
                 return;
             }
         }
@@ -639,7 +659,8 @@ impl<'a> Outbox<'a> {
                 Waiting::Busy { until: status::now_ms() + LOCKED_RETRY.as_millis() as u64 }
             }
             Some(d) => Waiting::Offline {
-                until: status::now_ms() + d.next_try.saturating_duration_since(Instant::now()).as_millis() as u64,
+                until: status::now_ms()
+                    + d.next_try.saturating_duration_since(Instant::now()).as_millis() as u64,
                 near: d.near.clone(),
                 stamp_by: self.stamp_by(path),
             },
@@ -721,8 +742,8 @@ fn keep_times(path: &Path, before: &Metadata) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::Settings;
     use crate::geo::Place;
+    use crate::settings::Settings;
     use crate::stamp::tests::{EIFFEL_TAGS, FixedPlace, OfflineWithTown, make_photo, temp_dir};
 
     /// The place server can't be reached and the person won't wait at all.
@@ -891,7 +912,8 @@ mod tests {
         assert!(root.join("b.jpg").exists(), "the other keeps waiting");
         st.snapshot(|s| assert_eq!(s.recent[0].caption[0], "Paris"));
         // ...and the waiting list remembers b.jpg across restarts.
-        let saved: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(root.join(".waiting.json")).unwrap()).unwrap();
+        let saved: HashMap<String, u64> =
+            serde_json::from_slice(&std::fs::read(root.join(".waiting.json")).unwrap()).unwrap();
         assert_eq!(saved.keys().collect::<Vec<_>>(), ["b.jpg"]);
 
         // Waited longer than the person allows: stamped with local data without being asked.
@@ -910,7 +932,11 @@ mod tests {
         let before = std::fs::read(root.join("trip/a.jpg")).unwrap();
         w.scan_once();
         assert!(stamped(&root.join("outbox/trip/a.jpg")));
-        assert_eq!(std::fs::read(root.join("originals/trip/a.jpg")).unwrap(), before, "original kept as it was");
+        assert_eq!(
+            std::fs::read(root.join("originals/trip/a.jpg")).unwrap(),
+            before,
+            "original kept as it was"
+        );
         // The originals folder isn't scanned (nothing is stamped twice).
         w.scan_once();
         assert!(!stamped(&root.join("originals/trip/a.jpg")));

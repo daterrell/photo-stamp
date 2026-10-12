@@ -3,7 +3,7 @@
 #
 #   dist/photo-stamp-windows/
 #     photo-stamp.exe, photo-stamp-ui.exe (the dashboard)
-#     photo-stamp-files/exiftool.exe, photo-stamp-files/exiftool_files/, photo-stamp-files/places.sqlite
+#     photo-stamp-files/exiftool.exe, photo-stamp-files/exiftool_files/, photo-stamp-files/towns.sqlite
 #     README.txt
 #   dist/photo-stamp-windows.zip
 #
@@ -70,7 +70,8 @@ if [ ! -f "$places" ]; then
   echo "building $places…"
   python3 scripts/build-places-db.py "$places"
 fi
-cp "$places" "$DIST/photo-stamp-files/places.sqlite"
+# Clients keep only the small towns database; the place server has the rest.
+python3 scripts/make-towns-db.py "$places" "$DIST/photo-stamp-files/towns.sqlite"
 
 cp scripts/windows-README.txt "$DIST/README.txt"
 (cd dist && python3 -m zipfile -c photo-stamp-windows.zip photo-stamp-windows/)

@@ -425,7 +425,11 @@ function waitingChip(q) {
     case "settling": return el("span", { class: "chip", dataset: { kind: "settling" } }, "Copying");
     case "ready": return el("span", { class: "chip", dataset: { kind: "ready" } }, "Next up");
     case "paused": return el("span", { class: "chip", dataset: { kind: "paused" } }, "Paused");
-    case "offline": return el("span", { class: "chip", dataset: { kind: "offline" }, title: `Map data couldn't be reached; trying again${until}` }, "Waiting for map data");
+    case "offline": {
+      const by = q.stamp_by ? `; stamped with what this PC knows at ${clock(q.stamp_by)} if it still can't be reached` : "";
+      return el("span", { class: "chip", dataset: { kind: "offline" }, title: `The place server can't be reached; trying again${until}${by}` },
+        q.near ? `Waiting for the place server, near ${q.near}` : "Waiting for the place server");
+    }
     case "busy": return el("span", { class: "chip", dataset: { kind: "busy" }, title: `Another program has it open; trying again${until}` }, "In use");
     default: return el("span", { class: "chip" }, q.kind);
   }
@@ -436,9 +440,24 @@ function renderQueue() {
   $("queue-count").textContent = q.length || "";
   $("queue-empty").hidden = q.length > 0;
   $("queue-list").replaceChildren(...q.slice(0, 300).map((item) =>
-    el("li", {}, el("span", { class: "path", title: item.path }, item.path), waitingChip(item))));
+    el("li", { class: item.kind === "offline" ? "waiting" : "" }, el("span", { class: "path", title: item.path }, item.path),
+      el("span", { class: "chips" }, waitingChip(item),
+        item.kind === "offline" ? el("button", { class: "ghost small", title: "Stamp it now with what this PC knows", onclick: (ev) => stampNow(item.path, ev.target) }, "Stamp now") : null))));
   if (q.length > 300) $("queue-list").append(el("li", { class: "quiet" }, `and ${q.length - 300} more`));
+  $("stamp-all").hidden = !q.some((item) => item.kind === "offline");
 }
+
+async function stampNow(path, button) {
+  if (button) button.disabled = true;
+  try {
+    await api(svc("stamp-now"), { method: "POST", body: path ? { path } : {} });
+    toast(path ? `Stamping ${path} with what this PC knows` : "Stamping every waiting photo with what this PC knows");
+  } catch (e) {
+    toast(e.message);
+    if (button) button.disabled = false;
+  }
+}
+$("stamp-all").onclick = (ev) => stampNow(null, ev.target);
 
 // ------------------------------------------------------------------ results
 
@@ -559,7 +578,7 @@ function renderExceptions() {
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(e);
   }
-  $("exceptions").replaceChildren(...[...groups].map(([title, list]) =>
+  $("exceptions-list").replaceChildren(...[...groups].map(([title, list]) =>
     el("section", { class: "group" },
       el("h2", {}, title, el("span", { class: "count" }, list.length)),
       el("ul", {}, list.map((e) => el("li", {},
@@ -591,7 +610,7 @@ function tile(title, rows, extra, cls = "") {
 function renderHealth() {
   const s = state.snap;
   const h = s.health || {};
-  const o = h.overture;
+  const p = h.server;
   const all = s.all_time;
   const tiles = [
     tile("photo-stamp", [
@@ -602,26 +621,28 @@ function renderHealth() {
       ["Outbox", s.outbox],
     ], null, "wide"),
   ];
-  if (o) {
-    const cacheShare = o.cache_cap_bytes ? Math.min(1, o.cache_bytes / o.cache_cap_bytes) : 0;
-    const online = o.online === null || o.online === undefined
-      ? ["Connection", "Nothing downloaded yet"]
-      : o.online ? ["Connection", "Working", "good"] : ["Connection", o.last_error ? `Failing: ${o.last_error}` : "Failing", "bad"];
-    tiles.push(tile("Map data (Overture Maps)", [
-      ["Release", o.release ? `${o.release}${o.release_age_days != null ? `, ${o.release_age_days} days old` : ""}` : "Not chosen yet"],
-      ["Indexes", o.indexes_ready === o.indexes_total ? "Ready" : `${o.indexes_ready} of ${o.indexes_total} ready`, o.indexes_ready === o.indexes_total ? "good" : "warn"],
-      online,
-      ["Cache", `${mb(o.cache_bytes)} of ${mb(o.cache_cap_bytes)}`],
-      ["Downloaded", `${mb(o.downloaded_bytes)} since starting`],
-    ], el("div", { class: "meter", title: "Cache use" }, el("div"))));
-    // Set the meter width through the DOM (no inline style attributes under the page's CSP).
-    tiles[tiles.length - 1].querySelector(".meter div").style.width = `${(cacheShare * 100).toFixed(1)}%`;
+  if (p) {
+    const conn = p.connected === null || p.connected === undefined
+      ? ["Connection", "Not asked yet"]
+      : p.connected ? ["Connection", p.latency_ms != null ? `Working, ${p.latency_ms} ms` : "Working", "good"]
+        : ["Connection", p.last_error || "Failing", "bad"];
+    const asked = p.cache_hits + p.server_answers;
+    tiles.push(tile("Place server", [
+      ["Address", p.url],
+      conn,
+      p.user ? ["Signed in as", `${p.user}, ${p.device}`] : null,
+      p.overture_release ? ["Map data", `Overture ${p.overture_release}`] : null,
+      p.places_built ? ["Place names", `Built ${p.places_built}`] : null,
+      p.history != null ? ["History", p.history ? "Kept (for trips and the map)" : "Not kept"] : null,
+      p.max_wait_hours != null ? ["Wait up to", plural(p.max_wait_hours, "hour", "hours")] : null,
+      ["Remembered", `${p.cached_answers.toLocaleString()} spots${asked ? `, ${Math.round((100 * p.cache_hits) / asked)}% answered here` : ""}`],
+    ], null, "wide"));
   } else {
-    tiles.push(tile("Map data", [["Mode", "Offline: bundled towns and landmarks only", "warn"]]));
+    tiles.push(tile("Place server", [["Status", "Not set up: places are named by the nearest town", "warn"]]));
   }
-  tiles.push(tile("Place names", [
-    ["Bundled data", h.places_built ? `Built ${h.places_built}` : "Unknown"],
-    ["Sources", "GeoNames, Wikidata"],
+  tiles.push(tile("On this PC", [
+    ["Towns", h.towns_built ? `Built ${h.towns_built}` : "None yet", h.towns_built ? null : "warn"],
+    ["Sources", "GeoNames, Wikidata, Overture Maps"],
   ]));
   const avg = all.stamped ? all.ms / all.stamped : 0;
   tiles.push(tile("All time", [
@@ -629,7 +650,6 @@ function renderHealth() {
     ["Not stamped", all.unchanged.toLocaleString()],
     ["Couldn't process", all.failed.toLocaleString(), all.failed ? "warn" : null],
     ["Average", avg ? ms(Math.round(avg)) + " a photo" : "–"],
-    ["Map data", mb(all.downloaded)],
   ]));
   $("tiles").replaceChildren(...tiles);
 }
@@ -672,10 +692,14 @@ setInterval(() => state.snap && currentTab() === "health" && renderHealth(), 300
 
 function renderSettings() {
   const st = state.snap.settings;
-  const form = $("settings");
+  const form = $("settings-form");
   if (form.contains(document.activeElement)) return; // don't overwrite while editing
+  const sep = state.snap.root.includes("\\") ? "\\" : "/";
   $("set-outbox").value = st.outbox || "";
-  $("set-outbox").placeholder = `${state.snap.root}${state.snap.root.includes("\\") ? "\\" : "/"}outbox`;
+  $("set-outbox").placeholder = `${state.snap.root}${sep}outbox`;
+  $("set-originals").value = st.originals || "";
+  $("set-originals").placeholder = `${state.snap.root}${sep}originals`;
+  renderServer();
   $("set-quality").value = st.quality;
   $("set-quality-out").textContent = st.quality;
   $("set-settle").value = st.settle_secs;
@@ -693,12 +717,13 @@ function renderStartup() {
 
 $("set-quality").addEventListener("input", (e) => ($("set-quality-out").textContent = e.target.value));
 
-$("settings").addEventListener("submit", async (e) => {
+$("settings-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const st = state.snap.settings;
   const next = {
     ...st,
     outbox: $("set-outbox").value.trim() || null,
+    originals: $("set-originals").value.trim() || null,
     quality: Number($("set-quality").value),
     settle_secs: Number($("set-settle").value),
     poll_secs: Number($("set-poll").value),
@@ -732,6 +757,73 @@ $("settings").addEventListener("submit", async (e) => {
     save.disabled = false;
   }
 });
+
+// ------------------------------------------------------------------ place server
+
+async function renderServer() {
+  const form = $("server-form");
+  if (form.contains(document.activeElement)) return;
+  let v;
+  try {
+    v = await api(svc("server"));
+  } catch {
+    return;
+  }
+  const p = state.snap && state.snap.health && state.snap.health.server;
+  $("srv-url").value = v.url || "";
+  $("srv-key").value = "";
+  $("srv-key").placeholder = v.has_key ? `Saved (device ${v.key_hint || "key"}); enter a new key to replace it` : "psk_…";
+  $("srv-save").textContent = v.url ? "Save and reconnect" : "Connect";
+  $("srv-remove").hidden = !v.url;
+  $("srv-prefs").hidden = !(p && p.user);
+  if (p && p.user) {
+    $("srv-history").checked = !!p.history;
+    $("srv-wait").value = p.max_wait_hours;
+    $("srv-status").textContent = p.connected === false ? `Can't connect: ${p.last_error}` : `Connected as ${p.user}, ${p.device}`;
+  } else if (v.url) {
+    $("srv-status").textContent = p && p.last_error ? `Can't connect: ${p.last_error}` : "";
+  }
+}
+
+$("server-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const status = $("srv-status");
+  const button = $("srv-save");
+  button.disabled = true;
+  status.textContent = "Connecting";
+  try {
+    const r = await api(svc("server"), { method: "PUT", body: { url: $("srv-url").value, key: $("srv-key").value } });
+    status.textContent = r.test.ok ? `Connected as ${r.test.user}, ${r.test.device}` : `Saved, but can't connect: ${r.test.error}`;
+    $("srv-key").value = "";
+    setTimeout(refresh, 500);
+  } catch (err) {
+    status.textContent = err.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("srv-remove").onclick = async () => {
+  if (!confirm("Disconnect from the place server? Photos will be named by the nearest town until you connect again.")) return;
+  try {
+    await api(svc("server"), { method: "DELETE" });
+    $("srv-status").textContent = "Disconnected";
+    setTimeout(refresh, 500);
+  } catch (err) {
+    $("srv-status").textContent = err.message;
+  }
+};
+
+async function savePrefs() {
+  try {
+    await api(svc("me"), { method: "PUT", body: { history: $("srv-history").checked, max_wait_hours: Number($("srv-wait").value) } });
+    $("srv-status").textContent = "Saved on the place server";
+  } catch (err) {
+    $("srv-status").textContent = err.message;
+  }
+}
+$("srv-history").addEventListener("change", savePrefs);
+$("srv-wait").addEventListener("change", savePrefs);
 
 // ------------------------------------------------------------------ tabs and buttons
 

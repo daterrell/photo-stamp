@@ -259,7 +259,12 @@ pub(crate) mod tests {
             anyhow::bail!("server unreachable")
         }
         fn local_place(&self, _: GpsPoint) -> Option<Place> {
-            Some(Place { primary: "Paris".into(), near: None, context: Some("France".into()), complete: true })
+            Some(Place {
+                primary: "Paris".into(),
+                near: None,
+                context: Some("France".into()),
+                complete: true,
+            })
         }
         fn nearby_town(&self, _: GpsPoint) -> Option<String> {
             Some("Paris".into())

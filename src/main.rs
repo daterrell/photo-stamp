@@ -285,7 +285,8 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
     }
 
     // The dashboard's way in.
-    let registration = start_api(&status, &watcher, &geo, settings_path, &root, &outbox, &key, exe.as_deref());
+    let registration =
+        start_api(&status, &watcher, &geo, settings_path, &root, &outbox, &key, exe.as_deref());
     let result = watcher.run();
     if let (Some(mut reg), Some(data)) = (registration, data.as_deref()) {
         reg.running = false;

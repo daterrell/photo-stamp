@@ -17,7 +17,7 @@ WHAT IT DOES
 - Every photo you drop into the folder, or any subfolder, is stamped with the place and time in its
   bottom-left corner and MOVED to the "outbox" folder, in the same subfolders:
       trip\day 1\IMG_1.jpg  ->  outbox\trip\day 1\IMG_1.jpg
-  It keeps its name and dates. The original is not kept, so keep a copy elsewhere if you want it.
+  It keeps its name and dates. The original is kept in the "originals" folder (same subfolders).
 - It doesn't matter how old a photo's file dates are. A hidden "photo-stamp" tag in the photo
   marks it as stamped, so nothing is ever stamped twice.
 - Photos that are already stamped, or have no date or location in their metadata, are moved to
@@ -26,7 +26,7 @@ WHAT IT DOES
   ARW, ...) are never modified: they're moved with a stamped copy beside them as <name>.jpg.
 - If the outbox already has a photo by that name, the new one becomes "name (2).jpg".
 - Other files (videos, documents, ...) are left where they are, and so are the folders.
-- The outbox and photo-stamp-files folders are ignored. To use a different outbox, start it with
+- The outbox, originals and photo-stamp-files folders are ignored. To use a different outbox, start it with
   --outbox "D:\Stamped".
 
 DASHBOARD
@@ -53,12 +53,19 @@ What it did, and why anything was left alone, is written to
 
 PLACE DATA
 
-Towns, regions and countries come from the bundled photo-stamp-files\places.sqlite and work offline.
-Venues (golf courses, parks, stadiums, towers...) and neighborhoods are downloaded on demand from
-Overture Maps, only for the area around each photo, and cached in %LOCALAPPDATA%\photo-stamp\overture
-(400 MB at most). The first photo after each monthly Overture release takes a minute longer while
-its index downloads (about 70 MB, done in the background at startup). Each new spot then downloads
-about 10-20 MB once; spots you've been to before need no download.
+Place names come from your family's place server (photo-stamp-server), which has the full map
+data: the venue you're in (golf course, park, stadium, tower...), famous landmarks nearby, the
+neighborhood, town, region and country. Set it up in the dashboard: Settings > Place server, with
+the server's address and this device's key. Each photo sends just its position; answers are
+remembered on this PC, so places you've been before work offline.
+
+When the place server can't be reached, photos wait (the dashboard shows where each is from and
+when it'll be stamped anyway). After your wait time (72 hours unless you change it), or when you
+choose "Stamp now", they're stamped with what this PC knows: a remembered answer, otherwise the
+nearest town from photo-stamp-files\towns.sqlite. Without a place server, photos are named by the
+nearest town.
+
+The original of every stamped photo is kept in the "originals" folder, in the same subfolders.
 
 Data: GeoNames (CC BY 4.0, geonames.org); Wikidata (CC0); Overture Maps (overturemaps.org; includes
 OpenStreetMap data (c) OpenStreetMap contributors, ODbL). Includes ExifTool by Phil Harvey.

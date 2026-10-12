@@ -174,7 +174,10 @@ impl Store {
                  AND user_id = (SELECT id FROM user WHERE name = ?1)",
                 params![user, name, now()],
             )?,
-            None => conn.execute("UPDATE device SET revoked = ?2 WHERE id = ?1 AND revoked IS NULL", params![device, now()])?,
+            None => conn.execute(
+                "UPDATE device SET revoked = ?2 WHERE id = ?1 AND revoked IS NULL",
+                params![device, now()],
+            )?,
         };
         if changed == 0 {
             bail!("no active device {device}");
@@ -184,7 +187,9 @@ impl Store {
 
     /// Who a key belongs to, if it's valid.
     pub fn authenticate(&self, key: &str) -> anyhow::Result<Option<Caller>> {
-        let Some((id, secret)) = key.strip_prefix("psk_").and_then(|k| k.split_once('_')) else { return Ok(None) };
+        let Some((id, secret)) = key.strip_prefix("psk_").and_then(|k| k.split_once('_')) else {
+            return Ok(None);
+        };
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
@@ -219,7 +224,10 @@ impl Store {
     }
 
     pub fn set_history(&self, device_id: &str, on: bool) -> anyhow::Result<()> {
-        self.conn.lock().unwrap().execute("UPDATE device SET history = ?2 WHERE id = ?1", params![device_id, on])?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE device SET history = ?2 WHERE id = ?1", params![device_id, on])?;
         Ok(())
     }
 
@@ -239,7 +247,9 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare_cached("INSERT INTO point(user_id, device_id, lat, lon, at) VALUES(?1, ?2, ?3, ?4, ?5)")?;
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO point(user_id, device_id, lat, lon, at) VALUES(?1, ?2, ?3, ?4, ?5)",
+            )?;
             for p in points {
                 stmt.execute(params![caller.user_id, caller.device_id, p.lat, p.lon, now()])?;
             }
@@ -249,7 +259,11 @@ impl Store {
     }
 
     pub fn point_count(&self, user_id: i64) -> anyhow::Result<u64> {
-        let n: i64 = self.conn.lock().unwrap().query_row("SELECT count(*) FROM point WHERE user_id = ?1", [user_id], |r| r.get(0))?;
+        let n: i64 = self.conn.lock().unwrap().query_row(
+            "SELECT count(*) FROM point WHERE user_id = ?1",
+            [user_id],
+            |r| r.get(0),
+        )?;
         Ok(n as u64)
     }
 }

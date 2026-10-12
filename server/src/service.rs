@@ -10,9 +10,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use photo_stamp_http::{Request, Response};
+use photo_stamp_proto::GpsPoint;
 use photo_stamp_proto::api::{BatchReply, BatchRequest, MAX_BATCH, Me, MeUpdate, PlaceReply, PlaceRequest};
 use photo_stamp_proto::places::{FILE_NAME, PlacesDb, TOWNS_FILE_NAME};
-use photo_stamp_proto::GpsPoint;
 
 use crate::gazetteer::Gazetteer;
 use crate::overture::Overture;
@@ -63,7 +63,8 @@ impl Data {
     }
 
     pub fn data_version(&self) -> String {
-        let release = self.gazetteer.overture_health().and_then(|o| o.release).unwrap_or_else(|| "none".into());
+        let release =
+            self.gazetteer.overture_health().and_then(|o| o.release).unwrap_or_else(|| "none".into());
         format!("{release}/{}", self.gazetteer.places_built().unwrap_or_else(|| "unknown".into()))
     }
 }
@@ -241,7 +242,11 @@ mod tests {
     use super::*;
 
     fn layout() -> Layout {
-        let dir = std::env::temp_dir().join(format!("ps-server-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ps-server-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::copy(
@@ -267,7 +272,13 @@ mod tests {
         if let Some(k) = key {
             headers.push(("authorization".to_owned(), format!("Bearer {k}")));
         }
-        Request { method: method.into(), path: path.into(), headers, body: body.as_bytes().to_vec(), ..Request::default() }
+        Request {
+            method: method.into(),
+            path: path.into(),
+            headers,
+            body: body.as_bytes().to_vec(),
+            ..Request::default()
+        }
     }
 
     fn json(r: Response) -> serde_json::Value {
@@ -306,8 +317,12 @@ mod tests {
         assert_eq!(svc.handle(req("POST", "/v1/places", Some(&key), &too_many)).status, 400);
 
         let me = json(svc.handle(req("GET", "/v1/me", Some(&key), "")));
-        assert_eq!((me["user"].as_str(), me["device"].as_str(), me["history"].as_bool()), (Some("Dave"), Some("laptop"), Some(true)));
-        let me = json(svc.handle(req("PUT", "/v1/me", Some(&key), r#"{"history":false,"max_wait_hours":6}"#)));
+        assert_eq!(
+            (me["user"].as_str(), me["device"].as_str(), me["history"].as_bool()),
+            (Some("Dave"), Some("laptop"), Some(true))
+        );
+        let me =
+            json(svc.handle(req("PUT", "/v1/me", Some(&key), r#"{"history":false,"max_wait_hours":6}"#)));
         assert_eq!((me["history"].as_bool(), me["max_wait_hours"].as_u64()), (Some(false), Some(6)));
         assert_eq!(svc.handle(req("GET", "/v1/towns.sqlite", Some(&key), "")).status, 404, "not built yet");
     }

@@ -153,7 +153,9 @@ pub fn handle(api: &Api, req: Request) -> Response {
         ("POST", ["api", "stamp-now"]) => {
             let body = req.json::<StampNowBody>().unwrap_or(StampNowBody { path: None });
             match body.path.as_deref().map(safe_relative) {
-                Some(None) => Response::error(400, "expected {\"path\": \"<path within the watched folder>\"} or {}"),
+                Some(None) => {
+                    Response::error(400, "expected {\"path\": \"<path within the watched folder>\"} or {}")
+                }
                 Some(Some(rel)) => {
                     wake(Wake::StampNow(Some(rel)));
                     Response::ok()
@@ -182,7 +184,10 @@ pub fn handle(api: &Api, req: Request) -> Response {
                 k => k.to_owned(),
             };
             if !key.starts_with("psk_") {
-                return Response::error(400, "the device key starts with psk_ (from photo-stamp-server device add)");
+                return Response::error(
+                    400,
+                    "the device key starts with psk_ (from photo-stamp-server device add)",
+                );
             }
             log::info!("place server set to {url}");
             geo.set_server(Some(ServerConfig { url, key }));

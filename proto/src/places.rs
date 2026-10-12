@@ -243,7 +243,8 @@ pub(crate) mod tests {
 
     /// A small real-data database around the test locations (tests/fixtures/places.sqlite).
     pub fn fixture_db() -> PlacesDb {
-        PlacesDb::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/places.sqlite")).unwrap()
+        PlacesDb::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/places.sqlite"))
+            .unwrap()
     }
 
     #[test]

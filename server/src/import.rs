@@ -23,6 +23,8 @@ pub const TOWN_MIN_POPULATION: u64 = 5_000;
 pub struct ImportOptions {
     /// Only mirror Overture files with rows in this box (xmin, xmax, ymin, ymax).
     pub bbox: Option<[f64; 4]>,
+    /// Only mirror these datasets (all of them when empty).
+    pub datasets: Vec<Dataset>,
     pub skip_overture: bool,
     /// Use this places database instead of building one.
     pub places_from: Option<PathBuf>,
@@ -38,7 +40,14 @@ pub fn run(layout: &Layout, opts: &ImportOptions) -> anyhow::Result<()> {
         let ov = Overture::new(&layout.root.join("import"))?.with_mirror(&layout.mirror());
         let release = ov.latest_remote_release()?;
         log::info!("Overture: newest release is {release}");
-        let bytes = ov.mirror_release(&release, &Dataset::ALL, opts.bbox)?;
+        let datasets = if opts.datasets.is_empty() { Dataset::ALL.to_vec() } else { opts.datasets.clone() };
+        // Only a full copy of every dataset makes a release complete (usable without the network).
+        let bbox = if datasets.len() < Dataset::ALL.len() && opts.bbox.is_none() {
+            Some([-180.0, 180.0, -90.0, 90.0])
+        } else {
+            opts.bbox
+        };
+        let bytes = ov.mirror_release(&release, &datasets, bbox)?;
         log::info!("Overture: mirror up to date ({:.1} GB downloaded)", bytes as f64 / 1e9);
     }
 

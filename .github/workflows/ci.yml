@@ -100,11 +100,14 @@ jobs:
         with:
           path: data/places.sqlite
           key: places-db-${{ steps.month.outputs.month }}-${{ hashFiles('scripts/build-places-db.py') }}
-      - run: ls -la data/places.sqlite
+      # Clients get the small towns database; the place server builds its own full one.
+      - run: python3 scripts/make-towns-db.py data/places.sqlite data/towns.sqlite && ls -la data/
       - uses: actions/upload-artifact@v7
         with:
           name: places-db
-          path: data/places.sqlite
+          path: |
+            data/places.sqlite
+            data/towns.sqlite
           if-no-files-found: error
           retention-days: 7
 
@@ -196,6 +199,64 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=docker
           cache-to: type=gha,scope=docker,mode=max
+
+  server:
+    name: Place server image
+    needs: check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}-server
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          load: true
+          tags: photo-stamp-server:test
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,scope=server,mode=max
+      # Smoke test: answers a real lookup with the test place data and a fresh device key.
+      - name: Smoke test
+        run: |
+          mkdir -p srv && cp tests/fixtures/places.sqlite srv/places.sqlite && chmod -R a+rwX srv
+          run() { docker run --rm -u "$(id -u)" -v "$PWD/srv:/data" photo-stamp-server:test "$@"; }
+          run user add ci
+          key=$(run device add ci runner | grep -o 'psk_[0-9a-f_]*')
+          docker run -d --name srv -u "$(id -u)" -p 8080:8080 -v "$PWD/srv:/data" photo-stamp-server:test serve --offline
+          for i in $(seq 1 30); do curl -sf localhost:8080/healthz && break; sleep 1; done
+          curl -sf -H "Authorization: Bearer $key" -d '{"lat":48.8556,"lon":2.2986}' localhost:8080/v1/place | tee reply.json
+          grep -q Paris reply.json
+          test "$(curl -s -o /dev/null -w '%{http_code}' -d '{"lat":1,"lon":1}' localhost:8080/v1/place)" = 401
+          docker rm -f srv
+      - name: Push
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile.server
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=server
 
   release:
     name: GitHub Release

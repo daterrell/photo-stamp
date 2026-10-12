@@ -110,7 +110,9 @@ impl RemoteGeocoder {
     pub fn new(data: Option<&Path>, offline: bool) -> Arc<Self> {
         let mut config = data.map(|d| ClientConfig::load(&ClientConfig::path(d))).unwrap_or_default();
         // The Docker image is set up through its environment instead.
-        if let (Ok(url), Ok(key)) = (std::env::var("PHOTO_STAMP_SERVER_URL"), std::env::var("PHOTO_STAMP_SERVER_KEY")) {
+        if let (Ok(url), Ok(key)) =
+            (std::env::var("PHOTO_STAMP_SERVER_URL"), std::env::var("PHOTO_STAMP_SERVER_KEY"))
+        {
             match normalize_url(&url) {
                 Ok(url) => config.server = Some(ServerConfig { url, key }),
                 Err(e) => log::warn!("PHOTO_STAMP_SERVER_URL: {e:#}"),
@@ -184,21 +186,34 @@ impl RemoteGeocoder {
         self.warm_up();
     }
 
-    fn call(&self, server: &ServerConfig, method: &str, path: &str, body: Option<&[u8]>) -> anyhow::Result<Vec<u8>> {
+    fn call(
+        &self,
+        server: &ServerConfig,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+    ) -> anyhow::Result<Vec<u8>> {
         let url = format!("{}{path}", server.url);
         let auth = format!("Bearer {}", server.key);
         let start = Instant::now();
         let result = match (method, body) {
-            ("POST", Some(b)) => {
-                self.agent.post(&url).header("Authorization", &auth).header("Content-Type", "application/json").send(b)
-            }
-            ("PUT", Some(b)) => {
-                self.agent.put(&url).header("Authorization", &auth).header("Content-Type", "application/json").send(b)
-            }
+            ("POST", Some(b)) => self
+                .agent
+                .post(&url)
+                .header("Authorization", &auth)
+                .header("Content-Type", "application/json")
+                .send(b),
+            ("PUT", Some(b)) => self
+                .agent
+                .put(&url)
+                .header("Authorization", &auth)
+                .header("Content-Type", "application/json")
+                .send(b),
             _ => self.agent.get(&url).header("Authorization", &auth).call(),
         };
         let outcome = (|| -> anyhow::Result<Vec<u8>> {
-            let mut resp = result.with_context(|| format!("can't reach the place server at {}", server.url))?;
+            let mut resp =
+                result.with_context(|| format!("can't reach the place server at {}", server.url))?;
             let status = resp.status().as_u16();
             let bytes = resp.body_mut().with_config().limit(64 * 1024 * 1024).read_to_vec()?;
             match status {
@@ -249,7 +264,12 @@ impl RemoteGeocoder {
     /// Change this device's history setting or the person's wait time on the server.
     pub fn update_me(&self, update: &MeUpdate) -> anyhow::Result<Me> {
         let server = self.server().context("no place server set up")?;
-        let me: Me = serde_json::from_slice(&self.call(&server, "PUT", "/v1/me", Some(&serde_json::to_vec(update)?))?)?;
+        let me: Me = serde_json::from_slice(&self.call(
+            &server,
+            "PUT",
+            "/v1/me",
+            Some(&serde_json::to_vec(update)?),
+        )?)?;
         self.config.write().unwrap().last_me = Some(me.clone());
         self.save_config();
         Ok(me)
@@ -277,7 +297,10 @@ impl RemoteGeocoder {
         *towns = None;
         std::fs::rename(&next, data.join(TOWNS_FILE_NAME))?;
         *towns = PlacesDb::open(&data.join(TOWNS_FILE_NAME)).ok();
-        log::info!("updated the towns database ({:.1} MB) from the place server", bytes.len() as f64 / 1_048_576.0);
+        log::info!(
+            "updated the towns database ({:.1} MB) from the place server",
+            bytes.len() as f64 / 1_048_576.0
+        );
         Ok(())
     }
 
@@ -287,7 +310,13 @@ impl RemoteGeocoder {
         let town = db.town(at).ok().flatten()?;
         // In a big city's districts, name the city (as the server does).
         let primary = db.big_city(at).ok().flatten().unwrap_or(town.town);
-        let context: Vec<String> = [town.region, town.country].into_iter().flatten().map(|n| n.display()).collect();
+        // "Moscow, Russia", not "Moscow, Moscow, Russia" where the region is the city.
+        let context: Vec<String> = [town.region, town.country]
+            .into_iter()
+            .flatten()
+            .filter(|n| !n.preferred.eq_ignore_ascii_case(&primary.preferred))
+            .map(|n| n.display())
+            .collect();
         Some(Place {
             primary: primary.display(),
             near: None,
@@ -300,7 +329,8 @@ impl RemoteGeocoder {
     fn fresh(&self, at: GpsPoint) -> Option<Option<Place>> {
         let cached = self.answers.as_ref()?.get(at)?;
         let me = self.last_me();
-        let current = me.as_ref().is_none_or(|m| m.data_version == cached.data_version && m.rev == cached.rev);
+        let current =
+            me.as_ref().is_none_or(|m| m.data_version == cached.data_version && m.rev == cached.rev);
         current.then_some(cached.place)
     }
 }
@@ -313,18 +343,21 @@ impl Geocoder for Arc<RemoteGeocoder> {
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(hit);
         }
-        if let Some(t) = self.net.lock().unwrap().retry_at
-            && Instant::now() < t
-        {
-            let why = self.net.lock().unwrap().last_error.clone().unwrap_or_default();
-            return Err(anyhow!("the place server can't be reached ({why})"));
+        // Copied out first: the lock mustn't be held while it's taken again below.
+        let (retry_at, last_error) = {
+            let net = self.net.lock().unwrap();
+            (net.retry_at, net.last_error.clone())
+        };
+        if retry_at.is_some_and(|t| Instant::now() < t) {
+            return Err(anyhow!("the place server can't be reached ({})", last_error.unwrap_or_default()));
         }
         // Refresh who we are now and then (cheap), so stale cached answers are noticed.
         if self.net.lock().unwrap().me_at.is_none_or(|t| t.elapsed() >= ME_EVERY) {
             let _ = self.refresh_me();
         }
         let body = serde_json::to_vec(&PlaceRequest::from(at))?;
-        let reply: PlaceReply = serde_json::from_slice(&self.call(&server, "POST", "/v1/place", Some(&body))?)?;
+        let reply: PlaceReply =
+            serde_json::from_slice(&self.call(&server, "POST", "/v1/place", Some(&body))?)?;
         self.asked.fetch_add(1, Ordering::Relaxed);
         if reply.complete
             && let Some(a) = &self.answers
@@ -478,6 +511,10 @@ mod tests {
         assert_eq!(again.local_place(at).unwrap().primary, "Somewhere");
         let err = again.place(GpsPoint { lat: 11.0, lon: 21.0 }).unwrap_err();
         assert!(format!("{err:#}").contains("place server"), "{err:#}");
+        // Asking again soon after fails at once, without trying the network (or hanging).
+        let start = Instant::now();
+        assert!(again.place(GpsPoint { lat: 12.0, lon: 22.0 }).is_err());
+        assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(again.health().server.unwrap().connected, Some(false));
         std::fs::remove_dir_all(&data).unwrap();
     }

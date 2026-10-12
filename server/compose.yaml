@@ -1,0 +1,53 @@
+# photo-stamp place server. From this folder:
+#
+#   docker compose up -d                       # the server (port 8080) and the monthly import
+#   docker compose run --rm server user add Dave
+#   docker compose run --rm server device add Dave laptop
+#
+# The first import downloads ~45 GB of Overture Maps data and builds the place-name database
+# (an hour or more); the server answers from Overture's cloud copy until its own copy is complete.
+#
+# Reaching it from outside your home: use Tailscale or a Cloudflare Tunnel to port 8080, or open
+# ports 80/443 and run the TLS proxy:  PLACES_DOMAIN=places.example.com docker compose --profile tls up -d
+services:
+  server:
+    image: ghcr.io/daterrell/photo-stamp-server:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    init: true
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "${PLACES_PORT:-8080}:8080"
+    volumes:
+      - data:/data
+
+  # Brings the place data up to date now, then every 30 days. The server picks up new data by itself.
+  import:
+    image: ghcr.io/daterrell/photo-stamp-server:latest
+    init: true
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    entrypoint: ["sh", "-c", "while true; do photo-stamp-server import || echo 'import failed; will try again'; sleep 30d; done"]
+    volumes:
+      - data:/data
+
+  # Optional HTTPS in front of the server (Let's Encrypt certificate for PLACES_DOMAIN).
+  caddy:
+    image: caddy:2
+    profiles: ["tls"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PLACES_DOMAIN: "${PLACES_DOMAIN:-}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy:/data
+
+volumes:
+  # Place data, the Overture mirror and accounts. Put it on a disk with ~60 GB free.
+  data:
+  caddy:

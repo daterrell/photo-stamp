@@ -368,8 +368,10 @@ mod tests {
     use serde_json::Value;
 
     fn fixture_db() -> PlacesDb {
-        PlacesDb::open(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/places.sqlite"))
-            .unwrap()
+        PlacesDb::open(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/places.sqlite"),
+        )
+        .unwrap()
     }
 
     /// Real Overture rows captured around test locations (tests/fixtures/overture.json).

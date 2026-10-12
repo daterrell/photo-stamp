@@ -50,16 +50,16 @@ impl Answers {
 
     pub fn get(&self, at: GpsPoint) -> Option<Cached> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT place, data_version, rev FROM answer WHERE key = ?1",
-            [at.cache_key()],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
-        )
+        conn.query_row("SELECT place, data_version, rev FROM answer WHERE key = ?1", [at.cache_key()], |r| {
+            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })
         .optional()
         .ok()
         .flatten()
         .map(|(place, data_version, rev)| Cached {
-            place: place.and_then(|p| serde_json::from_str::<Place>(&p).ok()).map(|p| Place { complete: true, ..p }),
+            place: place
+                .and_then(|p| serde_json::from_str::<Place>(&p).ok())
+                .map(|p| Place { complete: true, ..p }),
             data_version,
             rev: rev as u64,
         })
@@ -99,7 +99,12 @@ mod tests {
         let a = Answers::in_memory().unwrap();
         let at = GpsPoint { lat: 48.85561, lon: 2.29862 };
         assert!(a.get(at).is_none());
-        let place = Place { primary: "Champ de Mars".into(), near: None, context: Some("Paris".into()), complete: true };
+        let place = Place {
+            primary: "Champ de Mars".into(),
+            near: None,
+            context: Some("Paris".into()),
+            complete: true,
+        };
         a.put(at, Some(&place), "r1", 0);
         // A few meters away is the same spot.
         let hit = a.get(GpsPoint { lat: 48.85562, lon: 2.29863 }).unwrap();

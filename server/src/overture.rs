@@ -67,7 +67,12 @@ impl Dataset {
         }
     }
 
-    fn slug(self) -> &'static str {
+    /// The dataset called `name` ("places", "land_use", "infrastructure", "division").
+    pub fn from_slug(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| d.slug() == name)
+    }
+
+    pub fn slug(self) -> &'static str {
         match self {
             Dataset::Places => "places",
             Dataset::LandUse => "land_use",
@@ -281,7 +286,9 @@ impl Overture {
             let mut files: Vec<(String, u64)> = std::fs::read_dir(m.join(prefix))?
                 .flatten()
                 .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
-                .filter_map(|e| Some((format!("{prefix}{}", e.file_name().to_string_lossy()), e.metadata().ok()?.len())))
+                .filter_map(|e| {
+                    Some((format!("{prefix}{}", e.file_name().to_string_lossy()), e.metadata().ok()?.len()))
+                })
                 .collect();
             files.sort();
             return Ok(files);
@@ -309,7 +316,12 @@ impl Overture {
     /// Copy `datasets` of `release` into the mirror: whole files, resuming partial downloads. With
     /// `bbox` (xmin, xmax, ymin, ymax), only the files with rows in that box (for a regional server
     /// or tests); otherwise every file, and the release is then marked complete.
-    pub fn mirror_release(&self, release: &str, datasets: &[Dataset], bbox: Option<[f64; 4]>) -> anyhow::Result<u64> {
+    pub fn mirror_release(
+        &self,
+        release: &str,
+        datasets: &[Dataset],
+        bbox: Option<[f64; 4]>,
+    ) -> anyhow::Result<u64> {
         let mirror = self.mirror.clone().context("no mirror folder configured")?;
         let mut fetched = 0;
         for &ds in datasets {
@@ -368,7 +380,8 @@ impl Overture {
                 .user_agent(concat!("photo-stamp-server/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .into();
-            let mut resp = agent.get(&format!("{S3}/{key}")).header("Range", &format!("bytes={have}-")).call()?;
+            let mut resp =
+                agent.get(&format!("{S3}/{key}")).header("Range", &format!("bytes={have}-")).call()?;
             let copied = std::io::copy(&mut resp.body_mut().as_reader(), &mut out)?;
             out.flush()?;
             self.downloaded.fetch_add(copied, Ordering::Relaxed);
@@ -971,6 +984,30 @@ fn is_unfetched(e: &parquet::errors::ParquetError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mirrored_files_are_read_from_disk() {
+        let dir = std::env::temp_dir().join(format!("ps-mirror-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let release = "2099-01-01.0";
+        let prefix = format!("release/{release}/theme=divisions/type=division/");
+        let key = format!("{prefix}part-0.parquet");
+        let file = dir.join("mirror").join(&key);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, (0u8..100).collect::<Vec<_>>()).unwrap();
+        let ov = Overture::new(&dir.join("ov")).unwrap().with_mirror(&dir.join("mirror"));
+
+        assert_eq!(&ov.range(&key, 10, 5).unwrap()[..], &[10, 11, 12, 13, 14]);
+        assert_eq!(ov.downloaded_bytes(), 0, "nothing came over the network");
+        assert!(ov.local_file(&key, Some(99)).is_none(), "a partial copy isn't used");
+
+        assert!(ov.mirrored_releases().is_empty(), "not complete yet");
+        std::fs::write(dir.join("mirror/release").join(release).join(COMPLETE_MARKER), b"").unwrap();
+        assert_eq!(ov.mirrored_releases(), [release]);
+        assert_eq!(ov.list(release, &prefix).unwrap(), [(key.clone(), 100)]);
+        assert_eq!(ov.release().unwrap(), release, "a complete mirror is used without asking the network");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn listing_parses_keys_prefixes_and_tokens() {
