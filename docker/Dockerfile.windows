@@ -42,6 +42,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY assets assets
 COPY src src
 COPY tests tests
+COPY http http
+COPY ui ui
 # Link everything (libheif, codecs, libstdc++, libgcc, winpthread) statically into the exe. The
 # codecs' pkg-config files ask for -lstdc++/-lgcc_s by name, and the linker would pick the DLL
 # import libraries; a search directory holding only the static archives, placed first, prevents that.
@@ -54,8 +56,9 @@ ENV SYSTEM_DEPS_LIBHEIF_LINK=static \
     CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++-posix \
     CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc-posix \
     RUSTFLAGS="-L native=/opt/staticlibs -C link-arg=-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++"
-RUN cargo build --release --locked --target x86_64-pc-windows-gnu
+RUN cargo build --release --locked --workspace --target x86_64-pc-windows-gnu
 
-# Just the exe, for `docker buildx build --target exe --output type=local,dest=…` (used by CI).
+# Just the exes, for `docker buildx build --target exe --output type=local,dest=…` (used by CI).
 FROM scratch AS exe
 COPY --from=build /src/target/x86_64-pc-windows-gnu/release/photo-stamp.exe /photo-stamp.exe
+COPY --from=build /src/target/x86_64-pc-windows-gnu/release/photo-stamp-ui.exe /photo-stamp-ui.exe

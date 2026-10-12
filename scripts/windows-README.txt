@@ -29,6 +29,14 @@ WHAT IT DOES
 - The outbox and photo-stamp-files folders are ignored. To use a different outbox, start it with
   --outbox "D:\Stamped".
 
+DASHBOARD
+
+Double-click photo-stamp-ui.exe to see what photo-stamp is doing, in your browser
+(http://127.0.0.1:8765/): the photo being stamped, what's waiting, progress and time left, everything
+processed, photos that weren't stamped, and the log. You can pause, resume, stop and start photo-stamp
+there, and change its settings. Only this PC can open it. It closes by itself after half an hour with
+no dashboard open.
+
 COMMANDS (from a terminal in the folder)
 
     photo-stamp.exe --install-startup     start at login (and start now)
@@ -36,6 +44,7 @@ COMMANDS (from a terminal in the folder)
     photo-stamp.exe --stop                stop the running copy
     photo-stamp.exe stamp <files>         stamp specific photos once
     photo-stamp.exe --help                everything else
+    photo-stamp-ui.exe --stop             close the dashboard server
 
 LOG
 

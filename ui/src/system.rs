@@ -31,10 +31,16 @@ pub fn log(msg: &str) {
     }
 }
 
-/// Tell the user something: a message box on Windows (there's no console), stdout elsewhere.
+/// Tell the user something: in the terminal we were started from, if any, otherwise (on Windows,
+/// started by double-clicking) in a message box.
 pub fn tell(msg: &str) {
     #[cfg(windows)]
     {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } != 0 {
+            println!("{msg}");
+            return;
+        }
         use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
         let text: Vec<u16> = msg.encode_utf16().chain([0]).collect();
         let title: Vec<u16> = "photo-stamp dashboard".encode_utf16().chain([0]).collect();

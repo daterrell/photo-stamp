@@ -281,6 +281,8 @@ impl<'a> Outbox<'a> {
                 break;
             }
             self.process(&path);
+            // Map data may have been downloaded, indexes built.
+            self.status.set_health(self.geo.health());
         }
         self.report_queue();
     }

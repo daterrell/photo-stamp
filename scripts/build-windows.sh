@@ -2,13 +2,14 @@
 # Build the Windows release folder and zip:
 #
 #   dist/photo-stamp-windows/
-#     photo-stamp.exe
+#     photo-stamp.exe, photo-stamp-ui.exe (the dashboard)
 #     photo-stamp-files/exiftool.exe, photo-stamp-files/exiftool_files/, photo-stamp-files/places.sqlite
 #     README.txt
 #   dist/photo-stamp-windows.zip
 #
 # Needs only Docker. The exe is cross-compiled with HEIC support linked in statically.
-# Set PHOTO_STAMP_EXE to package an exe that was already built, PHOTO_STAMP_PLACES_DB for the place data
+# Set PHOTO_STAMP_EXE to package an exe that was already built (photo-stamp-ui.exe is taken from the same
+# folder), PHOTO_STAMP_PLACES_DB for the place data
 # (default data/places.sqlite, built with scripts/build-places-db.py if missing).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -27,12 +28,15 @@ mkdir -p "$DIST/photo-stamp-files"
 if [ -n "${PHOTO_STAMP_EXE:-}" ]; then
   # Already built (CI builds it with a layer cache, see .github/workflows/ci.yml).
   cp "$PHOTO_STAMP_EXE" "$DIST/photo-stamp.exe"
+  cp "$(dirname "$PHOTO_STAMP_EXE")/photo-stamp-ui.exe" "$DIST/photo-stamp-ui.exe"
 else
-  echo "building photo-stamp.exe…"
+  echo "building photo-stamp.exe and photo-stamp-ui.exe…"
   docker build -q --target build -t photo-stamp-win-build -f docker/Dockerfile.windows . >/dev/null
   container=$(docker create photo-stamp-win-build)
   trap 'docker rm -f "$container" >/dev/null' EXIT
-  docker cp "$container:/src/target/x86_64-pc-windows-gnu/release/photo-stamp.exe" "$DIST/photo-stamp.exe"
+  for exe in photo-stamp.exe photo-stamp-ui.exe; do
+    docker cp "$container:/src/target/x86_64-pc-windows-gnu/release/$exe" "$DIST/$exe"
+  done
 fi
 
 zip="$CACHE/exiftool-${EXIFTOOL_VERSION}_64.zip"

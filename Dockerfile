@@ -7,7 +7,10 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY assets assets
 COPY src src
-RUN cargo build --release --locked
+# Workspace members (the dashboard isn't part of the image, but cargo needs them to resolve).
+COPY http http
+COPY ui ui
+RUN cargo build --release --locked -p photo-stamp
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \

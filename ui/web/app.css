@@ -253,6 +253,7 @@ td.cap b { color: var(--ink); font-weight: 550; }
 /* Health */
 .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: 1rem; }
 .tile { background: var(--surface); border-radius: 12px; box-shadow: inset 0 0 0 1px var(--line); padding: 1rem; display: grid; gap: .5rem; align-content: start; }
+.tile.wide { grid-column: span 2; }
 .tile dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: .25rem .75rem; font-size: 14px; }
 .tile dt { color: var(--muted); }
 .tile dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
@@ -307,6 +308,7 @@ dialog::backdrop { background: rgb(10 12 16 / 60%); }
   .queue { max-height: 16rem; }
 }
 @media (max-width: 720px) {
+  .tile.wide { grid-column: auto; }
   .now { grid-template-columns: 1fr; }
   .bar { flex-wrap: wrap; }
   .folder-name { order: 3; width: 100%; }

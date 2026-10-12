@@ -52,6 +52,13 @@ async function api(path, opts = {}) {
 }
 const svc = (path) => `/api/s/${state.key}/${path}`;
 
+// Results leave out empty fields; fill them in once, where they arrive.
+function norm(e) {
+  e.caption = e.caption || [];
+  e.downloaded = e.downloaded || 0;
+  return e;
+}
+
 function toast(text) {
   const t = $("toast");
   t.textContent = text;
@@ -167,7 +174,7 @@ function showEmpty(title, text, action, onAction) {
     };
   }
   for (const p of document.querySelectorAll(".panel")) p.hidden = true;
-  $("btn-start").hidden = !action;
+  $("btn-start").hidden = true; // the page itself offers the action
   $("btn-pause").hidden = $("btn-resume").hidden = $("btn-stop").hidden = true;
 }
 
@@ -231,7 +238,7 @@ async function refresh() {
   try {
     const snap = await api(svc("status"));
     state.snap = snap;
-    state.results = snap.recent.slice();
+    state.results = snap.recent.map(norm);
     state.oldestLoaded = state.results.length ? state.results[state.results.length - 1].id : null;
     state.lastNow = state.results.find((e) => e.outcome === "stamped") || null;
     state.etaAt = Date.now();
@@ -280,6 +287,7 @@ function apply(ev) {
       s.session = ev.session;
       s.batch = ev.batch;
       setProgress(ev.progress);
+      norm(ev.entry);
       if (ev.entry.outcome === "stamped") state.lastNow = ev.entry;
       addResult(ev.entry);
       renderNow();
@@ -488,7 +496,7 @@ $("results-wrap").addEventListener("mouseleave", () => (state.hoveringTable = fa
 $("results-more").onclick = async () => {
   if (!state.oldestLoaded) return;
   try {
-    const older = await api(svc(`results?before=${state.oldestLoaded}&limit=100`));
+    const older = (await api(svc(`results?before=${state.oldestLoaded}&limit=100`))).map(norm);
     state.results.push(...older);
     if (older.length) state.oldestLoaded = older[older.length - 1].id;
     $("results").append(...older.map(resultRow));
@@ -573,8 +581,8 @@ async function retry(e, button) {
 
 // ------------------------------------------------------------------ health and log
 
-function tile(title, rows, extra) {
-  return el("section", { class: "tile" },
+function tile(title, rows, extra, cls = "") {
+  return el("section", { class: `tile ${cls}` },
     el("h2", {}, title),
     el("dl", {}, rows.filter(Boolean).flatMap(([k, v, cls]) => [el("dt", {}, k), el("dd", { class: cls }, v)])),
     extra);
@@ -592,7 +600,7 @@ function renderHealth() {
       ["Running for", since(s.started)],
       ["Watching", s.root],
       ["Outbox", s.outbox],
-    ]),
+    ], null, "wide"),
   ];
   if (o) {
     const cacheShare = o.cache_cap_bytes ? Math.min(1, o.cache_bytes / o.cache_cap_bytes) : 0;
@@ -631,7 +639,7 @@ function logLine(l) {
   if (state.logProblems && !problem) return null;
   if (state.logFilter && !l.text.toLowerCase().includes(state.logFilter)) return null;
   return el("div", { class: problem ? l.level : "" },
-    el("time", {}, new Date(l.at).toLocaleTimeString()), l.text);
+    el("time", {}, new Date(l.at).toLocaleTimeString()), l.text.replace(/ {2,}/g, " "));
 }
 
 function renderLog() {
@@ -742,7 +750,12 @@ function showTab(name) {
   }
   if (state.snap && name === "settings") renderSettings();
 }
-for (const b of document.querySelectorAll(".tabs button")) b.addEventListener("click", () => showTab(b.dataset.tab));
+for (const b of document.querySelectorAll(".tabs button")) {
+  b.addEventListener("click", () => {
+    showTab(b.dataset.tab);
+    history.replaceState(null, "", b.dataset.tab === "activity" ? location.pathname : `#${b.dataset.tab}`);
+  });
+}
 
 $("folder-select").addEventListener("change", (e) => select(e.target.value));
 
@@ -780,4 +793,7 @@ function renderAll() {
   if (tab === "settings") renderSettings();
 }
 
+// Open on the tab named in the address (#health, #settings…), so tabs can be bookmarked.
+const startTab = location.hash.slice(1);
+if (document.querySelector(`.tabs [data-tab="${CSS.escape(startTab)}"]`)) showTab(startTab);
 loadServices();
