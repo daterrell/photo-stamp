@@ -3,10 +3,10 @@
 pub mod formats;
 pub mod gazetteer;
 pub mod geo;
-pub mod inplace;
 pub mod localtime;
 pub mod logging;
 pub mod metadata;
+pub mod outbox;
 pub mod overture;
 pub mod paths;
 pub mod places;

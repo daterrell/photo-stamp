@@ -62,16 +62,22 @@ All metadata (EXIF, XMP, IPTC, ICC profile) is copied to the stamped file, with 
 rotated upright before drawing) and the XMP keyword `photo-stamp` added, which is how already-stamped photos
 are recognized and never stamped twice.
 
-## Windows: stamp photos in place
+## Windows: drop folder with an outbox
 
-A standalone `photo-stamp.exe` that watches **the folder it's in, and all its subfolders**, and replaces
-each **new** photo with the same photo plus the stamp, under the same name and with the same file dates.
-There's no backup copy. Camera RAW files are never modified; a stamped `<name>.jpg` is written beside them.
+A standalone `photo-stamp.exe` that watches **the folder it's in, and all its subfolders**. Each photo dropped
+there is stamped and **moved to `outbox\`**, in the same subfolders: `trip\day 1\a.jpg` becomes
+`outbox\trip\day 1\a.jpg`, with the same name and file dates. The photo is removed from where it was
+dropped, and the folders stay. There's no backup copy.
 
-- **New photos only.** Photos already in the folder when it first starts are left alone. "New" is judged by
-  the file's creation time, because Explorer keeps a copied photo's original modified date. It keeps a
-  heartbeat (`%LOCALAPPDATA%\photo-stamp\state-*.json`), so photos added while it wasn't running are caught
-  when it next starts.
+- **Every photo is handled**, including ones already in the folder when it starts. File dates don't matter:
+  only the `photo-stamp` marker in a photo's metadata says it's already stamped.
+- **Already-stamped photos, and photos with no date or location**, are moved to the outbox unchanged, so the
+  drop folder always empties. The log says which ones weren't stamped and why.
+- **Camera RAW files** are never modified; they move to the outbox with a stamped `<name>.jpg` beside them.
+- **Name clashes** in the outbox get `a (2).jpg`, `a (3).jpg`… Nothing in the outbox is ever overwritten.
+- Other files (videos, sidecars, documents) are left where they are. Photos that can't be read stay put and
+  are logged.
+- `--outbox <folder>` puts the outbox somewhere else, e.g. on another drive.
 - **Runs in the background:** no window, one instance per folder. It logs to
   `%LOCALAPPDATA%\photo-stamp\photo-stamp.log`.
 - **Filesystem events** give instant pickup, with a scan every 30 s as backup. Files open in another program
@@ -81,7 +87,7 @@ There's no backup copy. Camera RAW files are never modified; a stamped `<name>.j
   (`places.sqlite`) live in `photo-stamp-files\` beside the exe, which the watcher ignores. The Overture cache
   is in `%LOCALAPPDATA%\photo-stamp\overture`.
 
-Setup: copy `photo-stamp.exe` and `photo-stamp-files\` into the folder, then double-click the exe. From a
+Setup: copy `photo-stamp.exe` and `photo-stamp-files\` into an empty drop folder, then double-click the exe. From a
 terminal in that folder:
 
 ```
@@ -172,7 +178,8 @@ rebuilt automatically when it changes. The cargo registry is cached in `~/.cache
 | `src/geo.rs`      | Place/Name types; the previous OpenStreetMap geocoder (not used by default) |
 | `src/render.rs`   | Shaped, outlined + shadowed text (cosmic-text)                        |
 | `src/formats.rs`  | Format detection, decode/encode (image crate, libheif, RAW previews)  |
-| `src/stamp.rs`    | Per-photo pipeline and in-place mode                                  |
+| `src/stamp.rs`    | Per-photo pipeline; one-off `stamp` in place                          |
+| `src/outbox.rs`   | Windows drop folder: stamp and move to the outbox                     |
 | `src/watch.rs`    | Inbox watcher and folder sorting                                      |
 | `src/main.rs`     | CLI                                                                   |
 

@@ -46,7 +46,7 @@ pub fn locate() -> Option<PathBuf> {
         candidates.push(p.into());
     }
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_owned)) {
-        candidates.push(dir.join(crate::inplace::SUPPORT_DIR).join(FILE_NAME));
+        candidates.push(dir.join(crate::outbox::SUPPORT_DIR).join(FILE_NAME));
     }
     candidates.push(PathBuf::from("/usr/share/photo-stamp").join(FILE_NAME));
     candidates.into_iter().find(|p| p.is_file())

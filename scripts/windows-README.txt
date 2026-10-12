@@ -2,27 +2,32 @@ photo-stamp for Windows
 =======================
 
 Burns the place and local time each photo was taken into the photo itself, using the photo's
-own metadata (date and GPS position), with place names from OpenStreetMap.
+own metadata (date and GPS position).
 
 SETUP
 
-1. Copy photo-stamp.exe AND the photo-stamp-files folder into the folder you want stamped,
-   e.g. your Pictures folder. Subfolders are included.
+1. Make an empty folder to drop photos into, e.g. Pictures\Stamp. Copy photo-stamp.exe AND the
+   photo-stamp-files folder into it.
 2. Double-click photo-stamp.exe. Nothing appears on screen: it runs in the background.
 3. To have it start whenever you log in, open a terminal in that folder and run:
        photo-stamp.exe --install-startup
 
 WHAT IT DOES
 
-- Every NEW photo that appears in the folder or its subfolders is replaced with the same photo
-  with the place and time stamped in its bottom-left corner. The file keeps its name and dates.
-  There is no backup copy, so keep originals elsewhere if you want them.
-- Photos that were already there when you started it are left alone. Photos added while it
-  wasn't running are caught when it next starts.
-- JPEG, PNG, WebP, TIFF and HEIC (iPhone) photos are stamped in place. Camera RAW files (DNG, CR3,
-  NEF, ARW, ...) are never modified: a stamped copy is saved beside them as <name>.jpg.
-- Photos with no date or location in their metadata are left untouched.
-- The photo-stamp-files folder is ignored.
+- Every photo you drop into the folder, or any subfolder, is stamped with the place and time in its
+  bottom-left corner and MOVED to the "outbox" folder, in the same subfolders:
+      trip\day 1\IMG_1.jpg  ->  outbox\trip\day 1\IMG_1.jpg
+  It keeps its name and dates. The original is not kept, so keep a copy elsewhere if you want it.
+- It doesn't matter how old a photo's file dates are. A hidden "photo-stamp" tag in the photo
+  marks it as stamped, so nothing is ever stamped twice.
+- Photos that are already stamped, or have no date or location in their metadata, are moved to
+  the outbox unchanged.
+- JPEG, PNG, WebP, TIFF and HEIC (iPhone) photos are stamped. Camera RAW files (DNG, CR3, NEF,
+  ARW, ...) are never modified: they're moved with a stamped copy beside them as <name>.jpg.
+- If the outbox already has a photo by that name, the new one becomes "name (2).jpg".
+- Other files (videos, documents, ...) are left where they are, and so are the folders.
+- The outbox and photo-stamp-files folders are ignored. To use a different outbox, start it with
+  --outbox "D:\Stamped".
 
 COMMANDS (from a terminal in the folder)
 
