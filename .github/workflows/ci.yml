@@ -21,7 +21,7 @@ env:
 jobs:
   check:
     name: Tests, clippy, rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: actions/cache@v6
@@ -43,7 +43,7 @@ jobs:
 
   check-windows:
     name: Clippy (Windows target)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Toolchain
@@ -65,7 +65,7 @@ jobs:
   windows:
     name: Windows zip
     needs: [check, check-windows]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
@@ -111,7 +111,7 @@ jobs:
     name: Docker image
     needs: check
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -145,7 +145,7 @@ jobs:
     name: GitHub Release
     needs: windows
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
