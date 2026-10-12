@@ -146,6 +146,25 @@ pub struct Overture {
     downloaded: AtomicU64,
     /// Serializes building each dataset's index (indexed by `Dataset as usize`).
     building: [Mutex<()>; 4],
+    /// Whether the last network request worked, and the error if not.
+    last_fetch: Mutex<Option<Result<(), String>>>,
+}
+
+/// The state of the Overture data, for the dashboard.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct OvertureHealth {
+    pub release: Option<String>,
+    pub release_age_days: Option<i64>,
+    /// Datasets whose index is loaded, of [`Dataset::ALL`].
+    pub indexes_ready: usize,
+    pub indexes_total: usize,
+    pub cache_bytes: u64,
+    pub cache_cap_bytes: u64,
+    /// Downloaded since startup.
+    pub downloaded_bytes: u64,
+    /// Whether the last download worked (`None`: nothing downloaded yet).
+    pub online: Option<bool>,
+    pub last_error: Option<String>,
 }
 
 fn now_secs() -> u64 {
@@ -213,6 +232,7 @@ impl Overture {
             indexes: Mutex::new(HashMap::new()),
             downloaded: AtomicU64::new(0),
             building: Default::default(),
+            last_fetch: Mutex::new(None),
         })
     }
 
@@ -240,10 +260,14 @@ impl Overture {
                 Ok(b) => {
                     self.cache.put(key, start, len, &b);
                     self.downloaded.fetch_add(len as u64, Ordering::Relaxed);
+                    *self.last_fetch.lock().unwrap() = Some(Ok(()));
                     return Ok(b);
                 }
                 Err(e) => last_err = Some(e),
             }
+        }
+        if let Some(e) = &last_err {
+            *self.last_fetch.lock().unwrap() = Some(Err(format!("{e:#}")));
         }
         Err(last_err.unwrap_or_else(|| anyhow!("no source")).context(format!("reading {key}")))
     }
@@ -425,6 +449,28 @@ impl Overture {
             anyhow::Ok(out)
         })?;
         Ok(out)
+    }
+
+    /// The release in use, index and cache state, and whether downloads are working.
+    pub fn health(&self) -> OvertureHealth {
+        let release = self.state.lock().unwrap().as_ref().map(|s| s.release.clone());
+        let today = (now_secs() / 86_400) as i64;
+        let indexes_ready = release.as_deref().map_or(0, |r| {
+            let ix = self.indexes.lock().unwrap();
+            Dataset::ALL.iter().filter(|&&ds| ix.contains_key(&(r.to_owned(), ds))).count()
+        });
+        let last = self.last_fetch.lock().unwrap().clone();
+        OvertureHealth {
+            release_age_days: release.as_deref().and_then(release_day).map(|d| today - d),
+            release,
+            indexes_ready,
+            indexes_total: Dataset::ALL.len(),
+            cache_bytes: self.cache.total(),
+            cache_cap_bytes: self.cache.cap,
+            downloaded_bytes: self.downloaded_bytes(),
+            online: last.as_ref().map(Result::is_ok),
+            last_error: last.and_then(Result::err),
+        }
     }
 
     /// Total bytes fetched over the network so far.
@@ -736,6 +782,11 @@ impl RangeCache {
         if *total > self.cap {
             *total = self.evict(self.cap * 8 / 10);
         }
+    }
+
+    /// Bytes in the cache.
+    fn total(&self) -> u64 {
+        *self.size.lock().unwrap().get_or_insert_with(|| self.scan().iter().map(|e| e.1).sum())
     }
 
     fn scan(&self) -> Vec<(PathBuf, u64, SystemTime)> {

@@ -88,6 +88,12 @@ impl PlacesDb {
         Ok(Self { conn: Mutex::new(conn) })
     }
 
+    /// When the database was built (YYYY-MM-DD).
+    pub fn built(&self) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT value FROM meta WHERE key = 'built'", [], |r| r.get(0)).ok()
+    }
+
     /// Open the database found by [`locate`].
     pub fn open_default() -> anyhow::Result<Self> {
         let path = locate().context(

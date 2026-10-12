@@ -128,3 +128,56 @@ pub fn uninstall_startup(root: &Path) -> std::io::Result<bool> {
         err => Err(std::io::Error::from_raw_os_error(err as i32)),
     }
 }
+
+/// The name Windows shows on our notifications.
+const APP_ID: &str = "photo-stamp";
+
+/// Register photo-stamp as a notification sender for this user, so toasts show its name
+/// (unpackaged apps need this instead of a Start menu shortcut).
+fn register_app_id() -> std::io::Result<()> {
+    let key = wide(format!(r"Software\Classes\AppUserModelId\{APP_ID}"));
+    let (name, value) = (wide("DisplayName"), wide("photo-stamp"));
+    let err = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            REG_SZ,
+            value.as_ptr().cast(),
+            (value.len() * 2) as u32,
+        )
+    };
+    if err == 0 { Ok(()) } else { Err(std::io::Error::from_raw_os_error(err as i32)) }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// Show a Windows notification; clicking it opens `link` (e.g. the dashboard).
+pub fn toast(title: &str, body: &str, link: &str) -> anyhow::Result<()> {
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+    use windows::core::HSTRING;
+
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    REGISTERED.call_once(|| {
+        if let Err(e) = register_app_id() {
+            log::warn!("couldn't register for notifications: {e}");
+        }
+    });
+    // WinRT needs COM on this thread; harmless if it's already set up.
+    let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    let xml = format!(
+        r#"<toast activationType="protocol" launch="{}"><visual><binding template="ToastGeneric"><text>{}</text><text>{}</text></binding></visual></toast>"#,
+        xml_escape(link),
+        xml_escape(title),
+        xml_escape(body)
+    );
+    let doc = XmlDocument::new()?;
+    doc.LoadXml(&HSTRING::from(xml))?;
+    let toast = ToastNotification::CreateToastNotification(&doc)?;
+    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?.Show(&toast)?;
+    Ok(())
+}

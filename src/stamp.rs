@@ -125,8 +125,32 @@ pub fn write_stamped(
     dest: &Path,
     quality: u8,
 ) -> anyhow::Result<()> {
+    write_stamped_with(src, job, renderer, dest, quality, &mut |_, _| {})
+}
+
+/// Which picture [`write_stamped_with`] is showing its hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Picture {
+    /// Decoded and upright, before the caption.
+    Original,
+    /// With the caption, about to be saved.
+    Stamped,
+}
+
+/// [`write_stamped`], showing `on_image` the picture before and after the caption is drawn
+/// (e.g. to save previews) without decoding the photo twice.
+pub fn write_stamped_with(
+    src: &Path,
+    job: &Job,
+    renderer: &mut Renderer,
+    dest: &Path,
+    quality: u8,
+    on_image: &mut dyn FnMut(Picture, &DynamicImage),
+) -> anyhow::Result<()> {
     let img = formats::decode(src, job.kind, job.info.orientation)?;
+    on_image(Picture::Original, &img);
     let img = draw_caption(img, &job.lines, renderer);
+    on_image(Picture::Stamped, &img);
 
     // Keep the real extension last: exiftool picks the file format from it.
     let dest_name = dest.file_name().context("destination has no file name")?.to_string_lossy();

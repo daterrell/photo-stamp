@@ -3,11 +3,20 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 const ROTATE_AT: u64 = 5 * 1024 * 1024;
+
+/// Also receives every line (level, text), e.g. for the dashboard's log view.
+pub type Sink = Box<dyn Fn(&'static str, &str) + Send + Sync>;
+static SINK: OnceLock<Sink> = OnceLock::new();
+
+/// Send log lines to `sink` too (once; later calls are ignored).
+pub fn set_sink(sink: Sink) {
+    let _ = SINK.set(sink);
+}
 
 struct Logger {
     file: Option<Mutex<File>>,
@@ -28,7 +37,18 @@ impl Log for Logger {
             Level::Warn => "warn ",
             _ => "     ",
         };
-        let line = format!("{} {level} {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), r.args());
+        let text = r.args().to_string();
+        let line = format!("{} {level} {text}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+        if let Some(sink) = SINK.get() {
+            sink(
+                match r.level() {
+                    Level::Error => "error",
+                    Level::Warn => "warn",
+                    _ => "info",
+                },
+                &text,
+            );
+        }
         if let Some(f) = &self.file {
             let _ = f.lock().unwrap().write_all(line.as_bytes());
         }

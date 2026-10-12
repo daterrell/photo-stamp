@@ -1,0 +1,10 @@
+[package]
+name = "photo-stamp-ui"
+version = "0.6.0"
+edition = "2024"
+description = "Dashboard for photo-stamp: shows and controls the drop-folder service in your browser"
+license = "MIT"
+publish = false
+
+[dependencies]
+photo-stamp-http = { path = "../http" }
