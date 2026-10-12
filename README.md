@@ -19,17 +19,25 @@ Pebble Beach, California, United States
 Tue 3 Jun 2025, 15:10 PDT
 ```
 
-- **Where**: GPS coordinates turned into place names with OpenStreetMap, in English with local names in
-  parentheses, on up to three lines:
-  1. The **venue you're inside** (golf course, park, zoo, stadium, campus, castle, museum, airport, beach…), found
-     with Overpass `is_in` — "Pebble Beach Golf Course". Venue types and notability (Wikipedia/Wikidata) are
-     weighed against size, so a stadium beats the park around it and a course beats a garden within it. If you're
-     not inside a venue, the most notable **landmark within 250 m** is used instead — "Eiffel Tower (Tour Eiffel)".
+- **Where**: place names in English with local names in parentheses, on up to three lines, worked out
+  **offline-first** (no online API, no rate limits):
+  1. The **venue you're inside** (golf course, park, stadium, zoo, campus, tower, castle…) from
+     [Overture Maps](https://overturemaps.org) — "Pebble Beach Golf Course". Venue type and fame (how many
+     Wikipedia languages describe it) are weighed against size, so a stadium beats the park around it and a
+     course beats a garden within it. If you're not inside a venue, a famous **landmark nearby** is used instead —
+     "Eiffel Tower (Tour Eiffel)" (the more famous, the further away it can be).
   2. "near …" a clearly famous landmark close by, when line 1 is a venue.
-  3. **Neighbourhood, town, region, country** from [Nominatim](https://nominatim.org) — "Pebble Beach,
-     California, United States".
-  - Overpass requests fail over between public mirrors (override with `PHOTO_STAMP_OVERPASS_URLS`).
-  - With no network (or `--offline`) the raw coordinates are used: "48.85840° N, 2.29450° E".
+  3. **Neighbourhood** (Overture), then **town, region, country** (GeoNames) — "Pebble Beach, California,
+     United States".
+- **Bundled data** (`places.sqlite`, built by `scripts/build-places-db.py`): towns, regions and countries from
+  [GeoNames](https://www.geonames.org) (as [Immich](https://immich.app) uses), plus famous landmarks and a fame
+  score for ~1M places from [Wikidata](https://www.wikidata.org). Always available, so the town line never waits.
+- **Overture Maps** is read on demand: just the few row groups around each photo, fetched as plain byte ranges
+  from Overture's public files on AWS (Azure as fallback), and kept in a disk cache (400 MB cap,
+  `PHOTO_STAMP_OVERTURE_CACHE_MB`). The first lookup of each Overture release (roughly monthly) downloads about
+  60 MB of file indexes; after that a new spot costs a few MB and repeat spots are instant and offline. If
+  Overture can't be reached, photos still get town/region/country and nearby famous landmarks (watch mode first
+  retries for a few minutes). `--offline` uses the bundled data only.
 - **When**: the *local time at the place the photo was taken*, with its zone. The true instant comes from
   `OffsetTimeOriginal` (phones record it) or the GPS timestamp, and is converted to the timezone at the GPS
   position (offline lookup) — so a camera left on home time still shows the right local time. Without that
@@ -66,9 +74,11 @@ There's no backup copy. Camera RAW files are never modified; a stamped `<name>.j
 - **Runs in the background:** no window, one instance per folder. It logs to
   `%LOCALAPPDATA%\photo-stamp\photo-stamp.log`.
 - **Filesystem events** give instant pickup, with a scan every 30 s as backup. Files open in another program
-  (or mid-sync) are retried, as are photos whose place lookup fails because OpenStreetMap is unavailable.
-- **HEIC** (iPhone) support is compiled in, so no codec packs are needed. exiftool is bundled in
-  `photo-stamp-files\` beside the exe, which the watcher ignores.
+  (or mid-sync) are retried, as are photos taken while Overture Maps couldn't be reached (for a few minutes,
+  then they're stamped with the bundled town/landmark data).
+- **HEIC** (iPhone) support is compiled in, so no codec packs are needed. exiftool and the bundled place data
+  (`places.sqlite`) live in `photo-stamp-files\` beside the exe, which the watcher ignores. The Overture cache
+  is in `%LOCALAPPDATA%\photo-stamp\overture`.
 
 Setup: copy `photo-stamp.exe` and `photo-stamp-files\` into the folder, then double-click the exe. From a
 terminal in that folder:
@@ -108,9 +118,8 @@ photos/
 
 New files are noticed instantly via filesystem events, with the inbox also polled every 5 s as a backup (for
 network shares, `/mnt/c` under WSL, or missed events). They're processed once they've stopped changing for 3 s,
-so large copies are safe. If OpenStreetMap is
-unreachable or only partly answers, a photo waits in the inbox and is retried (1, 2, 4 min) before settling for
-what it has (town name, or coordinates). Name
+so large copies are safe. If Overture Maps can't be reached, a photo waits in the inbox and is retried
+(1, 2, 4 min) before settling for the bundled data (town, region, country and famous landmarks). Name
 clashes become `photo (2).jpg`. Watch progress with `docker compose logs -f`.
 
 Settings (in `compose.yaml` / environment):
@@ -120,18 +129,18 @@ Settings (in `compose.yaml` / environment):
 | `PHOTOS_DIR`          | `$PWD/photos`    | Host folder backing the `photos` volume (absolute path)        |
 | `PUID` / `PGID`       | `1000`           | Host user/group that output files belong to                    |
 | `PHOTO_STAMP_POLL_SECS` | `5`            | Backup polling interval (filesystem events are also used)      |
-| `PHOTO_STAMP_LANG`    | `en`             | Main language for place names                                   |
 | `PHOTO_STAMP_QUALITY` | `92`             | Quality for lossy re-encoding                                   |
-| `PHOTO_STAMP_OFFLINE` | `false`          | Never contact OpenStreetMap                                     |
+| `PHOTO_STAMP_OFFLINE` | `false`          | Bundled place data only (no Overture downloads)                 |
+| `PHOTO_STAMP_OVERTURE_CACHE_MB` | `400`  | Size cap of the Overture download cache                         |
 
-Place lookups are cached in the `cache` volume and throttled to 1 request/second per the OSM usage policies.
+The Overture cache lives in the `cache` volume.
 
 ## Command line
 
 ```sh
 photo-stamp watch <ROOT> [--poll-secs 5] [--settle-secs 3] [--no-events]
 photo-stamp stamp [-n|--dry-run] <PATHS>...     # IN PLACE; RAW → "<name>.jpg" alongside
-  global: --offline  --lang <LANG>  --quality <Q>
+  global: --offline  --quality <Q>
 ```
 
 Running outside Docker needs `exiftool` on the PATH (and libheif for HEIC; build with
@@ -155,7 +164,11 @@ rebuilt automatically when it changes. The cargo registry is cached in `~/.cache
 |-------------------|-----------------------------------------------------------------------|
 | `src/metadata.rs` | Reading/copying metadata and RAW previews via exiftool                |
 | `src/localtime.rs`| Timezone at a GPS position; local-time caption                        |
-| `src/geo.rs`      | Overpass/Nominatim lookups, POI scoring, bilingual labels, cache      |
+| `src/gazetteer.rs`| Naming a spot: venue / landmark / neighbourhood / town scoring         |
+| `src/places.rs`   | The bundled GeoNames + Wikidata database (`places.sqlite`)            |
+| `src/overture.rs` | On-demand Overture Maps reads: range requests, row-group pruning, cache |
+| `src/wkb.rs`      | Point-in-polygon on WKB geometry                                      |
+| `src/geo.rs`      | Place/Name types; the previous OpenStreetMap geocoder (not used by default) |
 | `src/render.rs`   | Shaped, outlined + shadowed text (cosmic-text)                        |
 | `src/formats.rs`  | Format detection, decode/encode (image crate, libheif, RAW previews)  |
 | `src/stamp.rs`    | Per-photo pipeline and in-place mode                                  |

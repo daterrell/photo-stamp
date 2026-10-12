@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libimage-exiftool-perl fonts-dejavu-core fonts-noto-core fonts-noto-cjk ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/photo-stamp /usr/local/bin/photo-stamp
+# Bundled place data: build it first with `python3 scripts/build-places-db.py data/places.sqlite`.
+COPY data/places.sqlite /usr/share/photo-stamp/places.sqlite
 # World-writable so the container can run as any user (see `user:` in compose.yaml).
 RUN mkdir -p /photos /cache && chmod 1777 /photos /cache
 ENV XDG_CACHE_HOME=/cache HOME=/tmp

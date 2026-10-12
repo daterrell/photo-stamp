@@ -37,4 +37,13 @@ LOG
 What it did, and why anything was left alone, is written to
     %LOCALAPPDATA%\photo-stamp\photo-stamp.log
 
-Place names (c) OpenStreetMap contributors. Includes ExifTool by Phil Harvey.
+PLACE DATA
+
+Towns, regions and countries come from the bundled photo-stamp-files\places.sqlite and work offline.
+Venues (golf courses, parks, stadiums, towers...) and neighbourhoods are downloaded on demand from
+Overture Maps, only for the area around each photo, and cached in %LOCALAPPDATA%\photo-stamp\overture
+(400 MB at most). The first photo after each monthly Overture release takes a minute longer while
+its index downloads (about 60 MB).
+
+Data: GeoNames (CC BY 4.0, geonames.org); Wikidata (CC0); Overture Maps (overturemaps.org; includes
+OpenStreetMap data (c) OpenStreetMap contributors, ODbL). Includes ExifTool by Phil Harvey.

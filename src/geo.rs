@@ -255,8 +255,14 @@ impl Name {
         if preferred.is_empty() {
             return None;
         }
-        let local =
-            local.map(str::trim).filter(|l| !l.is_empty() && !preferred.contains(l)).map(str::to_owned);
+        // Skip a local name that only differs in case, spacing or punctuation ("Champ-de-Mars").
+        let squash = |s: &str| {
+            s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect::<String>()
+        };
+        let local = local
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !squash(&preferred).contains(&squash(l)))
+            .map(str::to_owned);
         Some(Self { preferred, local })
     }
 

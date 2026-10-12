@@ -3,12 +3,13 @@
 #
 #   dist/photo-stamp-windows/
 #     photo-stamp.exe
-#     photo-stamp-files/exiftool.exe, photo-stamp-files/exiftool_files/
+#     photo-stamp-files/exiftool.exe, photo-stamp-files/exiftool_files/, photo-stamp-files/places.sqlite
 #     README.txt
 #   dist/photo-stamp-windows.zip
 #
 # Needs only Docker. The exe is cross-compiled with HEIC support linked in statically.
-# Set PHOTO_STAMP_EXE to package an exe that was already built.
+# Set PHOTO_STAMP_EXE to package an exe that was already built, PHOTO_STAMP_PLACES_DB for the place data
+# (default data/places.sqlite, built with scripts/build-places-db.py if missing).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -58,6 +59,14 @@ with zipfile.ZipFile(src) as z:
         with z.open(info) as r, open(out, "wb") as w:
             w.write(r.read())
 EOF
+
+# Bundled place data (towns, regions, countries, famous landmarks).
+places="${PHOTO_STAMP_PLACES_DB:-data/places.sqlite}"
+if [ ! -f "$places" ]; then
+  echo "building $places…"
+  python3 scripts/build-places-db.py "$places"
+fi
+cp "$places" "$DIST/photo-stamp-files/places.sqlite"
 
 cp scripts/windows-README.txt "$DIST/README.txt"
 (cd dist && python3 -m zipfile -c photo-stamp-windows.zip photo-stamp-windows/)

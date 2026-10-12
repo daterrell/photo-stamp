@@ -8,8 +8,11 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use log::{error, info};
-use photo_stamp::geo::{Geocoder, NoGeocoder, OsmGeocoder};
+use photo_stamp::gazetteer::Gazetteer;
+use photo_stamp::geo::Geocoder;
 use photo_stamp::inplace::{self, InPlace};
+use photo_stamp::overture::{self, Overture};
+use photo_stamp::places::PlacesDb;
 use photo_stamp::render::Renderer;
 use photo_stamp::stamp::{Options, Outcome, stamp_in_place};
 use photo_stamp::{formats, logging, metadata, paths, watch};
@@ -34,13 +37,10 @@ struct Cli {
 
 #[derive(Args)]
 struct Common {
-    /// Don't contact OpenStreetMap; caption with coordinates instead of place names
+    /// Use only the bundled place data (towns, regions, countries, famous landmarks); don't download
+    /// venue/landmark detail from Overture Maps
     #[arg(long, global = true, env = "PHOTO_STAMP_OFFLINE")]
     offline: bool,
-
-    /// Language for place names (local names are added in parentheses)
-    #[arg(long, global = true, default_value = "en", env = "PHOTO_STAMP_LANG")]
-    lang: String,
 
     /// Quality for lossy re-encoding (JPEG, HEIC, RAW→JPEG)
     #[arg(long, global = true, default_value_t = 92, env = "PHOTO_STAMP_QUALITY",
@@ -143,8 +143,13 @@ fn main() -> ExitCode {
             return if e.use_stderr() { ExitCode::FAILURE } else { ExitCode::SUCCESS };
         }
     };
-    let geo: Box<dyn Geocoder> =
-        if cli.common.offline { Box::new(NoGeocoder) } else { Box::new(OsmGeocoder::new(&cli.common.lang)) };
+    let geo: Box<dyn Geocoder> = match gazetteer(cli.common.offline) {
+        Ok(g) => Box::new(g),
+        Err(e) => {
+            tell(&format!("{e:#}"), true);
+            return ExitCode::FAILURE;
+        }
+    };
 
     match cli.command {
         None => here(cli.here, &cli.common, geo.as_ref()),
@@ -177,6 +182,19 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Bundled place data, plus Overture Maps on demand unless `offline`.
+fn gazetteer(offline: bool) -> anyhow::Result<Gazetteer> {
+    let places = PlacesDb::open_default()?;
+    let overture = if offline {
+        None
+    } else {
+        let dir =
+            overture::default_dir().ok_or_else(|| anyhow::anyhow!("no folder for the Overture cache"))?;
+        Some(Overture::new(&dir)?)
+    };
+    Ok(Gazetteer::new(places, overture))
 }
 
 /// The default action: stamp new photos in place in this program's folder (or `--root`).

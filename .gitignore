@@ -2,3 +2,5 @@
 /.claude/
 /dist/
 /photos/
+/data/
+__pycache__/

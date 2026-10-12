@@ -62,12 +62,43 @@ jobs:
       # Windows-only code.
       - run: cargo clippy --target x86_64-pc-windows-gnu --no-default-features --all-targets --locked -- -D warnings
 
-  windows:
-    name: Windows zip
-    needs: [check, check-windows]
+  places:
+    name: Place data
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      # Rebuilt weekly (GeoNames and Wikidata change slowly), and when the build script changes.
+      - id: week
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: data/places.sqlite
+          key: places-db-${{ steps.week.outputs.week }}-${{ hashFiles('scripts/build-places-db.py') }}
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/photo-stamp-dev/places-src
+          key: places-src-${{ steps.week.outputs.week }}
+          restore-keys: places-src-
+      - name: Build places.sqlite
+        run: test -f data/places.sqlite || python3 scripts/build-places-db.py data/places.sqlite
+      - run: ls -la data/places.sqlite
+      - uses: actions/upload-artifact@v7
+        with:
+          name: places-db
+          path: data/places.sqlite
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: Windows zip
+    needs: [check, check-windows, places]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: places-db
+          path: data
       - uses: docker/setup-buildx-action@v4
       # The static libde265/x265/libheif build takes ~10 minutes; the layer cache skips it.
       - name: Build photo-stamp.exe
@@ -83,7 +114,7 @@ jobs:
         with:
           path: ~/.cache/photo-stamp-dev/downloads
           key: downloads-${{ hashFiles('scripts/build-windows.sh') }}
-      - name: Package with exiftool
+      - name: Package with exiftool and place data
         run: scripts/build-windows.sh
         env:
           PHOTO_STAMP_EXE: build-out/photo-stamp.exe
@@ -109,7 +140,7 @@ jobs:
 
   docker:
     name: Docker image
-    needs: check
+    needs: [check, places]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-24.04
     permissions:
@@ -117,6 +148,10 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: places-db
+          path: data
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
