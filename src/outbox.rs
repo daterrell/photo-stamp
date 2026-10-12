@@ -6,10 +6,17 @@
 //! no date or location to stamp, are moved across unchanged. Camera RAW files are never modified;
 //! they're moved with a stamped `<name>.jpg` beside them. Other files are left where they are.
 //!
+//! Places come from the family's place server. While it can't be reached, photos wait in the queue
+//! (the dashboard shows the nearest town from the local towns database). After the person's wait
+//! time, or when asked to ("stamp now"), a photo is stamped with what's known on this PC instead.
+//!
+//! The original of every photo that's stamped is kept in `originals/`, with the same subfolders,
+//! so it can be stamped again later.
+//!
 //! As in the inbox watcher, filesystem events give instant pickup and polling is the backup; a
 //! file is only processed once it has stopped changing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{FileTimes, Metadata};
 use std::path::{Path, PathBuf};
@@ -22,7 +29,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::formats::{self, Kind};
-use crate::geo::Geocoder;
+use crate::geo::{Geocoder, GpsPoint};
 use crate::render::Renderer;
 use crate::stamp::{GeoUnavailable, Picture, Prepared, prepare, write_stamped_with};
 use crate::status::{self, Entry, Outcome, Queued, Stage, Status, Waiting, Which};
@@ -32,11 +39,14 @@ use crate::watch::is_temporary;
 pub const SUPPORT_DIR: &str = "photo-stamp-files";
 /// Default outbox, inside the watched folder; never scanned.
 pub const OUTBOX_DIR: &str = "outbox";
+/// Default folder for the originals of stamped photos, inside the watched folder; never scanned.
+pub const ORIGINALS_DIR: &str = "originals";
 const SKIP_DIRS: &[&str] = &[SUPPORT_DIR, "$RECYCLE.BIN", "System Volume Information"];
 
-/// Place lookups are retried this many times (with growing delays) before settling for less.
-const GEO_ATTEMPTS: u32 = 4;
+/// While the place server can't be reached, waiting photos are tried again after this long,
+/// doubling up to the maximum.
 const GEO_RETRY_BASE: Duration = Duration::from_secs(60);
+const GEO_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
 /// A file another program has open is retried this often, this many times.
 const LOCKED_RETRY: Duration = Duration::from_secs(30);
 const LOCKED_ATTEMPTS: u32 = 20;
@@ -48,6 +58,10 @@ pub struct Config {
     pub outbox: PathBuf,
     /// Listen for filesystem events (polling always runs too).
     pub events: bool,
+    /// Where the originals of stamped photos are kept (`None`: they aren't).
+    pub originals: Option<PathBuf>,
+    /// Where to remember since when photos have been waiting, across restarts.
+    pub waiting_file: Option<PathBuf>,
 }
 
 /// Why the watcher woke up.
@@ -56,6 +70,9 @@ pub enum Wake {
     Fs,
     /// Try this photo (a path within the watched folder) again, e.g. after it failed.
     Retry(PathBuf),
+    /// Stop waiting for the place server: stamp this waiting photo (or all of them, `None`) now
+    /// with what's known on this PC.
+    StampNow(Option<PathBuf>),
     Stop,
 }
 
@@ -66,6 +83,9 @@ struct Delivered {
     caption: Vec<String>,
     output: PathBuf,
     thumbs: bool,
+    /// Where the original was kept.
+    original: Option<PathBuf>,
+    gps: Option<GpsPoint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -89,6 +109,9 @@ struct Deferred {
     geo_attempts: u32,
     lock_attempts: u32,
     next_try: Instant,
+    /// Where it was taken, and the nearest town, while it waits for the place server.
+    gps: Option<GpsPoint>,
+    near: Option<String>,
 }
 
 pub struct Outbox<'a> {
@@ -103,6 +126,10 @@ pub struct Outbox<'a> {
     status: Arc<Status>,
     /// A stop arrived (seen between photos); the loop ends after the photo in hand.
     stopping: bool,
+    /// Since when (ms since the epoch) each photo has been waiting, by path within the folder.
+    first_seen: HashMap<String, u64>,
+    /// Photos to stamp now with local data rather than wait for the place server.
+    stamp_now: HashSet<PathBuf>,
     wake_tx: mpsc::Sender<Wake>,
     wake_rx: mpsc::Receiver<Wake>,
 }
@@ -117,6 +144,15 @@ impl<'a> Outbox<'a> {
         anyhow::ensure!(root.is_dir(), "{} is not a folder", root.display());
         std::fs::create_dir_all(&config.outbox)
             .with_context(|| format!("creating {}", config.outbox.display()))?;
+        if let Some(o) = &config.originals {
+            std::fs::create_dir_all(o).with_context(|| format!("creating {}", o.display()))?;
+        }
+        let first_seen = config
+            .waiting_file
+            .as_deref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         let (wake_tx, wake_rx) = mpsc::channel();
         Ok(Self {
             root: root.to_owned(),
@@ -128,6 +164,8 @@ impl<'a> Outbox<'a> {
             deferred: HashMap::new(),
             status,
             stopping: false,
+            first_seen,
+            stamp_now: HashSet::new(),
             wake_tx,
             wake_rx,
         })
@@ -149,6 +187,41 @@ impl<'a> Outbox<'a> {
             d.next_try = Instant::now();
         }
         info!("retrying    {}", rel.display());
+    }
+
+    /// Stamp a waiting photo (or every waiting photo) now with what's known on this PC.
+    fn stamp_now(&mut self, rel: Option<&Path>) {
+        let paths: Vec<PathBuf> = match rel {
+            Some(r) => vec![self.root.join(r)],
+            None => self.pending.keys().cloned().collect(),
+        };
+        for p in paths {
+            if let Some(d) = self.deferred.get_mut(&p) {
+                d.next_try = Instant::now();
+            }
+            self.stamp_now.insert(p);
+        }
+        info!("stamping now with local place data: {}", rel.map_or("every waiting photo".into(), |r| r.display().to_string()));
+    }
+
+    /// Whether `path` has waited for the place server longer than the person allows.
+    fn overdue(&self, path: &Path) -> bool {
+        let Some(max) = self.geo.max_wait() else { return false };
+        self.first_seen
+            .get(&self.show(path))
+            .is_some_and(|&t| status::now_ms().saturating_sub(t) >= max.as_millis() as u64)
+    }
+
+    fn save_waiting(&self) {
+        let Some(p) = &self.config.waiting_file else { return };
+        let result = serde_json::to_vec(&self.first_seen).map_err(std::io::Error::other).and_then(|b| {
+            let tmp = p.with_extension("tmp");
+            std::fs::write(&tmp, b)?;
+            std::fs::rename(&tmp, p)
+        });
+        if let Err(e) = result {
+            warn!("couldn't save the waiting list: {e}");
+        }
     }
 
     /// Something that can wake the watcher, e.g. to stop it from another thread.
@@ -211,6 +284,7 @@ impl<'a> Outbox<'a> {
                         return Ok(());
                     }
                     Ok(Wake::Retry(rel)) => self.retry(&rel),
+                    Ok(Wake::StampNow(rel)) => self.stamp_now(rel.as_deref()),
                     Ok(Wake::Fs) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
                 match self.wake_rx.try_recv() {
@@ -228,7 +302,8 @@ impl<'a> Outbox<'a> {
             && e.file_type().is_dir()
             && (name.starts_with('.')
                 || SKIP_DIRS.iter().any(|s| name.eq_ignore_ascii_case(s))
-                || same_path(e.path(), &self.config.outbox))
+                || same_path(e.path(), &self.config.outbox)
+                || self.config.originals.as_deref().is_some_and(|o| same_path(e.path(), o)))
     }
 
     /// Look through the tree once and process every photo that has settled.
@@ -258,6 +333,21 @@ impl<'a> Outbox<'a> {
         self.pending.retain(|p, _| present.contains(p));
         self.deferred.retain(|p, _| present.contains(p));
         self.settled.retain(|p, _| p.exists());
+        self.stamp_now.retain(|p| present.contains(p));
+        // Since when each photo has been waiting (kept across restarts, for the wait time).
+        let waiting: HashSet<String> = self.pending.keys().map(|p| self.show(p)).collect();
+        let before = self.first_seen.len();
+        self.first_seen.retain(|k, _| waiting.contains(k));
+        let mut changed = self.first_seen.len() != before;
+        for k in waiting {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.first_seen.entry(k) {
+                e.insert(status::now_ms());
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_waiting();
+        }
         self.status.set_health(self.geo.health());
         self.report_queue();
         if self.status.is_paused() {
@@ -296,6 +386,7 @@ impl<'a> Outbox<'a> {
                     return true;
                 }
                 Ok(Wake::Retry(rel)) => self.retry(&rel),
+                Ok(Wake::StampNow(rel)) => self.stamp_now(rel.as_deref()),
                 Ok(Wake::Fs) => {}
                 Err(mpsc::TryRecvError::Empty) => return false,
             }
@@ -316,7 +407,11 @@ impl<'a> Outbox<'a> {
                     Some(d) if now < d.next_try && d.lock_attempts > 0 => {
                         Waiting::Busy { until: until(d.next_try) }
                     }
-                    Some(d) if now < d.next_try => Waiting::Offline { until: until(d.next_try) },
+                    Some(d) if now < d.next_try => Waiting::Offline {
+                        until: until(d.next_try),
+                        near: d.near.clone(),
+                        stamp_by: self.stamp_by(p),
+                    },
                     _ if now.duration_since(s.since) < settle => Waiting::Settling,
                     _ if paused => Waiting::Paused,
                     _ => Waiting::Ready,
@@ -326,6 +421,12 @@ impl<'a> Outbox<'a> {
             .collect();
         queue.sort_by(|a, b| a.path.cmp(&b.path));
         self.status.set_queue(queue);
+    }
+
+    /// When a waiting photo will be stamped with local data if the server still can't be reached.
+    fn stamp_by(&self, path: &Path) -> Option<u64> {
+        let max = self.geo.max_wait()?;
+        Some(self.first_seen.get(&self.show(path))? + max.as_millis() as u64)
     }
 
     fn rel<'p>(&self, path: &'p Path) -> &'p Path {
@@ -349,6 +450,9 @@ impl<'a> Outbox<'a> {
         self.pending.remove(path);
         self.deferred.remove(path);
         self.settled.remove(path);
+        if self.first_seen.remove(&self.show(path)).is_some() {
+            self.save_waiting();
+        }
     }
 
     /// Stamp `path` into the outbox (or move it there unchanged) and remove it from here.
@@ -370,6 +474,8 @@ impl<'a> Outbox<'a> {
                     caption: Vec::new(),
                     output: dest,
                     thumbs: false,
+                    original: None,
+                    gps: None,
                 });
             }
             Prepared::Stamp(job) => job,
@@ -386,6 +492,7 @@ impl<'a> Outbox<'a> {
         };
         let quality = self.status.settings().quality;
         let before = std::fs::metadata(path)?;
+        let mut original = None;
         let output = if job.kind == Kind::Raw {
             // The untouched RAW and its stamped JPEG travel together under matching names.
             let raw = free_name(&dir, &name, Some(".jpg"));
@@ -399,11 +506,26 @@ impl<'a> Outbox<'a> {
         } else {
             let dest = free_name(&dir, &name, None);
             write_stamped_with(path, &job, &mut self.renderer, &dest, quality, &mut on_image)?;
-            // Only once the original is gone is the photo delivered; otherwise try again later.
-            if let Err(e) = std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))
-            {
-                let _ = std::fs::remove_file(&dest);
-                return Err(e);
+            // Only once the original is moved aside (or gone) is the photo delivered; otherwise
+            // try again later.
+            let put_aside = match &self.config.originals {
+                Some(o) => {
+                    let odir = o.join(rel.parent().unwrap_or(Path::new("")));
+                    std::fs::create_dir_all(&odir)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|()| {
+                            let kept = free_name(&odir, &name, None);
+                            move_file(path, &kept).map(|()| Some(kept))
+                        })
+                }
+                None => std::fs::remove_file(path).map(|()| None).with_context(|| format!("removing {}", path.display())),
+            };
+            match put_aside {
+                Ok(kept) => original = kept,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&dest);
+                    return Err(e);
+                }
             }
             if let Err(e) = keep_times(&dest, &before) {
                 warn!("couldn't keep the file dates of {}: {e}", self.show_out(&dest));
@@ -411,11 +533,15 @@ impl<'a> Outbox<'a> {
             dest
         };
         info!("stamped     {}: {}", self.show_out(&output), job.lines.join(" | "));
-        Ok(Delivered { outcome: Outcome::Stamped, reason: None, caption: job.lines, output, thumbs: true })
-    }
-
-    fn downloaded(&self) -> u64 {
-        self.geo.health().overture.map_or(0, |o| o.downloaded_bytes)
+        Ok(Delivered {
+            outcome: Outcome::Stamped,
+            reason: None,
+            caption: job.lines,
+            output,
+            thumbs: true,
+            original,
+            gps: job.info.gps,
+        })
     }
 
     fn show_out(&self, path: &Path) -> String {
@@ -426,14 +552,18 @@ impl<'a> Outbox<'a> {
     fn process(&mut self, path: &Path) {
         let (geo_attempts, lock_attempts) =
             self.deferred.get(path).map_or((0, 0), |d| (d.geo_attempts, d.lock_attempts));
-        let strict_geo = geo_attempts + 1 < GEO_ATTEMPTS;
+        // Wait for the place server unless asked not to, or the photo has waited long enough.
+        let forced = self.stamp_now.contains(path);
+        let overdue = self.overdue(path);
+        let strict_geo = !forced && !overdue;
+        if overdue && !forced && geo_attempts > 0 {
+            info!("waited long enough for the place server: stamping {} with local place data", self.show(path));
+        }
 
         let rel = self.show(path);
         let id = self.status.start(&rel);
-        let downloaded_before = self.downloaded();
         let result = self.deliver(path, id, strict_geo);
-        let downloaded = self.downloaded().saturating_sub(downloaded_before);
-        let entry = |outcome, reason, caption, output: Option<String>, thumbs| Entry {
+        let entry = |outcome, reason, caption, output: Option<String>, thumbs, original: Option<String>, gps: Option<GpsPoint>| Entry {
             id,
             path: rel.clone(),
             outcome,
@@ -441,26 +571,40 @@ impl<'a> Outbox<'a> {
             caption,
             output,
             ms: 0,
-            downloaded,
+            downloaded: 0,
             thumbs,
             finished: 0,
+            original,
+            gps: gps.map(|g| [g.lat, g.lon]),
         };
         match result {
             Ok(d) => {
                 self.done(path);
+                self.stamp_now.remove(path);
                 let output = Some(self.show_out(&d.output));
-                self.status.finish(entry(d.outcome, d.reason, d.caption, output, d.thumbs));
+                let original = d.original.as_deref().map(|o| self.show_out(o));
+                self.status.finish(entry(d.outcome, d.reason, d.caption, output, d.thumbs, original, d.gps));
                 return;
             }
             Err(e) if e.downcast_ref::<GeoUnavailable>().is_some() => {
-                let delay = GEO_RETRY_BASE * 2u32.pow(geo_attempts);
-                info!("waiting     {}: {e:#}; retrying in {delay:?}", self.show(path));
+                let at = e.downcast_ref::<GeoUnavailable>().map(|g| g.at);
+                let delay = (GEO_RETRY_BASE * 2u32.pow(geo_attempts.min(8))).min(GEO_RETRY_MAX);
+                if geo_attempts == 0 {
+                    info!("waiting     {}: {e:#}; trying again in {delay:?}", self.show(path));
+                }
+                let near = self
+                    .deferred
+                    .get(path)
+                    .and_then(|d| d.near.clone())
+                    .or_else(|| at.and_then(|a| self.geo.nearby_town(a)));
                 self.deferred.insert(
                     path.to_owned(),
                     Deferred {
                         geo_attempts: geo_attempts + 1,
                         lock_attempts,
                         next_try: Instant::now() + delay,
+                        gps: at,
+                        near,
                     },
                 );
             }
@@ -469,19 +613,23 @@ impl<'a> Outbox<'a> {
                     "busy        {}: in use by another program; retrying in {LOCKED_RETRY:?}",
                     self.show(path)
                 );
+                let (gps, near) = self.deferred.get(path).map_or((None, None), |d| (d.gps, d.near.clone()));
                 self.deferred.insert(
                     path.to_owned(),
                     Deferred {
                         geo_attempts,
                         lock_attempts: lock_attempts + 1,
                         next_try: Instant::now() + LOCKED_RETRY,
+                        gps,
+                        near,
                     },
                 );
             }
             Err(e) => {
                 warn!("couldn't stamp {}: {e:#}; leaving it here", self.show(path));
                 self.settle(path);
-                self.status.finish(entry(Outcome::Failed, Some(format!("{e:#}")), Vec::new(), None, false));
+                self.stamp_now.remove(path);
+                self.status.finish(entry(Outcome::Failed, Some(format!("{e:#}")), Vec::new(), None, false, None, None));
                 return;
             }
         }
@@ -491,8 +639,9 @@ impl<'a> Outbox<'a> {
                 Waiting::Busy { until: status::now_ms() + LOCKED_RETRY.as_millis() as u64 }
             }
             Some(d) => Waiting::Offline {
-                until: status::now_ms()
-                    + d.next_try.saturating_duration_since(Instant::now()).as_millis() as u64,
+                until: status::now_ms() + d.next_try.saturating_duration_since(Instant::now()).as_millis() as u64,
+                near: d.near.clone(),
+                stamp_by: self.stamp_by(path),
             },
             None => Waiting::Ready,
         };
@@ -573,10 +722,30 @@ fn keep_times(path: &Path, before: &Metadata) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::settings::Settings;
-    use crate::stamp::tests::{EIFFEL_TAGS, FailingGeocoder, FixedPlace, make_photo, temp_dir};
+    use crate::geo::Place;
+    use crate::stamp::tests::{EIFFEL_TAGS, FixedPlace, OfflineWithTown, make_photo, temp_dir};
+
+    /// The place server can't be reached and the person won't wait at all.
+    struct OfflineNoWait;
+    impl Geocoder for OfflineNoWait {
+        fn place(&self, _: GpsPoint) -> anyhow::Result<Option<Place>> {
+            anyhow::bail!("server unreachable")
+        }
+        fn local_place(&self, at: GpsPoint) -> Option<Place> {
+            OfflineWithTown.local_place(at)
+        }
+        fn max_wait(&self) -> Option<Duration> {
+            Some(Duration::ZERO)
+        }
+    }
 
     fn config(root: &Path) -> Config {
-        Config { outbox: root.join(OUTBOX_DIR), events: false }
+        Config {
+            outbox: root.join(OUTBOX_DIR),
+            events: false,
+            originals: Some(root.join(ORIGINALS_DIR)),
+            waiting_file: Some(root.join(".waiting.json")),
+        }
     }
 
     /// In-memory status (no history or previews on disk), processing as soon as files are seen.
@@ -695,20 +864,57 @@ mod tests {
     }
 
     #[test]
-    fn geo_outage_defers() {
+    fn waits_for_the_place_server_until_told_not_to() {
         let root = temp_dir("outbox-defer");
-        let mut w = Outbox::new(&root, config(&root), &FailingGeocoder, status(&root)).unwrap();
+        let st = status(&root);
+        let mut w = Outbox::new(&root, config(&root), &OfflineWithTown, st.clone()).unwrap();
         make_photo(&root.join("a.jpg"), EIFFEL_TAGS);
+        make_photo(&root.join("b.jpg"), EIFFEL_TAGS);
         w.scan_once();
-        assert!(root.join("a.jpg").exists(), "waits in place");
-        assert!(!root.join("outbox/a.jpg").exists());
+        assert!(root.join("a.jpg").exists() && root.join("b.jpg").exists(), "wait in place");
         assert_eq!(w.deferred[&root.join("a.jpg")].geo_attempts, 1);
-        // Out of retries: stamp with coordinates rather than wait forever.
-        let d = w.deferred.get_mut(&root.join("a.jpg")).unwrap();
-        d.geo_attempts = GEO_ATTEMPTS;
-        d.next_try = Instant::now();
+        st.snapshot(|s| {
+            let q = s.queue.iter().find(|q| q.path == "a.jpg").unwrap();
+            assert!(matches!(&q.waiting, Waiting::Offline { near: Some(n), .. } if n == "Paris"), "{q:?}");
+        });
+        // Still unreachable: it keeps waiting (no giving up after a few tries).
+        for _ in 0..5 {
+            w.deferred.values_mut().for_each(|d| d.next_try = Instant::now());
+            w.scan_once();
+        }
+        assert!(root.join("a.jpg").exists());
+
+        // "Stamp now" for one photo: stamped with what this PC knows.
+        w.stamp_now(Some(Path::new("a.jpg")));
         w.scan_once();
         assert!(stamped(&root.join("outbox/a.jpg")));
+        assert!(root.join("b.jpg").exists(), "the other keeps waiting");
+        st.snapshot(|s| assert_eq!(s.recent[0].caption[0], "Paris"));
+        // ...and the waiting list remembers b.jpg across restarts.
+        let saved: HashMap<String, u64> = serde_json::from_slice(&std::fs::read(root.join(".waiting.json")).unwrap()).unwrap();
+        assert_eq!(saved.keys().collect::<Vec<_>>(), ["b.jpg"]);
+
+        // Waited longer than the person allows: stamped with local data without being asked.
+        let mut w = Outbox::new(&root, config(&root), &OfflineNoWait, st).unwrap();
+        w.scan_once();
+        assert!(stamped(&root.join("outbox/b.jpg")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn keeps_originals_beside_the_outbox() {
+        let root = temp_dir("outbox-originals");
+        let mut w = Outbox::new(&root, config(&root), &FixedPlace, status(&root)).unwrap();
+        std::fs::create_dir_all(root.join("trip")).unwrap();
+        make_photo(&root.join("trip/a.jpg"), EIFFEL_TAGS);
+        let before = std::fs::read(root.join("trip/a.jpg")).unwrap();
+        w.scan_once();
+        assert!(stamped(&root.join("outbox/trip/a.jpg")));
+        assert_eq!(std::fs::read(root.join("originals/trip/a.jpg")).unwrap(), before, "original kept as it was");
+        // The originals folder isn't scanned (nothing is stamped twice).
+        w.scan_once();
+        assert!(!stamped(&root.join("originals/trip/a.jpg")));
+        assert!(w.pending.is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

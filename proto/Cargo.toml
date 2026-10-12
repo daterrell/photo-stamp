@@ -1,0 +1,19 @@
+[package]
+name = "photo-stamp-proto"
+version = "0.7.0"
+edition = "2024"
+description = "Place types and the /v1 protocol shared by photo-stamp and photo-stamp-server"
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
+
+[features]
+# The SQLite places database (towns, regions, countries, landmarks, fame).
+places = ["dep:rusqlite"]
+
+[dev-dependencies]
+serde_json = "1.0.151"

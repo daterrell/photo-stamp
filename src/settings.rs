@@ -12,13 +12,16 @@ pub const DEFAULT_QUALITY: u8 = 92;
 pub struct Settings {
     /// Where finished photos go; `None` is the "outbox" folder inside the watched folder.
     pub outbox: Option<PathBuf>,
+    /// Where the originals of stamped photos are kept; `None` is the "originals" folder inside the
+    /// watched folder.
+    pub originals: Option<PathBuf>,
     /// Quality for lossy re-encoding (JPEG, HEIC, RAW→JPEG), 1–100.
     pub quality: u8,
     /// Seconds a file must stay unchanged before it's processed.
     pub settle_secs: u64,
     /// Seconds between full scans (backup for filesystem events).
     pub poll_secs: u64,
-    /// Bundled place data only: no Overture Maps downloads.
+    /// Don't ask the place server: name places from this PC's towns database only.
     pub offline: bool,
     /// Show a notification when a batch of photos is done.
     pub notify: bool,
@@ -30,6 +33,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             outbox: None,
+            originals: None,
             quality: DEFAULT_QUALITY,
             settle_secs: 3,
             poll_secs: 30,
@@ -76,7 +80,7 @@ impl Settings {
 
     /// Whether going from `self` to `new` needs the service restarted to take effect.
     pub fn needs_restart(&self, new: &Settings) -> bool {
-        self.outbox != new.outbox || self.offline != new.offline
+        self.outbox != new.outbox || self.originals != new.originals || self.offline != new.offline
     }
 }
 

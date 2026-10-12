@@ -72,6 +72,12 @@ pub struct Entry {
     #[serde(default)]
     pub thumbs: bool,
     pub finished: u64,
+    /// Where the original was kept (relative to the outbox's parent), so it can be stamped again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original: Option<String>,
+    /// Where it was taken: latitude, longitude.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gps: Option<[f64; 2]>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -130,9 +136,15 @@ pub enum Waiting {
     Ready,
     /// Processing is paused.
     Paused,
-    /// Map data couldn't be reached; retried at `until` (ms since the epoch).
+    /// The place server couldn't be reached; asked again at `until` (ms since the epoch).
     Offline {
         until: u64,
+        /// The nearest town, from the local towns database.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        near: Option<String>,
+        /// When it'll be stamped with local place data if the server still can't be reached.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stamp_by: Option<u64>,
     },
     /// Open in another program; retried at `until`.
     Busy {
@@ -685,6 +697,8 @@ mod tests {
             downloaded,
             thumbs: false,
             finished: 0,
+            original: None,
+            gps: None,
         }
     }
 

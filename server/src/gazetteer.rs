@@ -1,22 +1,24 @@
-//! Naming where a photo was taken, offline-first:
+//! Naming where a photo was taken:
 //!
-//! * town, region and country — bundled GeoNames data ([`PlacesDb`]); never needs the network;
-//! * famous landmarks nearby — bundled Wikidata (also gives every feature a "fame" score:
-//!   how many Wikipedia language editions describe it);
+//! * town, region and country: GeoNames ([`PlacesDb`]);
+//! * famous landmarks nearby: Wikidata (which also gives every feature a "fame" score: how many
+//!   Wikipedia language editions describe it);
 //! * the venue you're inside (golf course, park, stadium, tower…), notable structures and the
-//!   neighborhood — Overture Maps, read on demand and cached on disk ([`Overture`]).
+//!   neighborhood: Overture Maps ([`Overture`]), read from the server's local copy.
 //!
-//! If Overture can't be reached the result is marked incomplete (callers that can wait retry
-//! later), but town/region/country and bundled landmarks are still there.
+//! If Overture can't be read the result is marked incomplete (callers that can wait retry later),
+//! but town/region/country and landmarks are still there.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::geo::{GeoHealth, Geocoder, Name, Place};
-use crate::metadata::GpsPoint;
-use crate::overture::{Dataset, Feature, Overture};
-use crate::places::{Landmark, PlacesDb, Town};
+use photo_stamp_proto::places::{Landmark, PlacesDb, Town};
+use photo_stamp_proto::{GpsPoint, Name, Place};
 
+use crate::overture::{Dataset, Feature, Overture, OvertureHealth};
+
+/// Answers kept in memory (each a few hundred bytes).
+const MAX_CACHED: usize = 200_000;
 /// How far to look for venues and structures around the point.
 const SEARCH_M: f64 = 250.0;
 /// How far to look for neighborhood and town names (Overture division points).
@@ -257,6 +259,16 @@ impl Gazetteer {
         Self { places, overture: overture.map(Arc::new), cache: Mutex::new(HashMap::new()) }
     }
 
+    /// When the places database was built (YYYY-MM-DD).
+    pub fn places_built(&self) -> Option<String> {
+        self.places.built()
+    }
+
+    /// The Overture reader's state (`None` when offline).
+    pub fn overture_health(&self) -> Option<OvertureHealth> {
+        self.overture.as_ref().map(|ov| ov.health())
+    }
+
     fn lookup_overture(
         &self,
         ov: &Overture,
@@ -281,8 +293,9 @@ impl Gazetteer {
     }
 }
 
-impl Geocoder for Gazetteer {
-    fn warm_up(&self) {
+impl Gazetteer {
+    /// Build the Overture indexes in the background, so the first lookup is quick.
+    pub fn warm_up(&self) {
         let Some(ov) = self.overture.clone() else { return };
         std::thread::spawn(move || {
             let before = ov.downloaded_bytes();
@@ -300,14 +313,8 @@ impl Geocoder for Gazetteer {
         });
     }
 
-    fn health(&self) -> GeoHealth {
-        GeoHealth {
-            places_built: self.places.built(),
-            overture: self.overture.as_ref().map(|ov| ov.health()),
-        }
-    }
-
-    fn place(&self, at: GpsPoint) -> anyhow::Result<Option<Place>> {
+    /// Name the spot: venue or landmark, then neighborhood, town, region, country.
+    pub fn place(&self, at: GpsPoint) -> anyhow::Result<Option<Place>> {
         // ~11 m: photos from the same spot share a result.
         let key = format!("{:.4},{:.4}", at.lat, at.lon);
         if let Some(hit) = self.cache.lock().unwrap().get(&key) {
@@ -344,7 +351,12 @@ impl Geocoder for Gazetteer {
         };
         let place = build_place(&surroundings, &self.places).map(|p| Place { complete, ..p });
         if let Some(p) = place.as_ref().filter(|p| p.complete) {
-            self.cache.lock().unwrap().insert(key, p.clone());
+            let mut cache = self.cache.lock().unwrap();
+            // A long-running server sees many spots: start over rather than grow without bound.
+            if cache.len() >= MAX_CACHED {
+                cache.clear();
+            }
+            cache.insert(key, p.clone());
         }
         Ok(place)
     }
@@ -355,9 +367,14 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    fn fixture_db() -> PlacesDb {
+        PlacesDb::open(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/places.sqlite"))
+            .unwrap()
+    }
+
     /// Real Overture rows captured around test locations (tests/fixtures/overture.json).
     fn fixture(spot: &str) -> (GpsPoint, Vec<Feature>, Vec<Feature>, Vec<Feature>) {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/overture.json");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/overture.json");
         let all: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         let s = &all[spot];
         let at = GpsPoint { lat: s["lat"].as_f64().unwrap(), lon: s["lon"].as_f64().unwrap() };
@@ -367,9 +384,9 @@ mod tests {
             let point = v["lat"].as_f64().zip(v["lon"].as_f64()).map(|(lat, lon)| GpsPoint { lat, lon });
             let contains = v["contains"].as_bool().unwrap_or(false);
             let distance_m = match point {
-                Some(p) => crate::places::distance_m(at, p),
+                Some(p) => photo_stamp_proto::places::distance_m(at, p),
                 None if contains => 0.0,
-                None => crate::places::distance_m(
+                None => photo_stamp_proto::places::distance_m(
                     at,
                     GpsPoint { lat: at.lat.clamp(bbox[2], bbox[3]), lon: at.lon.clamp(bbox[0], bbox[1]) },
                 ),
@@ -397,7 +414,7 @@ mod tests {
     }
 
     fn caption(spot: &str) -> Vec<String> {
-        let db = crate::places::tests::fixture_db();
+        let db = fixture_db();
         let (at, features, places, divisions) = fixture(spot);
         let landmarks = db.landmarks_near(at, LANDMARK_MAX_REACH_M).unwrap();
         let big_city = db.big_city(at).unwrap();
@@ -465,7 +482,7 @@ mod tests {
 
     #[test]
     fn offline_still_names_town_and_landmarks() {
-        let db = crate::places::tests::fixture_db();
+        let db = fixture_db();
         let at = GpsPoint { lat: 48.8556, lon: 2.2986 };
         let landmarks = db.landmarks_near(at, LANDMARK_MAX_REACH_M).unwrap();
         let big_city = db.big_city(at).unwrap();

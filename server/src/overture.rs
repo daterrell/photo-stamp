@@ -1,17 +1,20 @@
-//! On-demand reads of Overture Maps data (https://overturemaps.org): named land use (golf courses,
-//! parks…), infrastructure (towers, bridges…), places (POIs) and division points (neighborhoods).
+//! Reads of Overture Maps data (https://overturemaps.org): named land use (golf courses, parks…),
+//! infrastructure (towers, bridges…), places (POIs) and division points (neighborhoods).
 //!
 //! Overture publishes GeoParquet files on public cloud storage (AWS S3, mirrored on Azure). Rows are
 //! sorted spatially and every row group carries bounding-box statistics, so a lookup around one point
-//! only needs a handful of row groups. We fetch exactly those byte ranges over HTTP — no API, no rate
-//! limits — and keep every fetched range in a size-capped disk cache, so revisiting an area is
-//! instant and works offline.
+//! only needs a handful of row groups.
+//!
+//! The server keeps a local **mirror** of the files it uses (`photo-stamp-server import`). A file
+//! that's in the mirror is read from disk; one that isn't (yet) is read remotely, fetching just the
+//! byte ranges needed and keeping them in a size-capped disk cache. So a new server answers at once
+//! while its mirror fills, and a server with a complete mirror needs no network to answer.
 //!
 //! The first lookup for a release builds a small per-dataset index (each file's row-group bounding
-//! boxes) from the file footers, about 60 MiB of downloads once per release (roughly monthly).
+//! boxes) from the file footers, once per release (roughly monthly).
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,9 +35,8 @@ use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
 use serde::{Deserialize, Serialize};
 
-use crate::geo::Name;
-use crate::metadata::GpsPoint;
-use crate::places::distance_m;
+use photo_stamp_proto::places::distance_m;
+use photo_stamp_proto::{GpsPoint, Name};
 
 const S3: &str = "https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com";
 const AZURE: &str = "https://overturemapswestus2.blob.core.windows.net";
@@ -148,7 +150,12 @@ pub struct Overture {
     building: [Mutex<()>; 4],
     /// Whether the last network request worked, and the error if not.
     last_fetch: Mutex<Option<Result<(), String>>>,
+    /// Local copy of Overture files, laid out like the bucket (`<mirror>/release/<r>/theme=…/…`).
+    mirror: Option<PathBuf>,
 }
+
+/// Written into `<mirror>/release/<r>/` once every file of that release has been mirrored.
+const COMPLETE_MARKER: &str = ".complete";
 
 /// The state of the Overture data, for the dashboard.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -233,15 +240,158 @@ impl Overture {
             downloaded: AtomicU64::new(0),
             building: Default::default(),
             last_fetch: Mutex::new(None),
+            mirror: None,
         })
+    }
+
+    /// Read files from this local mirror when they're there (see [`Overture::mirror_release`]).
+    pub fn with_mirror(mut self, mirror: &Path) -> Self {
+        self.mirror = Some(mirror.to_owned());
+        self
+    }
+
+    /// The mirrored copy of `key`, if it's fully there.
+    fn local_file(&self, key: &str, size: Option<u64>) -> Option<PathBuf> {
+        let path = self.mirror.as_ref()?.join(key);
+        let meta = std::fs::metadata(&path).ok()?;
+        (meta.is_file() && size.is_none_or(|s| meta.len() == s)).then_some(path)
+    }
+
+    /// Releases mirrored completely, newest first.
+    pub fn mirrored_releases(&self) -> Vec<String> {
+        let Some(m) = &self.mirror else { return Vec::new() };
+        let mut out: Vec<String> = std::fs::read_dir(m.join("release"))
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.path().join(COMPLETE_MARKER).is_file())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort_by(|a, b| b.cmp(a));
+        out
+    }
+
+    /// Every `.parquet` object under `prefix`, with sizes: from the mirror when the release is
+    /// complete there, otherwise from the bucket listing.
+    fn list(&self, release: &str, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
+        if let Some(m) = &self.mirror
+            && self.mirrored_releases().iter().any(|r| r == release)
+        {
+            let mut files: Vec<(String, u64)> = std::fs::read_dir(m.join(prefix))?
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".parquet"))
+                .filter_map(|e| Some((format!("{prefix}{}", e.file_name().to_string_lossy()), e.metadata().ok()?.len())))
+                .collect();
+            files.sort();
+            return Ok(files);
+        }
+        let mut files = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut url = format!("{S3}/?list-type=2&prefix={prefix}");
+            if let Some(t) = &token {
+                url.push_str(&format!(
+                    "&continuation-token={}",
+                    t.replace('+', "%2B").replace('/', "%2F").replace('=', "%3D")
+                ));
+            }
+            let (objects, _, next) = parse_listing(&self.get_text(&url)?);
+            files.extend(objects.into_iter().filter(|(k, _)| k.ends_with(".parquet")));
+            match next {
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+        Ok(files)
+    }
+
+    /// Copy `datasets` of `release` into the mirror: whole files, resuming partial downloads. With
+    /// `bbox` (xmin, xmax, ymin, ymax), only the files with rows in that box (for a regional server
+    /// or tests); otherwise every file, and the release is then marked complete.
+    pub fn mirror_release(&self, release: &str, datasets: &[Dataset], bbox: Option<[f64; 4]>) -> anyhow::Result<u64> {
+        let mirror = self.mirror.clone().context("no mirror folder configured")?;
+        let mut fetched = 0;
+        for &ds in datasets {
+            let index = self.index(release, ds)?;
+            let wanted: Vec<&FileIndex> = index
+                .iter()
+                .filter(|f| bbox.is_none_or(|q| f.row_groups.iter().any(|rg| overlaps(*rg, q))))
+                .collect();
+            let total: u64 = wanted.iter().map(|f| f.size).sum();
+            log::info!(
+                "mirroring {} of release {release}: {} files, {:.1} GB",
+                ds.slug(),
+                wanted.len(),
+                total as f64 / 1e9
+            );
+            for f in wanted {
+                if self.local_file(&f.key, Some(f.size)).is_some() {
+                    continue;
+                }
+                fetched += self.download(&f.key, f.size, &mirror.join(&f.key))?;
+            }
+        }
+        if bbox.is_none() {
+            std::fs::write(mirror.join("release").join(release).join(COMPLETE_MARKER), b"")?;
+            // Older releases aren't needed any more.
+            for old in self.mirrored_releases().into_iter().filter(|r| r.as_str() < release) {
+                log::info!("removing mirrored release {old}");
+                let _ = std::fs::remove_dir_all(mirror.join("release").join(old));
+            }
+        }
+        Ok(fetched)
+    }
+
+    /// The newest release Overture has published.
+    pub fn latest_remote_release(&self) -> anyhow::Result<String> {
+        let xml = self.get_text(&format!("{S3}/?list-type=2&prefix=release/&delimiter=/"))?;
+        parse_listing(&xml)
+            .1
+            .into_iter()
+            .filter_map(|p| p.strip_prefix("release/").map(|r| r.trim_end_matches('/').to_owned()))
+            .max()
+            .context("no Overture releases listed")
+    }
+
+    /// Download a whole object to `dest` (via `<dest>.part`, resumed if it's there).
+    fn download(&self, key: &str, size: u64, dest: &Path) -> anyhow::Result<u64> {
+        std::fs::create_dir_all(dest.parent().context("bad mirror path")?)?;
+        let part = dest.with_extension("parquet.part");
+        let have = std::fs::metadata(&part).map_or(0, |m| m.len()).min(size);
+        let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&part)?;
+        out.set_len(have)?;
+        if have < size {
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_connect(Some(Duration::from_secs(30)))
+                .timeout_recv_body(Some(Duration::from_secs(120)))
+                .user_agent(concat!("photo-stamp-server/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .into();
+            let mut resp = agent.get(&format!("{S3}/{key}")).header("Range", &format!("bytes={have}-")).call()?;
+            let copied = std::io::copy(&mut resp.body_mut().as_reader(), &mut out)?;
+            out.flush()?;
+            self.downloaded.fetch_add(copied, Ordering::Relaxed);
+        }
+        let got = std::fs::metadata(&part)?.len();
+        anyhow::ensure!(got == size, "{key}: got {got} of {size} bytes; run the import again to resume");
+        std::fs::rename(&part, dest)?;
+        Ok(size - have)
     }
 
     fn get_text(&self, url: &str) -> anyhow::Result<String> {
         Ok(self.agent.get(url).call()?.body_mut().read_to_string()?)
     }
 
-    /// One byte range of an object, from the cache or the network (S3, then Azure).
+    /// One byte range of an object: from the mirror, the cache or the network (S3, then Azure).
     fn range(&self, key: &str, start: u64, len: usize) -> anyhow::Result<Bytes> {
+        if let Some(path) = self.local_file(key, None) {
+            let mut f = std::fs::File::open(&path)?;
+            f.seek(SeekFrom::Start(start))?;
+            let mut buf = vec![0; len];
+            f.read_exact(&mut buf).with_context(|| format!("reading {}", path.display()))?;
+            return Ok(Bytes::from(buf));
+        }
         if let Some(b) = self.cache.get(key, start, len) {
             return Ok(b);
         }
@@ -275,6 +425,15 @@ impl Overture {
     /// The release to use, re-checking the published list at most daily.
     fn release(&self) -> anyhow::Result<String> {
         let mut state = self.state.lock().unwrap();
+        // A completely mirrored release is used as is: no listing, no network.
+        if let Some(newest) = self.mirrored_releases().into_iter().next() {
+            if state.as_ref().is_none_or(|s| s.release != newest) {
+                log::info!("Overture: using mirrored release {newest}");
+                self.indexes.lock().unwrap().clear();
+                *state = Some(ReleaseState { release: newest.clone(), checked: now_secs() });
+            }
+            return Ok(newest);
+        }
         if let Some(s) = state.as_ref()
             && now_secs().saturating_sub(s.checked) < RELEASE_CHECK_EVERY.as_secs()
         {
@@ -341,23 +500,7 @@ impl Overture {
 
     fn build_index(&self, release: &str, ds: Dataset) -> anyhow::Result<Vec<FileIndex>> {
         let prefix = format!("release/{release}/{}/", ds.path());
-        let mut files = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let mut url = format!("{S3}/?list-type=2&prefix={prefix}");
-            if let Some(t) = &token {
-                url.push_str(&format!(
-                    "&continuation-token={}",
-                    t.replace('+', "%2B").replace('/', "%2F").replace('=', "%3D")
-                ));
-            }
-            let (objects, _, next) = parse_listing(&self.get_text(&url)?);
-            files.extend(objects.into_iter().filter(|(k, _)| k.ends_with(".parquet")));
-            match next {
-                Some(t) => token = Some(t),
-                None => break,
-            }
-        }
+        let files = self.list(release, &prefix)?;
         anyhow::ensure!(!files.is_empty(), "no files under {prefix}");
         // Fetch footers several at a time: dozens of files, each a round trip or two.
         const PARALLEL: usize = 8;
@@ -817,10 +960,6 @@ impl RangeCache {
         }
         total
     }
-}
-
-pub fn default_dir() -> Option<PathBuf> {
-    crate::paths::data_dir().map(|d| d.join("overture"))
 }
 
 /// For tests: is `e` a "not fetched" error from [`SparseFile`]?

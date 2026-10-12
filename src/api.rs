@@ -8,8 +8,13 @@
 //! - `GET  /api/thumb/<id>/<before|after>`: small previews of stamped photos
 //! - `POST /api/pause`, `/api/resume`, `/api/stop`
 //! - `POST /api/retry` `{"path": "<path within the watched folder>"}`
-//! - `GET|PUT /api/settings`: PUT replies `{"settings": …, "restart": bool}`; outbox and offline
-//!   changes only apply after a restart.
+//! - `POST /api/stamp-now` `{"path": "…"}` or `{}` for every waiting photo: stop waiting for the
+//!   place server and stamp with what's known on this PC
+//! - `GET|PUT /api/settings`: PUT replies `{"settings": …, "restart": bool}`; outbox, originals and
+//!   offline changes only apply after a restart.
+//! - `GET /api/server`, `PUT /api/server` `{"url", "key"}` (an empty key keeps the current one),
+//!   `DELETE /api/server`: the place server this PC uses; `POST /api/server/test`
+//! - `PUT /api/me` `{"history": bool, "max_wait_hours": n}`: this device's settings on the server
 
 use std::io::Write;
 use std::net::TcpListener;
@@ -24,6 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::outbox::Wake;
+use crate::remote::{RemoteGeocoder, ServerConfig, normalize_url};
 use crate::settings::Settings;
 use crate::status::{Status, Which};
 
@@ -36,6 +42,31 @@ pub struct Api {
     pub token: String,
     /// Where settings changes are saved (`None`: not saved).
     pub settings_path: Option<PathBuf>,
+    /// The place server connection (`None` in tests).
+    pub geo: Option<Arc<RemoteGeocoder>>,
+}
+
+#[derive(Deserialize)]
+struct StampNowBody {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ServerBody {
+    url: String,
+    #[serde(default)]
+    key: String,
+}
+
+/// The place server settings as the dashboard sees them (never the key itself).
+fn server_view(geo: &RemoteGeocoder) -> serde_json::Value {
+    let server = geo.server();
+    json!({
+        "url": server.as_ref().map(|s| s.url.clone()),
+        "has_key": server.as_ref().is_some_and(|s| !s.key.is_empty()),
+        "key_hint": server.as_ref().and_then(|s| s.key.split('_').nth(1).map(str::to_owned)),
+    })
 }
 
 /// A random 128-bit token, as hex.
@@ -119,6 +150,77 @@ pub fn handle(api: &Api, req: Request) -> Response {
             }
             None => Response::error(400, "expected {\"path\": \"<path within the watched folder>\"}"),
         },
+        ("POST", ["api", "stamp-now"]) => {
+            let body = req.json::<StampNowBody>().unwrap_or(StampNowBody { path: None });
+            match body.path.as_deref().map(safe_relative) {
+                Some(None) => Response::error(400, "expected {\"path\": \"<path within the watched folder>\"} or {}"),
+                Some(Some(rel)) => {
+                    wake(Wake::StampNow(Some(rel)));
+                    Response::ok()
+                }
+                None => {
+                    wake(Wake::StampNow(None));
+                    Response::ok()
+                }
+            }
+        }
+        ("GET", ["api", "server"]) => match &api.geo {
+            Some(g) => Response::json(200, &server_view(g)),
+            None => Response::error(404, "no place lookups here"),
+        },
+        ("PUT", ["api", "server"]) => {
+            let Some(geo) = &api.geo else { return Response::error(404, "no place lookups here") };
+            let Ok(body) = req.json::<ServerBody>() else {
+                return Response::error(400, "expected {\"url\": \"https://…\", \"key\": \"psk_…\"}");
+            };
+            let url = match normalize_url(&body.url) {
+                Ok(u) => u,
+                Err(e) => return Response::error(400, &format!("{e:#}")),
+            };
+            let key = match body.key.trim() {
+                "" => geo.server().map(|s| s.key).unwrap_or_default(),
+                k => k.to_owned(),
+            };
+            if !key.starts_with("psk_") {
+                return Response::error(400, "the device key starts with psk_ (from photo-stamp-server device add)");
+            }
+            log::info!("place server set to {url}");
+            geo.set_server(Some(ServerConfig { url, key }));
+            let test = geo.refresh_me();
+            let mut v = server_view(geo);
+            v["test"] = match test {
+                Ok(me) => json!({ "ok": true, "user": me.user, "device": me.device }),
+                Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
+            };
+            wake(Wake::Fs);
+            Response::json(200, &v)
+        }
+        ("DELETE", ["api", "server"]) => {
+            let Some(geo) = &api.geo else { return Response::error(404, "no place lookups here") };
+            log::info!("place server removed: naming places from this PC's towns database only");
+            geo.set_server(None);
+            Response::json(200, &server_view(geo))
+        }
+        ("POST", ["api", "server", "test"]) => {
+            let Some(geo) = &api.geo else { return Response::error(404, "no place lookups here") };
+            match geo.refresh_me() {
+                Ok(me) => {
+                    wake(Wake::Fs);
+                    Response::json(200, &json!({ "ok": true, "user": me.user, "device": me.device }))
+                }
+                Err(e) => Response::json(200, &json!({ "ok": false, "error": format!("{e:#}") })),
+            }
+        }
+        ("PUT", ["api", "me"]) => {
+            let Some(geo) = &api.geo else { return Response::error(404, "no place lookups here") };
+            let Ok(update) = req.json::<photo_stamp_proto::api::MeUpdate>() else {
+                return Response::error(400, "expected {\"history\": bool, \"max_wait_hours\": n}");
+            };
+            match geo.update_me(&update) {
+                Ok(me) => Response::json(200, &me),
+                Err(e) => Response::error(502, &format!("{e:#}")),
+            }
+        }
         ("GET", ["api", "settings"]) => Response::json(200, &api.status.settings()),
         ("PUT", ["api", "settings"]) => match req.json::<Settings>() {
             Ok(new) => {
@@ -189,7 +291,7 @@ mod tests {
             "k",
             Settings::default(),
         ));
-        (Api { status, waker: Mutex::new(tx), token: "secret".into(), settings_path: None }, rx)
+        (Api { status, waker: Mutex::new(tx), token: "secret".into(), settings_path: None, geo: None }, rx)
     }
 
     fn req(method: &str, path: &str, body: &str) -> Request {
