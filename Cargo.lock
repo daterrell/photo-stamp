@@ -1564,6 +1564,10 @@ name = "photo-stamp-ui"
 version = "0.6.0"
 dependencies = [
  "photo-stamp-http",
+ "serde",
+ "serde_json",
+ "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -101,6 +101,8 @@ pub struct Outbox<'a> {
     settled: HashMap<PathBuf, Fingerprint>,
     deferred: HashMap<PathBuf, Deferred>,
     status: Arc<Status>,
+    /// A stop arrived (seen between photos); the loop ends after the photo in hand.
+    stopping: bool,
     wake_tx: mpsc::Sender<Wake>,
     wake_rx: mpsc::Receiver<Wake>,
 }
@@ -125,6 +127,7 @@ impl<'a> Outbox<'a> {
             settled: HashMap::new(),
             deferred: HashMap::new(),
             status,
+            stopping: false,
             wake_tx,
             wake_rx,
         })
@@ -185,6 +188,10 @@ impl<'a> Outbox<'a> {
 
         loop {
             self.scan_once();
+            if self.stopping {
+                info!("stopped");
+                return Ok(());
+            }
             let (settle, poll) = (self.settle_time(), self.poll_interval());
             let wait = if self.pending.is_empty() && self.deferred.is_empty() {
                 poll
@@ -269,13 +276,28 @@ impl<'a> Outbox<'a> {
             .collect();
         ready.sort();
         for path in ready {
-            // Paused from the dashboard part-way through a batch.
-            if self.status.is_paused() {
+            // Paused or stopped part-way through a batch.
+            if self.status.is_paused() || self.take_wakes() {
                 break;
             }
             self.process(&path);
         }
         self.report_queue();
+    }
+
+    /// Handle requests that arrived while processing (retries); returns whether to stop.
+    fn take_wakes(&mut self) -> bool {
+        loop {
+            match self.wake_rx.try_recv() {
+                Ok(Wake::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.stopping = true;
+                    return true;
+                }
+                Ok(Wake::Retry(rel)) => self.retry(&rel),
+                Ok(Wake::Fs) => {}
+                Err(mpsc::TryRecvError::Empty) => return false,
+            }
+        }
     }
 
     /// Tell the dashboard what's waiting, and why.
@@ -726,6 +748,22 @@ mod tests {
         w.retry(Path::new("broken.png"));
         w.scan_once();
         st.snapshot(|s| assert_eq!(s.session.failed, 2, "tried again"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stop_is_noticed_between_photos() {
+        let root = temp_dir("outbox-stop-batch");
+        let mut w = Outbox::new(&root, config(&root), &FixedPlace, status(&root)).unwrap();
+        make_photo(&root.join("a.jpg"), EIFFEL_TAGS);
+        make_photo(&root.join("b.jpg"), EIFFEL_TAGS);
+        w.waker().send(Wake::Stop).unwrap();
+        w.scan_once();
+        assert!(w.stopping);
+        assert!(
+            root.join("a.jpg").exists() && root.join("b.jpg").exists(),
+            "the batch stops before starting"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
