@@ -10,7 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use log::{error, info};
 use photo_stamp::gazetteer::Gazetteer;
 use photo_stamp::geo::Geocoder;
-use photo_stamp::inplace::{self, InPlace};
+use photo_stamp::outbox::{self, Outbox};
 use photo_stamp::overture::{self, Overture};
 use photo_stamp::places::PlacesDb;
 use photo_stamp::render::Renderer;
@@ -19,9 +19,10 @@ use photo_stamp::{formats, logging, metadata, paths, watch};
 
 /// Burn the place and local time each photo was taken into the photo itself.
 ///
-/// With no command, watches the folder this program is in (and its subfolders) and stamps each
-/// new photo in place. Supports JPEG, PNG, WebP, TIFF, HEIC/HEIF/AVIF and camera RAW (a stamped
-/// JPEG is written beside the RAW file). Photos without date/location metadata are never touched.
+/// With no command, watches the folder this program is in (and its subfolders) and moves each
+/// photo dropped there to its outbox folder, stamped, keeping the subfolders. Supports JPEG, PNG,
+/// WebP, TIFF, HEIC/HEIF/AVIF and camera RAW (moved with a stamped JPEG beside it). Photos without
+/// date/location metadata, or already stamped, are moved unchanged.
 #[derive(Parser)]
 #[command(version, args_conflicts_with_subcommands = true)]
 struct Cli {
@@ -48,12 +49,16 @@ struct Common {
     quality: u8,
 }
 
-/// Options for the default action: stamping new photos in place.
+/// Options for the default action: stamping dropped photos into the outbox.
 #[derive(Args)]
 struct HereArgs {
     /// Folder to watch instead of the one this program is in
     #[arg(long)]
     root: Option<PathBuf>,
+
+    /// Where finished photos go [default: the "outbox" folder inside the watched folder]
+    #[arg(long)]
+    outbox: Option<PathBuf>,
 
     /// Stop the photo-stamp that is watching this folder
     #[arg(long, conflicts_with_all = ["install_startup", "uninstall_startup"])]
@@ -198,7 +203,12 @@ fn gazetteer(offline: bool) -> anyhow::Result<Gazetteer> {
     Ok(Gazetteer::new(places, overture))
 }
 
-/// The default action: stamp new photos in place in this program's folder (or `--root`).
+/// `p` made absolute against the current folder (it may be used later from elsewhere, e.g. at login).
+fn absolute(p: &Path) -> PathBuf {
+    std::path::absolute(p).unwrap_or_else(|_| p.to_owned())
+}
+
+/// The default action: stamp photos dropped in this program's folder (or `--root`) into the outbox.
 fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder) -> ExitCode {
     let exe = std::env::current_exe().ok();
     let root = match args.root.clone().or_else(|| exe.as_ref().and_then(|e| e.parent().map(Path::to_owned))) {
@@ -242,15 +252,16 @@ fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let config = inplace::Config {
+    let outbox = args.outbox.clone().map_or_else(|| root.join(outbox::OUTBOX_DIR), |o| absolute(&o));
+    let config = outbox::Config {
+        outbox,
         settle: Duration::from_secs(args.settle_secs),
         poll_interval: Duration::from_secs(args.poll_secs.max(1)),
         events: true,
         quality: common.quality,
-        state_file: data.map(|d| d.join(format!("state-{}.json", paths::folder_key(&root)))),
     };
     geo.warm_up();
-    let watcher = match InPlace::new(&root, config, geo) {
+    let watcher = match Outbox::new(&root, config, geo) {
         Ok(w) => w,
         Err(e) => {
             error!("{e:#}");
@@ -298,6 +309,9 @@ fn manage(args: &HereArgs, root: &Path, exe: Option<&Path>) -> ExitCode {
         if args.root.is_some() {
             command.push_str(&format!(" --root \"{}\"", root.display()));
         }
+        if let Some(o) = &args.outbox {
+            command.push_str(&format!(" --outbox \"{}\"", absolute(o).display()));
+        }
         winsys::install_startup(root, &command)?;
         // And start it now, fully detached from this terminal (if it's already running, the new
         // copy notices and exits).
@@ -308,6 +322,9 @@ fn manage(args: &HereArgs, root: &Path, exe: Option<&Path>) -> ExitCode {
         if args.root.is_some() {
             start.arg("--root").arg(root);
         }
+        if let Some(o) = &args.outbox {
+            start.arg("--outbox").arg(absolute(o));
+        }
         start
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -315,8 +332,9 @@ fn manage(args: &HereArgs, root: &Path, exe: Option<&Path>) -> ExitCode {
             .creation_flags(DETACHED_PROCESS)
             .spawn()?;
         Ok(format!(
-            "photo-stamp will start at login and is now watching {}.\nNew photos there are stamped in place.",
-            root.display()
+            "photo-stamp will start at login and is now watching {}.\nPhotos dropped there are stamped into {}.",
+            root.display(),
+            args.outbox.as_deref().map_or_else(|| root.join(outbox::OUTBOX_DIR), absolute).display()
         ))
     })();
     match result {

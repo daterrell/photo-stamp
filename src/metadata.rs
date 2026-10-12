@@ -46,7 +46,7 @@ fn exiftool_program() -> PathBuf {
     let name = if cfg!(windows) { "exiftool.exe" } else { "exiftool" };
     std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(crate::inplace::SUPPORT_DIR).join(name)))
+        .and_then(|exe| exe.parent().map(|dir| dir.join(crate::outbox::SUPPORT_DIR).join(name)))
         .filter(|p| p.is_file())
         .unwrap_or_else(|| PathBuf::from("exiftool"))
 }

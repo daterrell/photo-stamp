@@ -16,7 +16,7 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW};
 
-use crate::inplace::Wake;
+use crate::outbox::Wake;
 use crate::paths::folder_key;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
