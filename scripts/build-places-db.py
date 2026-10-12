@@ -61,7 +61,7 @@ def fetch(url: str, dest: Path, data: bytes | None = None, max_age_days: float =
             tmp.replace(dest)
             return dest
         except Exception as e:  # noqa: BLE001 - retry any network failure
-            # Public services rate-limit; honour Retry-After, else back off exponentially.
+            # Public services rate-limit; honor Retry-After, else back off exponentially.
             retry_after = getattr(e, "headers", None) and e.headers.get("Retry-After")
             wait = int(retry_after) if retry_after and retry_after.isdigit() else 30 * 2**attempt
             log(f"  attempt {attempt + 1} failed: {e}; retrying in {wait}s")
@@ -196,7 +196,7 @@ LANDMARK_QUERIES = {
     # its types do: Paris has fifteen such types, the Eiffel Tower one of three.
     "types": f"{_PREFIXES} SELECT ?item ?type WHERE {{ {_NOTABLE} ?item wdt:P31 ?type }}",
     # Roots: human settlement, administrative entity, country, plus things that have coordinates but
-    # aren't somewhere you stand: continent, ocean, language, event, organisation, historical country.
+    # aren't somewhere you stand: continent, ocean, language, event, organization, historical country.
     "area_types": f"""{_PREFIXES} SELECT DISTINCT ?type WHERE {{ {_NOTABLE} ?item wdt:P31 ?type .
         VALUES ?root {{ wd:Q486972 wd:Q56061 wd:Q6256 wd:Q5107 wd:Q9430 wd:Q34770 wd:Q1190554 wd:Q43229
                        wd:Q3024240 }}

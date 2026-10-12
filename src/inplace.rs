@@ -494,7 +494,7 @@ mod tests {
     }
 
     #[test]
-    fn locked_errors_are_recognised() {
+    fn locked_errors_are_recognized() {
         if cfg!(windows) {
             let e = anyhow::Error::from(std::io::Error::from_raw_os_error(32)).context("renaming");
             assert!(is_locked(&e), "sharing violation, wrapped in context");

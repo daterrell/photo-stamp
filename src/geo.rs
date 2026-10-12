@@ -8,7 +8,7 @@
 //! 2. **What am I near?** Notable features within 250 m (landmarks, museums, peaks, towers…).
 //!    If we're not inside a venue, the best one is the main line ("Eiffel Tower"); if we are, a
 //!    clearly famous one nearby is added as "near …".
-//! 3. **Which town?** Nominatim reverse geocoding gives neighbourhood, town, region and country
+//! 3. **Which town?** Nominatim reverse geocoding gives neighborhood, town, region and country
 //!    for the context line: "Pebble Beach, California, United States".
 //!
 //! Names are in the preferred language with the local name in parentheses when it differs.
@@ -28,11 +28,11 @@ use crate::metadata::GpsPoint;
 /// Where a photo was taken, as caption lines.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Place {
-    /// Most specific name: the venue we're in, a landmark, or a neighbourhood/town.
+    /// Most specific name: the venue we're in, a landmark, or a neighborhood/town.
     pub primary: String,
     /// A famous landmark close by, when `primary` is a venue we're inside.
     pub near: Option<String>,
-    /// Neighbourhood, town, region, country.
+    /// Neighborhood, town, region, country.
     pub context: Option<String>,
     /// False when part of the lookup failed (e.g. Overpass unreachable): usable, but worth retrying.
     #[serde(skip)]
@@ -286,7 +286,7 @@ impl Name {
     }
 }
 
-/// Neighbourhood / settlement / region names pulled out of Nominatim reverse responses.
+/// Neighborhood / settlement / region names pulled out of Nominatim reverse responses.
 #[derive(Debug, Default, PartialEq)]
 pub struct Area {
     pub district: Option<Name>,
@@ -308,7 +308,7 @@ impl Area {
                 Name::new(p, l)
             })
         };
-        // Region and country are recognisable enough in the preferred language alone.
+        // Region and country are recognizable enough in the preferred language alone.
         let preferred_only = |n: Option<Name>| n.map(|n| Name { local: None, ..n });
         Area {
             district: pick(&["neighbourhood", "quarter", "suburb", "city_district"]),
@@ -363,7 +363,7 @@ pub fn build_place(
 
 /// One Overpass request answering both questions (halving load on the public servers):
 /// first the named areas containing the point, output with bounding boxes (`out tags bb`), then
-/// notable features nearby, output with centres (`out tags center`). The output modes are what
+/// notable features nearby, output with centers (`out tags center`). The output modes are what
 /// tell the two result sets apart; see [`OverpassResponse::split_inside_around`].
 fn place_query(at: GpsPoint, radius: f64) -> String {
     let around = format!("(around:{radius},{},{})", at.lat, at.lon);
@@ -511,7 +511,7 @@ fn notability(tags: &HashMap<String, String>) -> f64 {
 }
 
 /// The enclosing area that best names where we are. Notable venue types win; very large areas
-/// are penalised so the stadium beats the national park it sits in, and the course beats a
+/// are penalized so the stadium beats the national park it sits in, and the course beats a
 /// small unremarkable garden inside it because the garden scores lower on type and notability.
 fn best_venue(resp: &OverpassResponse, lang: &str) -> Option<Name> {
     resp.elements

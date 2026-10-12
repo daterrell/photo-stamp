@@ -1,6 +1,6 @@
 //! Showing the time of day as it was *where the photo was taken*.
 //!
-//! Camera clocks are often left on home time when travelling, so when we can establish the true
+//! Camera clocks are often left on home time when traveling, so when we can establish the true
 //! instant (UTC) we convert it into the timezone at the photo's GPS position.
 
 use std::sync::OnceLock;

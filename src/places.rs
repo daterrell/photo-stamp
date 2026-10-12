@@ -142,7 +142,7 @@ impl PlacesDb {
             .prepare_cached("SELECT name FROM country WHERE code = ?1")?
             .query_row(params![country], |r| r.get::<_, String>(0))
             .optional()?
-            // Country names are recognisable enough in English alone.
+            // Country names are recognizable enough in English alone.
             .and_then(|n| Name::new(Some(&n), None));
         Ok(Some(Town { town, region, country, distance_km: d / 1000.0 }))
     }

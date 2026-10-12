@@ -4,7 +4,7 @@
 //! * famous landmarks nearby — bundled Wikidata (also gives every feature a "fame" score:
 //!   how many Wikipedia language editions describe it);
 //! * the venue you're inside (golf course, park, stadium, tower…), notable structures and the
-//!   neighbourhood — Overture Maps, read on demand and cached on disk ([`Overture`]).
+//!   neighborhood — Overture Maps, read on demand and cached on disk ([`Overture`]).
 //!
 //! If Overture can't be reached the result is marked incomplete (callers that can wait retry
 //! later), but town/region/country and bundled landmarks are still there.
@@ -19,11 +19,11 @@ use crate::places::{Landmark, PlacesDb, Town};
 
 /// How far to look for venues and structures around the point.
 const SEARCH_M: f64 = 250.0;
-/// How far to look for neighbourhood and town names (Overture division points).
+/// How far to look for neighborhood and town names (Overture division points).
 const DIVISION_SEARCH_M: f64 = 5000.0;
 const TOWN_M: f64 = 5000.0;
-/// How far a neighbourhood point can be and still name where you are.
-const NEIGHBOURHOOD_M: f64 = 1500.0;
+/// How far a neighborhood point can be and still name where you are.
+const NEIGHBORHOOD_M: f64 = 1500.0;
 const MICROHOOD_M: f64 = 600.0;
 /// Bundled landmarks: the most famous are named from further away.
 const LANDMARK_MAX_REACH_M: f64 = 700.0;
@@ -123,7 +123,7 @@ pub struct Surroundings<'a> {
     pub features: &'a [Feature],
     /// Overture places (POIs) within [`SEARCH_M`].
     pub places: &'a [Feature],
-    /// Overture division points (neighbourhoods, localities) within [`DIVISION_SEARCH_M`].
+    /// Overture division points (neighborhoods, localities) within [`DIVISION_SEARCH_M`].
     pub divisions: &'a [Feature],
 }
 
@@ -188,16 +188,16 @@ pub fn build_place(s: &Surroundings, k: &dyn Knowledge) -> Option<Place> {
             .min_by(|a, b| a.distance_m.total_cmp(&b.distance_m))
             .map(|d| d.name.clone())
     };
-    // Neighbourhoods: Overture's neighbourhood/macrohood tier where it has one (Paris: Passy,
+    // Neighborhoods: Overture's neighborhood/macrohood tier where it has one (Paris: Passy,
     // Vaugirard); else a close microhood (Tokyo's only tier: Shiba, Roppongi — in Paris those are squares).
-    let district = nearest_division(&["neighborhood", "macrohood"], NEIGHBOURHOOD_M);
+    let district = nearest_division(&["neighborhood", "macrohood"], NEIGHBORHOOD_M);
     let microhood = || nearest_division(&["microhood"], MICROHOOD_M);
     // Town: Overture knows small places GeoNames' populated-places list lacks (e.g. Pebble Beach).
     // Inside a big city Overture's "localities" are its districts (Tokyo's wards, Paris'
-    // arrondissements), so the city names the town and the ward stands in for the neighbourhood.
+    // arrondissements), so the city names the town and the ward stands in for the neighborhood.
     // GeoNames is the offline fallback.
     let locality = nearest_division(&["locality"], TOWN_M);
-    let (neighbourhood, town_name) = match s.big_city.clone() {
+    let (neighborhood, town_name) = match s.big_city.clone() {
         Some(city) => (district.or(locality).or_else(microhood), Some(city)),
         None => (district.or_else(microhood), locality.or_else(|| s.town.as_ref().map(|t| t.town.clone()))),
     };
@@ -209,11 +209,11 @@ pub fn build_place(s: &Surroundings, k: &dyn Knowledge) -> Option<Place> {
         (None, None) => (poi(), None),
     };
 
-    // Context: neighbourhood, town, region, country — skipping anything already said.
+    // Context: neighborhood, town, region, country — skipping anything already said.
     let mut context: Vec<Name> = Vec::new();
     let town = s.town.as_ref();
     for n in
-        [neighbourhood, town_name, town.and_then(|t| t.region.clone()), town.and_then(|t| t.country.clone())]
+        [neighborhood, town_name, town.and_then(|t| t.region.clone()), town.and_then(|t| t.country.clone())]
             .into_iter()
             .flatten()
     {

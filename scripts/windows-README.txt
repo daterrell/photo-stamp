@@ -40,7 +40,7 @@ What it did, and why anything was left alone, is written to
 PLACE DATA
 
 Towns, regions and countries come from the bundled photo-stamp-files\places.sqlite and work offline.
-Venues (golf courses, parks, stadiums, towers...) and neighbourhoods are downloaded on demand from
+Venues (golf courses, parks, stadiums, towers...) and neighborhoods are downloaded on demand from
 Overture Maps, only for the area around each photo, and cached in %LOCALAPPDATA%\photo-stamp\overture
 (400 MB at most). The first photo after each monthly Overture release takes a minute longer while
 its index downloads (about 70 MB, done in the background at startup). Each new spot then downloads

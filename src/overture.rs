@@ -1,5 +1,5 @@
 //! On-demand reads of Overture Maps data (https://overturemaps.org): named land use (golf courses,
-//! parks…), infrastructure (towers, bridges…), places (POIs) and division points (neighbourhoods).
+//! parks…), infrastructure (towers, bridges…), places (POIs) and division points (neighborhoods).
 //!
 //! Overture publishes GeoParquet files on public cloud storage (AWS S3, mirrored on Azure). Rows are
 //! sorted spatially and every row group carries bounding-box statistics, so a lookup around one point
@@ -103,7 +103,7 @@ pub struct Feature {
     pub bbox: [f64; 4],
     /// The query point lies inside this feature's area.
     pub contains: bool,
-    /// Metres from the query point (0 when it's inside).
+    /// Meters from the query point (0 when it's inside).
     pub distance_m: f64,
 }
 
@@ -144,7 +144,7 @@ pub struct Overture {
     indexes: Mutex<HashMap<(String, Dataset), DatasetIndex>>,
     /// Bytes fetched over the network (for logging what a lookup cost).
     downloaded: AtomicU64,
-    /// Serialises building each dataset's index (indexed by `Dataset as usize`).
+    /// Serializes building each dataset's index (indexed by `Dataset as usize`).
     building: [Mutex<()>; 4],
 }
 

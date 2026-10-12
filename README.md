@@ -27,7 +27,7 @@ Tue 3 Jun 2025, 15:10 PDT
      course beats a garden within it. If you're not inside a venue, a famous **landmark nearby** is used instead —
      "Eiffel Tower (Tour Eiffel)" (the more famous, the further away it can be).
   2. "near …" a clearly famous landmark close by, when line 1 is a venue.
-  3. **Neighbourhood** (Overture), then **town, region, country** (GeoNames) — "Pebble Beach, California,
+  3. **Neighborhood** (Overture), then **town, region, country** (GeoNames) — "Pebble Beach, California,
      United States".
 - **Bundled data** (`places.sqlite`, built by `scripts/build-places-db.py`): towns, regions and countries from
   [GeoNames](https://www.geonames.org) (as [Immich](https://immich.app) uses), plus famous landmarks and a fame
@@ -60,7 +60,7 @@ The tool uses only metadata — it doesn't look at the image content to work out
 
 All metadata (EXIF, XMP, IPTC, ICC profile) is copied to the stamped file, with Orientation reset (pixels are
 rotated upright before drawing) and the XMP keyword `photo-stamp` added, which is how already-stamped photos
-are recognised and never stamped twice.
+are recognized and never stamped twice.
 
 ## Windows: stamp photos in place
 
@@ -165,7 +165,7 @@ rebuilt automatically when it changes. The cargo registry is cached in `~/.cache
 |-------------------|-----------------------------------------------------------------------|
 | `src/metadata.rs` | Reading/copying metadata and RAW previews via exiftool                |
 | `src/localtime.rs`| Timezone at a GPS position; local-time caption                        |
-| `src/gazetteer.rs`| Naming a spot: venue / landmark / neighbourhood / town scoring         |
+| `src/gazetteer.rs`| Naming a spot: venue / landmark / neighborhood / town scoring         |
 | `src/places.rs`   | The bundled GeoNames + Wikidata database (`places.sqlite`)            |
 | `src/overture.rs` | On-demand Overture Maps reads: range requests, row-group pruning, cache |
 | `src/wkb.rs`      | Point-in-polygon on WKB geometry                                      |
@@ -185,6 +185,6 @@ rebuilt automatically when it changes. The cargo registry is cached in `~/.cache
 - The embedded EXIF thumbnail is removed rather than regenerated.
 - Location ranking is heuristic; tune `category_weight` / `MIN_POI_SCORE` in `src/geo.rs`.
 
-## Licence
+## License
 
 Code: MIT. Embedded font: DejaVu Sans Bold — see `assets/DejaVuSans-LICENSE.txt`.
