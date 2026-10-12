@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::geo::{Geocoder, Name, Place};
+use crate::geo::{GeoHealth, Geocoder, Name, Place};
 use crate::metadata::GpsPoint;
 use crate::overture::{Dataset, Feature, Overture};
 use crate::places::{Landmark, PlacesDb, Town};
@@ -298,6 +298,13 @@ impl Geocoder for Gazetteer {
                 ),
             }
         });
+    }
+
+    fn health(&self) -> GeoHealth {
+        GeoHealth {
+            places_built: self.places.built(),
+            overture: self.overture.as_ref().map(|ov| ov.health()),
+        }
     }
 
     fn place(&self, at: GpsPoint) -> anyhow::Result<Option<Place>> {

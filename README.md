@@ -87,7 +87,8 @@ dropped, and the folders stay. There's no backup copy.
   (`places.sqlite`) live in `photo-stamp-files\` beside the exe, which the watcher ignores. The Overture cache
   is in `%LOCALAPPDATA%\photo-stamp\overture`.
 
-Setup: copy `photo-stamp.exe` and `photo-stamp-files\` into an empty drop folder, then double-click the exe. From a
+Setup: copy `photo-stamp.exe`, `photo-stamp-ui.exe` and `photo-stamp-files\` into an empty drop folder, then double-click
+photo-stamp.exe (or open photo-stamp-ui.exe and start it from the dashboard). From a
 terminal in that folder:
 
 ```
@@ -96,6 +97,35 @@ photo-stamp.exe --uninstall-startup
 photo-stamp.exe --stop
 photo-stamp.exe stamp <files>         # one-off
 ```
+
+### Dashboard
+
+`photo-stamp-ui.exe` shows and controls photo-stamp in your browser. It's a separate program: double-click it
+and it opens `http://127.0.0.1:8765/`, with a button to start photo-stamp if it isn't running.
+
+- **Activity:**
+  - the photo being stamped, as a small preview that changes from the original to the stamped result, with
+    the steps (finding the place, drawing the caption, saving);
+  - the queue, with why each photo is waiting (still copying, map data unreachable, open in another program,
+    paused);
+  - a progress bar with photos done and time left, estimated separately for new spots (map data to download)
+    and places you've been before;
+  - a running table of everything processed, each with its caption, how long it took and a before/after view.
+- **Not stamped:** photos moved unchanged, grouped by reason, and photos that couldn't be processed, with
+  **Try again**.
+- **Health:** map data release, indexes, cache and connection; the bundled place data; all-time totals; and the
+  live log.
+- **Settings:** outbox, quality, timing, offline mode, a notification when a batch is done, and start at login.
+- **Pause / Resume** (new photos are still noticed and queued), **Stop**, and **Start**.
+
+How it fits together: photo-stamp serves a small API on 127.0.0.1 (a random port), protected by a random token.
+It writes the port and token to `%LOCALAPPDATA%\photo-stamp\services\<folder>.json`, which only you can
+read. photo-stamp-ui finds services there, passes the page's requests on with the token, and starts them when
+asked. It only answers requests addressed to `127.0.0.1`/`localhost`, and changes must come from its own page.
+It exits after 30 minutes with no dashboard open; `photo-stamp-ui.exe --stop` stops it sooner.
+
+Settings changed in the dashboard are kept in `%LOCALAPPDATA%\photo-stamp\settings-<folder>.json`; options on the
+command line override them. History and previews (the most recent 2,000) are kept there too.
 
 Build it (Docker only; produces `dist/photo-stamp-windows/` and `dist/photo-stamp-windows.zip`):
 
@@ -181,7 +211,12 @@ rebuilt automatically when it changes. The cargo registry is cached in `~/.cache
 | `src/stamp.rs`    | Per-photo pipeline; one-off `stamp` in place                          |
 | `src/outbox.rs`   | Windows drop folder: stamp and move to the outbox                     |
 | `src/watch.rs`    | Inbox watcher and folder sorting                                      |
+| `src/status.rs`   | What the service is doing: queue, progress, results, history, previews |
+| `src/api.rs`      | The service's local API for the dashboard                             |
+| `src/settings.rs` | Settings the dashboard can change                                     |
 | `src/main.rs`     | CLI                                                                   |
+| `http/`           | Minimal HTTP server and the service registry, shared with the dashboard |
+| `ui/`             | `photo-stamp-ui`: the dashboard server and page (`ui/web/`)           |
 
 ## Limitations / next steps
 

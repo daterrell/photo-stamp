@@ -35,11 +35,11 @@ jobs:
       # dev.sh runs everything in the dev image, which has the exiftool, libheif and fonts the
       # tests need.
       - name: rustfmt
-        run: ./dev.sh cargo fmt --check
+        run: ./dev.sh cargo fmt --all --check
       - name: clippy
-        run: ./dev.sh cargo clippy --all-targets --locked -- -D warnings
+        run: ./dev.sh cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: tests
-        run: ./dev.sh cargo test --locked
+        run: ./dev.sh cargo test --workspace --locked
 
   check-windows:
     name: Clippy (Windows target)
@@ -60,7 +60,7 @@ jobs:
           restore-keys: check-windows-
       # HEIC (libheif) is linked statically in the real build; without it this still checks all the
       # Windows-only code.
-      - run: cargo clippy --target x86_64-pc-windows-gnu --no-default-features --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --target x86_64-pc-windows-gnu --no-default-features --all-targets --locked -- -D warnings
 
   places:
     name: Place data
@@ -120,7 +120,7 @@ jobs:
           path: data
       - uses: docker/setup-buildx-action@v4
       # The static libde265/x265/libheif build takes ~10 minutes; the layer cache skips it.
-      - name: Build photo-stamp.exe
+      - name: Build photo-stamp.exe and photo-stamp-ui.exe
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -140,11 +140,13 @@ jobs:
       - name: Only Windows system DLLs
         run: |
           sudo apt-get install -y --no-install-recommends binutils-mingw-w64-x86-64 >/dev/null
-          x86_64-w64-mingw32-objdump -p dist/photo-stamp-windows/photo-stamp.exe | grep "DLL Name" | sort -uf | tee dlls.txt
-          if grep -iE "libgcc|libstdc|libwinpthread|libheif|libde265|x265" dlls.txt; then
-            echo "::error::photo-stamp.exe depends on non-system DLLs"
-            exit 1
-          fi
+          for exe in photo-stamp.exe photo-stamp-ui.exe; do
+            x86_64-w64-mingw32-objdump -p "dist/photo-stamp-windows/$exe" | grep "DLL Name" | sort -uf | tee dlls.txt
+            if grep -iE "libgcc|libstdc|libwinpthread|libheif|libde265|x265" dlls.txt; then
+              echo "::error::$exe depends on non-system DLLs"
+              exit 1
+            fi
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: photo-stamp-windows
@@ -221,8 +223,9 @@ jobs:
           zip="photo-stamp-windows-${GITHUB_REF_NAME}.zip"
           mv photo-stamp-windows.zip "$zip"
           {
-            echo "Unzip, copy \`photo-stamp.exe\` and the \`photo-stamp-files\` folder into the folder you want"
-            echo "stamped, and double-click \`photo-stamp.exe\`. See README.txt inside the zip."
+            echo "Unzip into an empty folder to drop photos into, and double-click \`photo-stamp.exe\`."
+            echo "Stamped photos go to its \`outbox\` folder. Double-click \`photo-stamp-ui.exe\` to see and"
+            echo "control what it's doing in your browser. See README.txt inside the zip."
             echo
             echo "Docker image: \`ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME#v}\`"
           } > notes.md

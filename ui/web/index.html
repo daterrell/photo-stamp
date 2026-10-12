@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>photo-stamp</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <img src="icon.svg" alt="" width="26" height="26">
+    <span>photo-stamp</span>
+  </div>
+  <label class="folder" id="folder-pick" hidden>
+    <span class="sr">Watched folder</span>
+    <select id="folder-select"></select>
+  </label>
+  <div class="folder-name" id="folder-name"></div>
+  <div class="controls">
+    <span class="state" id="state" data-state="loading">Connecting</span>
+    <button class="ghost" id="btn-pause" hidden>Pause</button>
+    <button class="primary" id="btn-resume" hidden>Resume</button>
+    <button class="primary" id="btn-start" hidden>Start</button>
+    <button class="ghost" id="btn-stop" hidden>Stop</button>
+  </div>
+</header>
+
+<div class="progress" id="progress" hidden>
+  <div class="track"><div class="fill" id="progress-fill"></div></div>
+  <div class="progress-text"><span id="progress-count"></span><span id="progress-eta"></span></div>
+</div>
+
+<nav class="tabs" role="tablist">
+  <button role="tab" data-tab="activity" aria-selected="true">Activity</button>
+  <button role="tab" data-tab="exceptions">Not stamped <span class="count" id="exceptions-count"></span></button>
+  <button role="tab" data-tab="health">Health</button>
+  <button role="tab" data-tab="settings">Settings</button>
+</nav>
+
+<main>
+  <!-- Nothing to show yet: no service, or it's stopped. -->
+  <section class="empty" id="empty" hidden>
+    <h1 id="empty-title"></h1>
+    <p id="empty-text"></p>
+    <button class="primary" id="empty-action" hidden></button>
+  </section>
+
+  <section class="panel" id="tab-activity" data-panel="activity">
+    <div class="now-row">
+      <figure class="now" id="now">
+        <div class="lighttable">
+          <img id="now-img" alt="">
+          <div class="now-placeholder" id="now-placeholder">Drop photos into the folder to stamp them.</div>
+        </div>
+        <figcaption>
+          <div class="now-path" id="now-path"></div>
+          <ol class="stages" id="stages">
+            <li data-stage="locating">Finding the place</li>
+            <li data-stage="drawing">Drawing the caption</li>
+            <li data-stage="saving">Saving to the outbox</li>
+          </ol>
+          <div class="caption" id="now-caption"></div>
+        </figcaption>
+      </figure>
+      <aside class="queue">
+        <h2>Waiting <span class="count" id="queue-count"></span></h2>
+        <ul id="queue-list"></ul>
+        <p class="quiet" id="queue-empty">Nothing waiting.</p>
+      </aside>
+    </div>
+
+    <div class="results">
+      <div class="results-head">
+        <h2>Processed</h2>
+        <span class="quiet" id="totals"></span>
+        <button class="pill" id="new-rows" hidden></button>
+      </div>
+      <div class="table-wrap" id="results-wrap">
+        <table>
+          <thead><tr><th class="thumb-col"><span class="sr">Preview</span></th><th>Photo</th><th>Result</th><th>Caption</th><th class="num">Time</th><th class="num">Finished</th></tr></thead>
+          <tbody id="results"></tbody>
+        </table>
+        <p class="quiet center" id="results-empty">Nothing processed yet.</p>
+        <button class="ghost small more" id="results-more" hidden>Show older</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-exceptions" data-panel="exceptions" hidden>
+    <p class="lede">Photos moved to the outbox without a stamp, and photos that couldn't be processed. Ones that couldn't be processed stay where they were dropped.</p>
+    <div id="exceptions"></div>
+    <p class="quiet" id="exceptions-empty">Every photo so far has been stamped.</p>
+  </section>
+
+  <section class="panel" id="tab-health" data-panel="health" hidden>
+    <div class="tiles" id="tiles"></div>
+    <div class="log-head">
+      <h2>Log</h2>
+      <input type="search" id="log-filter" placeholder="Filter" aria-label="Filter the log">
+      <label class="check"><input type="checkbox" id="log-problems"> Problems only</label>
+    </div>
+    <pre class="log" id="log" tabindex="0"></pre>
+  </section>
+
+  <section class="panel" id="tab-settings" data-panel="settings" hidden>
+    <form class="settings" id="settings">
+      <label class="field">
+        <span>Outbox</span>
+        <input type="text" name="outbox" id="set-outbox" spellcheck="false">
+        <small id="set-outbox-hint">Leave empty to use the outbox folder inside the watched folder. Changing it restarts photo-stamp.</small>
+      </label>
+      <label class="field">
+        <span>Quality <output id="set-quality-out"></output></span>
+        <input type="range" name="quality" id="set-quality" min="50" max="100" step="1">
+        <small>For JPEG and HEIC photos, and the JPEGs made from RAW files. 92 is visually lossless.</small>
+      </label>
+      <div class="field-pair">
+        <label class="field">
+          <span>Wait before processing</span>
+          <span class="with-unit"><input type="number" name="settle_secs" id="set-settle" min="0" max="3600"> seconds</span>
+          <small>How long a photo must stay unchanged, so copies finish first.</small>
+        </label>
+        <label class="field">
+          <span>Check the folder every</span>
+          <span class="with-unit"><input type="number" name="poll_secs" id="set-poll" min="1" max="3600"> seconds</span>
+          <small>A backup for when Windows doesn't report a new file.</small>
+        </label>
+      </div>
+      <label class="check"><input type="checkbox" name="notify" id="set-notify"> Notify me when a batch is done</label>
+      <label class="check"><input type="checkbox" name="offline" id="set-offline"> <span>Offline: use only the bundled place data <small>(towns and famous landmarks, no venues like golf courses or parks; restarts photo-stamp)</small></span></label>
+      <label class="check" id="set-startup-row"><input type="checkbox" id="set-startup"> Start photo-stamp when I log in to Windows</label>
+      <div class="form-actions">
+        <button class="primary" type="submit" id="set-save">Save settings</button>
+        <span class="quiet" id="set-status" role="status"></span>
+      </div>
+    </form>
+  </section>
+</main>
+
+<dialog id="viewer">
+  <form method="dialog" class="viewer-close"><button class="icon-btn" aria-label="Close">✕</button></form>
+  <img id="viewer-img" alt="">
+  <div class="viewer-meta">
+    <div class="viewer-toggle" role="group" aria-label="Show">
+      <button class="pill" data-which="after" aria-pressed="true">Stamped</button>
+      <button class="pill" data-which="before" aria-pressed="false">Original</button>
+    </div>
+    <div class="caption" id="viewer-caption"></div>
+    <div class="quiet" id="viewer-path"></div>
+  </div>
+</dialog>
+
+<div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

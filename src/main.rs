@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
@@ -14,8 +15,11 @@ use photo_stamp::outbox::{self, Outbox};
 use photo_stamp::overture::{self, Overture};
 use photo_stamp::places::PlacesDb;
 use photo_stamp::render::Renderer;
+use photo_stamp::settings::{self, Settings};
 use photo_stamp::stamp::{Options, Outcome, stamp_in_place};
-use photo_stamp::{formats, logging, metadata, paths, watch};
+use photo_stamp::status::Status;
+use photo_stamp::{api, formats, logging, metadata, paths, watch};
+use photo_stamp_http::registry::Registration;
 
 /// Burn the place and local time each photo was taken into the photo itself.
 ///
@@ -43,10 +47,10 @@ struct Common {
     #[arg(long, global = true, env = "PHOTO_STAMP_OFFLINE")]
     offline: bool,
 
-    /// Quality for lossy re-encoding (JPEG, HEIC, RAW→JPEG)
-    #[arg(long, global = true, default_value_t = 92, env = "PHOTO_STAMP_QUALITY",
+    /// Quality for lossy re-encoding (JPEG, HEIC, RAW→JPEG) [default: 92, or the dashboard's setting]
+    #[arg(long, global = true, env = "PHOTO_STAMP_QUALITY",
           value_parser = clap::value_parser!(u8).range(1..=100))]
-    quality: u8,
+    quality: Option<u8>,
 }
 
 /// Options for the default action: stamping dropped photos into the outbox.
@@ -72,13 +76,14 @@ struct HereArgs {
     #[arg(long)]
     uninstall_startup: bool,
 
-    /// Seconds a file must stay unchanged before it's stamped
-    #[arg(long, default_value_t = 3)]
-    settle_secs: u64,
+    /// Seconds a file must stay unchanged before it's stamped [default: 3, or the dashboard's setting]
+    #[arg(long)]
+    settle_secs: Option<u64>,
 
-    /// Seconds between full scans (backup for filesystem events)
-    #[arg(long, default_value_t = 30)]
-    poll_secs: u64,
+    /// Seconds between full scans, as a backup for filesystem events [default: 30, or the dashboard's
+    /// setting]
+    #[arg(long)]
+    poll_secs: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -148,6 +153,7 @@ fn main() -> ExitCode {
             return if e.use_stderr() { ExitCode::FAILURE } else { ExitCode::SUCCESS };
         }
     };
+    let Some(command) = cli.command else { return here(cli.here, &cli.common) };
     let geo: Box<dyn Geocoder> = match gazetteer(cli.common.offline) {
         Ok(g) => Box::new(g),
         Err(e) => {
@@ -155,35 +161,28 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-
-    match cli.command {
-        None => here(cli.here, &cli.common, geo.as_ref()),
-        Some(command) => {
-            console();
-            let _ = logging::init(None, true);
-            if let Err(e) = metadata::check_exiftool() {
-                eprintln!("error: {e:#}");
-                return ExitCode::FAILURE;
-            }
-            match command {
-                Command::Stamp { paths, dry_run } => {
-                    stamp_paths(&paths, geo.as_ref(), Options { dry_run, quality: cli.common.quality })
-                }
-                Command::Watch { root, settle_secs, poll_secs, no_events } => {
-                    let config = watch::Config {
-                        settle: Duration::from_secs(settle_secs),
-                        poll_interval: Duration::from_secs(poll_secs.max(1)),
-                        events: !no_events,
-                        quality: cli.common.quality,
-                    };
-                    geo.warm_up();
-                    match watch::Inbox::new(&root, config, geo.as_ref()).and_then(|inbox| inbox.run()) {
-                        Ok(()) => ExitCode::SUCCESS,
-                        Err(e) => {
-                            eprintln!("error: {e:#}");
-                            ExitCode::FAILURE
-                        }
-                    }
+    let quality = cli.common.quality.unwrap_or(settings::DEFAULT_QUALITY);
+    console();
+    let _ = logging::init(None, true);
+    if let Err(e) = metadata::check_exiftool() {
+        eprintln!("error: {e:#}");
+        return ExitCode::FAILURE;
+    }
+    match command {
+        Command::Stamp { paths, dry_run } => stamp_paths(&paths, geo.as_ref(), Options { dry_run, quality }),
+        Command::Watch { root, settle_secs, poll_secs, no_events } => {
+            let config = watch::Config {
+                settle: Duration::from_secs(settle_secs),
+                poll_interval: Duration::from_secs(poll_secs.max(1)),
+                events: !no_events,
+                quality,
+            };
+            geo.warm_up();
+            match watch::Inbox::new(&root, config, geo.as_ref()).and_then(|inbox| inbox.run()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::FAILURE
                 }
             }
         }
@@ -209,7 +208,7 @@ fn absolute(p: &Path) -> PathBuf {
 }
 
 /// The default action: stamp photos dropped in this program's folder (or `--root`) into the outbox.
-fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder) -> ExitCode {
+fn here(args: HereArgs, common: &Common) -> ExitCode {
     let exe = std::env::current_exe().ok();
     let root = match args.root.clone().or_else(|| exe.as_ref().and_then(|e| e.parent().map(Path::to_owned))) {
         Some(r) => std::fs::canonicalize(&r).unwrap_or(r),
@@ -252,16 +251,44 @@ fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let outbox = args.outbox.clone().map_or_else(|| root.join(outbox::OUTBOX_DIR), |o| absolute(&o));
-    let config = outbox::Config {
-        outbox,
-        settle: Duration::from_secs(args.settle_secs),
-        poll_interval: Duration::from_secs(args.poll_secs.max(1)),
-        events: true,
+    // Saved settings (changed from the dashboard), with command-line options taking precedence.
+    let key = paths::folder_key(&root);
+    let settings_path = data.as_deref().map(|d| Settings::path(d, &key));
+    let overrides = settings::Overrides {
+        outbox: args.outbox.as_deref().map(absolute),
         quality: common.quality,
+        settle_secs: args.settle_secs,
+        poll_secs: args.poll_secs,
+        offline: common.offline,
     };
+    let settings = overrides.apply(settings_path.as_deref().map(Settings::load).unwrap_or_default());
+    let outbox = settings.outbox.as_deref().map_or_else(|| root.join(outbox::OUTBOX_DIR), absolute);
+
+    let geo = match gazetteer(settings.offline) {
+        Ok(g) => g,
+        Err(e) => {
+            error!("{e:#}");
+            tell(&format!("{e:#}"), true);
+            return ExitCode::FAILURE;
+        }
+    };
+    let status = Arc::new(Status::new(&root, &outbox, data.as_deref(), &key, settings));
+    {
+        let status = status.clone();
+        logging::set_sink(Box::new(move |level, text| status.log(level, text)));
+    }
+    #[cfg(windows)]
+    status.set_notifier(Box::new(|title, body| {
+        if let Err(e) = photo_stamp::winsys::toast(title, body, DASHBOARD_URL) {
+            log::warn!("couldn't show a notification: {e:#}");
+        }
+    }));
+    #[cfg(not(windows))]
+    status.set_notifier(Box::new(|title, body| info!("{title}: {body}")));
+
     geo.warm_up();
-    let watcher = match Outbox::new(&root, config, geo) {
+    let config = outbox::Config { outbox: outbox.clone(), events: true };
+    let watcher = match Outbox::new(&root, config, &geo, status.clone()) {
         Ok(w) => w,
         Err(e) => {
             error!("{e:#}");
@@ -276,11 +303,67 @@ fn here(args: HereArgs, common: &Common, geo: &dyn Geocoder) -> ExitCode {
     if let Some(log) = &log_file {
         info!("log file: {}", log.display());
     }
-    match watcher.run() {
+
+    // The dashboard's way in.
+    let registration = start_api(&status, &watcher, settings_path, &root, &outbox, &key, exe.as_deref());
+    let result = watcher.run();
+    if let (Some(mut reg), Some(data)) = (registration, data.as_deref()) {
+        reg.running = false;
+        reg.port = None;
+        let _ = reg.save(data);
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             error!("{e:#}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Where the dashboard (photo-stamp-ui) serves its page.
+#[cfg(windows)]
+const DASHBOARD_URL: &str = "http://127.0.0.1:8765/";
+
+/// Start the local API and record how to reach it, for the dashboard.
+fn start_api(
+    status: &Arc<Status>,
+    watcher: &Outbox,
+    settings_path: Option<PathBuf>,
+    root: &Path,
+    outbox: &Path,
+    key: &str,
+    exe: Option<&Path>,
+) -> Option<Registration> {
+    let data = paths::data_dir()?;
+    let started = (|| -> anyhow::Result<Registration> {
+        let token = api::new_token()?;
+        let port = api::start(Arc::new(api::Api {
+            status: status.clone(),
+            waker: Mutex::new(watcher.waker()),
+            token: token.clone(),
+            settings_path,
+        }))?;
+        let reg = Registration {
+            key: key.to_owned(),
+            root: root.to_owned(),
+            outbox: outbox.to_owned(),
+            exe: exe.map(Path::to_owned),
+            pid: std::process::id(),
+            port: Some(port),
+            token,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            started: photo_stamp::status::now_ms(),
+            running: true,
+        };
+        reg.save(&data)?;
+        Ok(reg)
+    })();
+    match started {
+        Ok(reg) => Some(reg),
+        Err(e) => {
+            log::warn!("the dashboard won't be able to connect: {e:#}");
+            None
         }
     }
 }

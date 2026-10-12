@@ -52,6 +52,20 @@ pub trait Geocoder {
 
     /// Prepare in the background (e.g. download indexes) so the first lookup is quick.
     fn warm_up(&self) {}
+
+    /// The state of the place data, for the dashboard.
+    fn health(&self) -> GeoHealth {
+        GeoHealth::default()
+    }
+}
+
+/// The state of the place data, for the dashboard.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct GeoHealth {
+    /// When the bundled places database was built (YYYY-MM-DD).
+    pub places_built: Option<String>,
+    /// `None` when offline (bundled data only).
+    pub overture: Option<crate::overture::OvertureHealth>,
 }
 
 /// Never looks anything up.

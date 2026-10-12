@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{FileTimes, Metadata};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
@@ -24,7 +24,8 @@ use walkdir::{DirEntry, WalkDir};
 use crate::formats::{self, Kind};
 use crate::geo::Geocoder;
 use crate::render::Renderer;
-use crate::stamp::{GeoUnavailable, Prepared, prepare, write_stamped};
+use crate::stamp::{GeoUnavailable, Picture, Prepared, prepare, write_stamped_with};
+use crate::status::{self, Entry, Outcome, Queued, Stage, Status, Waiting, Which};
 use crate::watch::is_temporary;
 
 /// Folder beside the exe holding bundled helpers (exiftool, place data); never scanned.
@@ -40,23 +41,31 @@ const GEO_RETRY_BASE: Duration = Duration::from_secs(60);
 const LOCKED_RETRY: Duration = Duration::from_secs(30);
 const LOCKED_ATTEMPTS: u32 = 20;
 
+/// Quality, settle time and polling come from the live settings in [`Status`].
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Where finished photos go, mirroring the watched folder's subfolders.
     pub outbox: PathBuf,
-    /// How long a file must stay unchanged before it's processed.
-    pub settle: Duration,
-    /// How often to poll the tree, as a backup to filesystem events.
-    pub poll_interval: Duration,
     /// Listen for filesystem events (polling always runs too).
     pub events: bool,
-    pub quality: u8,
 }
 
 /// Why the watcher woke up.
 pub enum Wake {
+    /// Something changed on disk, or a setting changed (e.g. resumed).
     Fs,
+    /// Try this photo (a path within the watched folder) again, e.g. after it failed.
+    Retry(PathBuf),
     Stop,
+}
+
+/// How a photo was delivered to the outbox.
+struct Delivered {
+    outcome: Outcome,
+    reason: Option<String>,
+    caption: Vec<String>,
+    output: PathBuf,
+    thumbs: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -91,12 +100,20 @@ pub struct Outbox<'a> {
     /// Files that couldn't be moved (e.g. undecodable), as we last saw them; retried if they change.
     settled: HashMap<PathBuf, Fingerprint>,
     deferred: HashMap<PathBuf, Deferred>,
+    status: Arc<Status>,
+    /// A stop arrived (seen between photos); the loop ends after the photo in hand.
+    stopping: bool,
     wake_tx: mpsc::Sender<Wake>,
     wake_rx: mpsc::Receiver<Wake>,
 }
 
 impl<'a> Outbox<'a> {
-    pub fn new(root: &Path, config: Config, geo: &'a dyn Geocoder) -> anyhow::Result<Self> {
+    pub fn new(
+        root: &Path,
+        config: Config,
+        geo: &'a dyn Geocoder,
+        status: Arc<Status>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(root.is_dir(), "{} is not a folder", root.display());
         std::fs::create_dir_all(&config.outbox)
             .with_context(|| format!("creating {}", config.outbox.display()))?;
@@ -109,9 +126,29 @@ impl<'a> Outbox<'a> {
             pending: HashMap::new(),
             settled: HashMap::new(),
             deferred: HashMap::new(),
+            status,
+            stopping: false,
             wake_tx,
             wake_rx,
         })
+    }
+
+    fn settle_time(&self) -> Duration {
+        Duration::from_secs(self.status.settings().settle_secs)
+    }
+
+    fn poll_interval(&self) -> Duration {
+        Duration::from_secs(self.status.settings().poll_secs.max(1))
+    }
+
+    /// Forget that `rel` failed, so it's tried again on the next scan.
+    fn retry(&mut self, rel: &Path) {
+        let path = self.root.join(rel);
+        self.settled.remove(&path);
+        if let Some(d) = self.deferred.get_mut(&path) {
+            d.next_try = Instant::now();
+        }
+        info!("retrying    {}", rel.display());
     }
 
     /// Something that can wake the watcher, e.g. to stop it from another thread.
@@ -142,33 +179,45 @@ impl<'a> Outbox<'a> {
              photos are stamped and moved to {}",
             self.root.display(),
             if _watcher.is_some() { "on" } else { "off" },
-            self.config.poll_interval,
+            self.poll_interval(),
             self.config.outbox.display(),
         );
+        if self.status.is_paused() {
+            info!("paused: new photos are noticed but not processed until resumed");
+        }
 
         loop {
             self.scan_once();
+            if self.stopping {
+                info!("stopped");
+                return Ok(());
+            }
+            let (settle, poll) = (self.settle_time(), self.poll_interval());
             let wait = if self.pending.is_empty() && self.deferred.is_empty() {
-                self.config.poll_interval
+                poll
             } else {
-                self.config.settle.min(self.config.poll_interval).max(Duration::from_millis(250))
+                settle.min(poll).max(Duration::from_millis(250))
             };
-            match self.wake_rx.recv_timeout(wait) {
-                Ok(Wake::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    info!("stopped");
-                    return Ok(());
-                }
-                Ok(Wake::Fs) => {
-                    // Let a burst of events (a big copy) coalesce before scanning.
-                    std::thread::sleep(Duration::from_millis(250));
-                    while let Ok(w) = self.wake_rx.try_recv() {
-                        if matches!(w, Wake::Stop) {
-                            let _ = self.wake_tx.send(Wake::Stop);
-                            break;
-                        }
+            let mut wake = self.wake_rx.recv_timeout(wait);
+            if matches!(wake, Ok(Wake::Fs)) {
+                // Let a burst of events (a big copy) coalesce before scanning.
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            // Handle everything that's arrived; a stop wins.
+            loop {
+                match wake {
+                    Ok(Wake::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        info!("stopped");
+                        return Ok(());
                     }
+                    Ok(Wake::Retry(rel)) => self.retry(&rel),
+                    Ok(Wake::Fs) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                match self.wake_rx.try_recv() {
+                    Ok(w) => wake = Ok(w),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => wake = Err(mpsc::RecvTimeoutError::Disconnected),
+                }
             }
         }
     }
@@ -209,20 +258,74 @@ impl<'a> Outbox<'a> {
         self.pending.retain(|p, _| present.contains(p));
         self.deferred.retain(|p, _| present.contains(p));
         self.settled.retain(|p, _| p.exists());
+        self.status.set_health(self.geo.health());
+        self.report_queue();
+        if self.status.is_paused() {
+            return;
+        }
 
+        let settle = self.settle_time();
         let mut ready: Vec<PathBuf> = self
             .pending
             .iter()
             .filter(|(p, s)| {
-                now.duration_since(s.since) >= self.config.settle
+                now.duration_since(s.since) >= settle
                     && self.deferred.get(*p).is_none_or(|d| now >= d.next_try)
             })
             .map(|(p, _)| p.clone())
             .collect();
         ready.sort();
         for path in ready {
+            // Paused or stopped part-way through a batch.
+            if self.status.is_paused() || self.take_wakes() {
+                break;
+            }
             self.process(&path);
+            // Map data may have been downloaded, indexes built.
+            self.status.set_health(self.geo.health());
         }
+        self.report_queue();
+    }
+
+    /// Handle requests that arrived while processing (retries); returns whether to stop.
+    fn take_wakes(&mut self) -> bool {
+        loop {
+            match self.wake_rx.try_recv() {
+                Ok(Wake::Stop) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.stopping = true;
+                    return true;
+                }
+                Ok(Wake::Retry(rel)) => self.retry(&rel),
+                Ok(Wake::Fs) => {}
+                Err(mpsc::TryRecvError::Empty) => return false,
+            }
+        }
+    }
+
+    /// Tell the dashboard what's waiting, and why.
+    fn report_queue(&self) {
+        let now = Instant::now();
+        let settle = self.settle_time();
+        let paused = self.status.is_paused();
+        let until = |t: Instant| status::now_ms() + t.saturating_duration_since(now).as_millis() as u64;
+        let mut queue: Vec<Queued> = self
+            .pending
+            .iter()
+            .map(|(p, s)| {
+                let waiting = match self.deferred.get(p) {
+                    Some(d) if now < d.next_try && d.lock_attempts > 0 => {
+                        Waiting::Busy { until: until(d.next_try) }
+                    }
+                    Some(d) if now < d.next_try => Waiting::Offline { until: until(d.next_try) },
+                    _ if now.duration_since(s.since) < settle => Waiting::Settling,
+                    _ if paused => Waiting::Paused,
+                    _ => Waiting::Ready,
+                };
+                Queued { path: self.show(p), waiting }
+            })
+            .collect();
+        queue.sort_by(|a, b| a.path.cmp(&b.path));
+        self.status.set_queue(queue);
     }
 
     fn rel<'p>(&self, path: &'p Path) -> &'p Path {
@@ -249,7 +352,7 @@ impl<'a> Outbox<'a> {
     }
 
     /// Stamp `path` into the outbox (or move it there unchanged) and remove it from here.
-    fn deliver(&mut self, path: &Path, strict_geo: bool) -> anyhow::Result<()> {
+    fn deliver(&mut self, path: &Path, id: u64, strict_geo: bool) -> anyhow::Result<Delivered> {
         let rel = self.rel(path).to_owned();
         let dir = self.config.outbox.join(rel.parent().unwrap_or(Path::new("")));
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -257,28 +360,45 @@ impl<'a> Outbox<'a> {
 
         let job = match prepare(path, self.geo, strict_geo)? {
             Prepared::Skip(why) => {
+                self.status.stage(Stage::Moving);
                 let dest = free_name(&dir, &name, None);
                 move_file(path, &dest)?;
                 info!("moved       {} (unstamped: {why})", self.show_out(&dest));
-                return Ok(());
+                return Ok(Delivered {
+                    outcome: Outcome::Unchanged,
+                    reason: Some(why.to_string()),
+                    caption: Vec::new(),
+                    output: dest,
+                    thumbs: false,
+                });
             }
             Prepared::Stamp(job) => job,
         };
 
+        self.status.stage(Stage::Drawing);
+        let status = self.status.clone();
+        let mut on_image = |picture: Picture, img: &image::DynamicImage| match picture {
+            Picture::Original => status.save_thumb(id, Which::Before, img),
+            Picture::Stamped => {
+                status.save_thumb(id, Which::After, img);
+                status.stage(Stage::Saving);
+            }
+        };
+        let quality = self.status.settings().quality;
         let before = std::fs::metadata(path)?;
-        if job.kind == Kind::Raw {
+        let output = if job.kind == Kind::Raw {
             // The untouched RAW and its stamped JPEG travel together under matching names.
             let raw = free_name(&dir, &name, Some(".jpg"));
             let jpg = dir.join(formats::output_name(&raw, job.kind));
-            write_stamped(path, &job, &mut self.renderer, &jpg, self.config.quality)?;
+            write_stamped_with(path, &job, &mut self.renderer, &jpg, quality, &mut on_image)?;
             if let Err(e) = move_file(path, &raw) {
                 let _ = std::fs::remove_file(&jpg);
                 return Err(e);
             }
-            info!("stamped     {}: {}", self.show_out(&jpg), job.lines.join(" | "));
+            jpg
         } else {
             let dest = free_name(&dir, &name, None);
-            write_stamped(path, &job, &mut self.renderer, &dest, self.config.quality)?;
+            write_stamped_with(path, &job, &mut self.renderer, &dest, quality, &mut on_image)?;
             // Only once the original is gone is the photo delivered; otherwise try again later.
             if let Err(e) = std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))
             {
@@ -288,9 +408,14 @@ impl<'a> Outbox<'a> {
             if let Err(e) = keep_times(&dest, &before) {
                 warn!("couldn't keep the file dates of {}: {e}", self.show_out(&dest));
             }
-            info!("stamped     {}: {}", self.show_out(&dest), job.lines.join(" | "));
-        }
-        Ok(())
+            dest
+        };
+        info!("stamped     {}: {}", self.show_out(&output), job.lines.join(" | "));
+        Ok(Delivered { outcome: Outcome::Stamped, reason: None, caption: job.lines, output, thumbs: true })
+    }
+
+    fn downloaded(&self) -> u64 {
+        self.geo.health().overture.map_or(0, |o| o.downloaded_bytes)
     }
 
     fn show_out(&self, path: &Path) -> String {
@@ -303,8 +428,30 @@ impl<'a> Outbox<'a> {
             self.deferred.get(path).map_or((0, 0), |d| (d.geo_attempts, d.lock_attempts));
         let strict_geo = geo_attempts + 1 < GEO_ATTEMPTS;
 
-        match self.deliver(path, strict_geo) {
-            Ok(()) => self.done(path),
+        let rel = self.show(path);
+        let id = self.status.start(&rel);
+        let downloaded_before = self.downloaded();
+        let result = self.deliver(path, id, strict_geo);
+        let downloaded = self.downloaded().saturating_sub(downloaded_before);
+        let entry = |outcome, reason, caption, output: Option<String>, thumbs| Entry {
+            id,
+            path: rel.clone(),
+            outcome,
+            reason,
+            caption,
+            output,
+            ms: 0,
+            downloaded,
+            thumbs,
+            finished: 0,
+        };
+        match result {
+            Ok(d) => {
+                self.done(path);
+                let output = Some(self.show_out(&d.output));
+                self.status.finish(entry(d.outcome, d.reason, d.caption, output, d.thumbs));
+                return;
+            }
             Err(e) if e.downcast_ref::<GeoUnavailable>().is_some() => {
                 let delay = GEO_RETRY_BASE * 2u32.pow(geo_attempts);
                 info!("waiting     {}: {e:#}; retrying in {delay:?}", self.show(path));
@@ -334,8 +481,22 @@ impl<'a> Outbox<'a> {
             Err(e) => {
                 warn!("couldn't stamp {}: {e:#}; leaving it here", self.show(path));
                 self.settle(path);
+                self.status.finish(entry(Outcome::Failed, Some(format!("{e:#}")), Vec::new(), None, false));
+                return;
             }
         }
+        // Back in the queue, to try again later.
+        let waiting = match self.deferred.get(path) {
+            Some(d) if d.lock_attempts > lock_attempts => {
+                Waiting::Busy { until: status::now_ms() + LOCKED_RETRY.as_millis() as u64 }
+            }
+            Some(d) => Waiting::Offline {
+                until: status::now_ms()
+                    + d.next_try.saturating_duration_since(Instant::now()).as_millis() as u64,
+            },
+            None => Waiting::Ready,
+        };
+        self.status.deferred(Queued { path: rel, waiting });
     }
 }
 
@@ -411,16 +572,17 @@ fn keep_times(path: &Path, before: &Metadata) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::Settings;
     use crate::stamp::tests::{EIFFEL_TAGS, FailingGeocoder, FixedPlace, make_photo, temp_dir};
 
     fn config(root: &Path) -> Config {
-        Config {
-            outbox: root.join(OUTBOX_DIR),
-            settle: Duration::ZERO,
-            poll_interval: Duration::from_secs(1),
-            events: false,
-            quality: 90,
-        }
+        Config { outbox: root.join(OUTBOX_DIR), events: false }
+    }
+
+    /// In-memory status (no history or previews on disk), processing as soon as files are seen.
+    fn status(root: &Path) -> Arc<Status> {
+        let settings = Settings { settle_secs: 0, poll_secs: 1, quality: 90, ..Settings::default() };
+        Arc::new(Status::new(root, &root.join(OUTBOX_DIR), None, "test", settings))
     }
 
     fn stamped(path: &Path) -> bool {
@@ -439,7 +601,7 @@ mod tests {
         // Already in the folder before the watcher starts, with old dates: still handled.
         make_photo(&root.join("old.jpg"), EIFFEL_TAGS);
         set_old_times(&root.join("old.jpg"));
-        let mut w = Outbox::new(&root, config(&root), &FixedPlace).unwrap();
+        let mut w = Outbox::new(&root, config(&root), &FixedPlace, status(&root)).unwrap();
 
         std::fs::create_dir_all(root.join("trip/day 1")).unwrap();
         make_photo(&root.join("trip/day 1/a.jpg"), EIFFEL_TAGS);
@@ -484,7 +646,7 @@ mod tests {
     #[test]
     fn already_stamped_photos_move_unchanged_and_names_never_clash() {
         let root = temp_dir("outbox-clash");
-        let mut w = Outbox::new(&root, config(&root), &FixedPlace).unwrap();
+        let mut w = Outbox::new(&root, config(&root), &FixedPlace, status(&root)).unwrap();
         make_photo(&root.join("a.jpg"), EIFFEL_TAGS);
         w.scan_once();
         // The stamped photo comes back in (e.g. copied from the outbox), plus a new one by that name.
@@ -510,7 +672,7 @@ mod tests {
         let elsewhere = temp_dir("outbox-custom-dest");
         let mut cfg = config(&root);
         cfg.outbox = elsewhere.join("done");
-        let mut w = Outbox::new(&root, cfg, &FixedPlace).unwrap();
+        let mut w = Outbox::new(&root, cfg, &FixedPlace, status(&root)).unwrap();
         std::fs::create_dir_all(root.join("x")).unwrap();
         make_photo(&root.join("x/a.jpg"), EIFFEL_TAGS);
         w.scan_once();
@@ -535,7 +697,7 @@ mod tests {
     #[test]
     fn geo_outage_defers() {
         let root = temp_dir("outbox-defer");
-        let mut w = Outbox::new(&root, config(&root), &FailingGeocoder).unwrap();
+        let mut w = Outbox::new(&root, config(&root), &FailingGeocoder, status(&root)).unwrap();
         make_photo(&root.join("a.jpg"), EIFFEL_TAGS);
         w.scan_once();
         assert!(root.join("a.jpg").exists(), "waits in place");
@@ -551,9 +713,66 @@ mod tests {
     }
 
     #[test]
+    fn reports_results_and_honors_pause_and_retry() {
+        let root = temp_dir("outbox-status");
+        let st = status(&root);
+        let mut w = Outbox::new(&root, config(&root), &FixedPlace, st.clone()).unwrap();
+        st.set_paused(true);
+        make_photo(&root.join("a.jpg"), EIFFEL_TAGS);
+        // Good metadata, but a JPEG named .png: it can't be decoded as what it claims to be.
+        make_photo(&root.join("broken.jpg"), EIFFEL_TAGS);
+        std::fs::rename(root.join("broken.jpg"), root.join("broken.png")).unwrap();
+        w.scan_once();
+        assert!(root.join("a.jpg").exists(), "paused: noticed but not processed");
+        st.snapshot(|s| {
+            assert_eq!(s.queue.len(), 2);
+            assert!(s.queue.iter().all(|q| q.waiting == Waiting::Paused));
+        });
+
+        st.set_paused(false);
+        w.scan_once();
+        assert!(stamped(&root.join("outbox/a.jpg")));
+        st.snapshot(|s| {
+            assert!(s.queue.is_empty() && s.current.is_none());
+            assert_eq!((s.session.stamped, s.session.failed), (1, 1));
+            let a = s.recent.iter().find(|e| e.path == "a.jpg").unwrap();
+            assert_eq!(a.outcome, Outcome::Stamped);
+            assert_eq!(a.caption[0], "Eiffel Tower (Tour Eiffel)");
+            assert_eq!(a.output.as_deref().map(|o| o.replace('\\', "/")), Some("outbox/a.jpg".into()));
+            let broken = s.recent.iter().find(|e| e.path == "broken.png").unwrap();
+            assert_eq!(broken.outcome, Outcome::Failed);
+            assert!(broken.reason.is_some());
+        });
+
+        // A failed photo is left alone until it changes, or until retried.
+        w.scan_once();
+        st.snapshot(|s| assert_eq!(s.session.failed, 1));
+        w.retry(Path::new("broken.png"));
+        w.scan_once();
+        st.snapshot(|s| assert_eq!(s.session.failed, 2, "tried again"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stop_is_noticed_between_photos() {
+        let root = temp_dir("outbox-stop-batch");
+        let mut w = Outbox::new(&root, config(&root), &FixedPlace, status(&root)).unwrap();
+        make_photo(&root.join("a.jpg"), EIFFEL_TAGS);
+        make_photo(&root.join("b.jpg"), EIFFEL_TAGS);
+        w.waker().send(Wake::Stop).unwrap();
+        w.scan_once();
+        assert!(w.stopping);
+        assert!(
+            root.join("a.jpg").exists() && root.join("b.jpg").exists(),
+            "the batch stops before starting"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn stop_ends_the_loop() {
         let root = temp_dir("outbox-stop");
-        let w = Outbox::new(&root, config(&root), &FixedPlace).unwrap();
+        let w = Outbox::new(&root, config(&root), &FixedPlace, status(&root)).unwrap();
         let waker = w.waker();
         let t = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
