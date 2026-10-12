@@ -144,6 +144,8 @@ pub struct Overture {
     indexes: Mutex<HashMap<(String, Dataset), DatasetIndex>>,
     /// Bytes fetched over the network (for logging what a lookup cost).
     downloaded: AtomicU64,
+    /// Serialises building each dataset's index (indexed by `Dataset as usize`).
+    building: [Mutex<()>; 4],
 }
 
 fn now_secs() -> u64 {
@@ -210,6 +212,7 @@ impl Overture {
             state: Mutex::new(state),
             indexes: Mutex::new(HashMap::new()),
             downloaded: AtomicU64::new(0),
+            building: Default::default(),
         })
     }
 
@@ -280,6 +283,11 @@ impl Overture {
 
     /// Per-file row-group bounding boxes for a dataset, built once per release.
     fn index(&self, release: &str, ds: Dataset) -> anyhow::Result<Arc<Vec<FileIndex>>> {
+        if let Some(ix) = self.indexes.lock().unwrap().get(&(release.to_owned(), ds)) {
+            return Ok(ix.clone());
+        }
+        // One builder per dataset: the startup warm-up and the first photo mustn't both download it.
+        let _building = self.building[ds as usize].lock().unwrap();
         if let Some(ix) = self.indexes.lock().unwrap().get(&(release.to_owned(), ds)) {
             return Ok(ix.clone());
         }

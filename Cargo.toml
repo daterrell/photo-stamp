@@ -1,6 +1,6 @@
 [package]
 name = "photo-stamp"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Burn when/where a photo was taken into the image, using its EXIF data"
 license = "MIT"
