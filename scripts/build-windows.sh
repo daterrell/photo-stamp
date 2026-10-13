@@ -26,7 +26,7 @@ rm -rf "$DIST" dist/photo-stamp-windows.zip
 mkdir -p "$DIST/photo-stamp-files"
 
 if [ -n "${PHOTO_STAMP_EXE:-}" ]; then
-  # Already built (CI builds it with a layer cache, see .github/workflows/ci.yml).
+  # Already built (CI builds it with a layer cache, see .forgejo/workflows/ci.yml).
   cp "$PHOTO_STAMP_EXE" "$DIST/photo-stamp.exe"
   cp "$(dirname "$PHOTO_STAMP_EXE")/photo-stamp-ui.exe" "$DIST/photo-stamp-ui.exe"
 else
