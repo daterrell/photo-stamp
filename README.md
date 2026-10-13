@@ -1,5 +1,7 @@
 # photo-stamp
 
+(If you're reading this on GitHub, you're reading a mirror).
+
 Burns **where** and **when** a photo was taken into its bottom-left corner, using the photo's own metadata.
 
 **Downloads**
