@@ -1,7 +1,11 @@
 name: CI
 
 # Checks every push and pull request; on success builds the Windows zip. Pushes to main and
-# version tags also publish the Docker image, and v* tags create a GitHub Release.
+# version tags also publish the Docker image to Forgejo's registry, and v* tags create a GitHub
+# Release.
+#
+# Runs on the self-hosted Forgejo runner. Its Docker daemon keeps images, build layers and the
+# dev.sh cargo volumes between runs, so there's no cache-from/cache-to to manage.
 on:
   push:
     branches: ["**"]
@@ -17,21 +21,17 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  REGISTRY: forgejo.terrell.ltd
 
 jobs:
   check:
     name: Tests, clippy, rustfmt
     runs-on: ubuntu-24.04
+    env:
+      # The runner's Docker daemon can't bind-mount this checkout; see dev.sh.
+      DEV_SH_COPY_SOURCE: "1"
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/photo-stamp-dev/cargo/registry
-            ~/.cache/photo-stamp-dev/cargo/git
-            target
-          key: check-${{ hashFiles('Cargo.lock', 'docker/Dockerfile') }}
-          restore-keys: check-
+      - uses: actions/checkout@v4
       # dev.sh runs everything in the dev image, which has the exiftool, libheif and fonts the
       # tests need.
       - name: rustfmt
@@ -45,19 +45,16 @@ jobs:
     name: Clippy (Windows target)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - name: Toolchain
+      - uses: actions/checkout@v4
+      - name: mingw-w64
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends mingw-w64
-          rustup toolchain install stable --profile minimal --component clippy --target x86_64-pc-windows-gnu
-      - uses: actions/cache@v6
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            ~/.cargo/registry
-            target
-          key: check-windows-${{ hashFiles('Cargo.lock') }}
-          restore-keys: check-windows-
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
       # HEIC (libheif) is linked statically in the real build; without it this still checks all the
       # Windows-only code.
       - run: cargo clippy --workspace --target x86_64-pc-windows-gnu --no-default-features --all-targets --locked -- -D warnings
@@ -66,19 +63,19 @@ jobs:
     name: Place data
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       # Rebuilt monthly (GeoNames and Wikidata change slowly) and when the build script changes. The
       # public Wikidata endpoint rate-limits, so a failed rebuild falls back to the previous database
       # instead of holding up the Windows zip, Docker image and releases.
       - id: month
         run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
       - id: db
-        uses: actions/cache/restore@v6
+        uses: actions/cache/restore@v4
         with:
           path: data/places.sqlite
           key: places-db-${{ steps.month.outputs.month }}-${{ hashFiles('scripts/build-places-db.py') }}
           restore-keys: places-db-
-      - uses: actions/cache@v6
+      - uses: actions/cache@v4
         if: steps.db.outputs.cache-hit != 'true'
         with:
           path: ~/.cache/photo-stamp-dev/places-src
@@ -95,13 +92,14 @@ jobs:
         run: |
           test -f data/places.sqlite || { echo "::error::couldn't build the place data and no previous build is cached"; exit 1; }
           echo "::warning::couldn't rebuild the place data this month; using the previous build"
-      - uses: actions/cache/save@v6
+      - uses: actions/cache/save@v4
         if: steps.build.outcome == 'success'
         with:
           path: data/places.sqlite
           key: places-db-${{ steps.month.outputs.month }}-${{ hashFiles('scripts/build-places-db.py') }}
       - run: ls -la data/places.sqlite
-      - uses: actions/upload-artifact@v7
+      # Forgejo's fork: GitHub's upload/download-artifact v4+ don't work against Forgejo.
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: places-db
           path: data/places.sqlite
@@ -113,23 +111,16 @@ jobs:
     needs: [check, check-windows, places]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@v4
+      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: places-db
           path: data
-      - uses: docker/setup-buildx-action@v4
-      # The static libde265/x265/libheif build takes ~10 minutes; the layer cache skips it.
+      # The static libde265/x265/libheif build takes ~10 minutes; the runner's persistent layer
+      # cache skips it.
       - name: Build photo-stamp.exe and photo-stamp-ui.exe
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/Dockerfile.windows
-          target: exe
-          outputs: type=local,dest=build-out
-          cache-from: type=gha,scope=windows
-          cache-to: type=gha,scope=windows,mode=max
-      - uses: actions/cache@v6
+        run: docker build -f docker/Dockerfile.windows --target exe -o type=local,dest=build-out .
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/photo-stamp-dev/downloads
           key: downloads-${{ hashFiles('scripts/build-windows.sh') }}
@@ -139,6 +130,7 @@ jobs:
           PHOTO_STAMP_EXE: build-out/photo-stamp.exe
       - name: Only Windows system DLLs
         run: |
+          sudo apt-get update >/dev/null
           sudo apt-get install -y --no-install-recommends binutils-mingw-w64-x86-64 >/dev/null
           for exe in photo-stamp.exe photo-stamp-ui.exe; do
             x86_64-w64-mingw32-objdump -p "dist/photo-stamp-windows/$exe" | grep "DLL Name" | sort -uf | tee dlls.txt
@@ -147,12 +139,12 @@ jobs:
               exit 1
             fi
           done
-      - uses: actions/upload-artifact@v7
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: photo-stamp-windows
           path: dist/photo-stamp-windows/
           if-no-files-found: error
-      - uses: actions/upload-artifact@v7
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: photo-stamp-windows-zip
           path: dist/photo-stamp-windows.zip
@@ -164,25 +156,22 @@ jobs:
     needs: [check, places]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@v4
+      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: places-db
           path: data
-      - uses: docker/setup-buildx-action@v4
+      # The automatic token can't push packages, so this uses a token with package write access.
       - uses: docker/login-action@v4
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.PACKAGES_TOKEN }}
       - id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-
@@ -194,18 +183,18 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=docker
-          cache-to: type=gha,scope=docker,mode=max
 
   release:
     name: GitHub Release
     needs: windows
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    env:
+      # Releases are published on GitHub. Forgejo push-mirrors the repo there, tags included.
+      GH_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+      GH_REPO: daterrell/photo-stamp
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
       - name: Tag matches Cargo.toml
         run: |
           version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
@@ -213,12 +202,22 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version"
             exit 1
           fi
-      - uses: actions/download-artifact@v8
+      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: photo-stamp-windows-zip
+      - name: Install gh
+        run: |
+          curl -fsSL https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz | tar xz -C /tmp
+          sudo install /tmp/gh_2.102.0_linux_amd64/bin/gh /usr/local/bin/gh
+      - name: Wait for the push mirror to bring the tag to GitHub
+        run: |
+          for _ in $(seq 60); do
+            gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --silent 2>/dev/null && exit 0
+            sleep 5
+          done
+          echo "::error::$GITHUB_REF_NAME didn't reach github.com/$GH_REPO; check the repo's push mirror."
+          exit 1
       - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           zip="photo-stamp-windows-${GITHUB_REF_NAME}.zip"
           mv photo-stamp-windows.zip "$zip"
@@ -227,7 +226,7 @@ jobs:
             echo "Stamped photos go to its \`outbox\` folder. Double-click \`photo-stamp-ui.exe\` to see and"
             echo "control what it's doing in your browser. See README.txt inside the zip."
             echo
-            echo "Docker image: \`ghcr.io/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME#v}\`"
+            echo "Docker image: \`${REGISTRY}/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME#v}\`"
           } > notes.md
-          gh release create "$GITHUB_REF_NAME" "$zip" --title "photo-stamp $GITHUB_REF_NAME" \
+          gh release create "$GITHUB_REF_NAME" "$zip" --verify-tag --title "photo-stamp $GITHUB_REF_NAME" \
             --notes-file notes.md --generate-notes
