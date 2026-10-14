@@ -151,7 +151,7 @@ impl Service {
             max_wait_hours: caller.max_wait_hours,
             rev: caller.rev,
             data_version: data.data_version(),
-            server_version: env!("CARGO_PKG_VERSION").into(),
+            server_version: photo_stamp_http::VERSION.into(),
             places_built: data.gazetteer.places_built(),
             overture_release: data.gazetteer.overture_health().and_then(|o| o.release),
         }

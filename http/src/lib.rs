@@ -12,6 +12,10 @@ use std::time::Duration;
 
 pub mod registry;
 
+/// The version of photo-stamp: from the git tag (`v0.7.0` → `0.7.0`), or between releases
+/// something like `0.6.1-dev.7+g1b37dbe` (see `scripts/version.sh`).
+pub const VERSION: &str = env!("PHOTO_STAMP_VERSION");
+
 /// Largest request body accepted.
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_HEADER_LINES: usize = 100;

@@ -1571,7 +1571,7 @@ dependencies = [
 
 [[package]]
 name = "photo-stamp"
-version = "0.7.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1598,7 +1598,7 @@ dependencies = [
 
 [[package]]
 name = "photo-stamp-http"
-version = "0.6.0"
+version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1606,7 +1606,7 @@ dependencies = [
 
 [[package]]
 name = "photo-stamp-proto"
-version = "0.7.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "photo-stamp-server"
-version = "0.7.0"
+version = "0.0.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "photo-stamp-ui"
-version = "0.6.0"
+version = "0.0.0"
 dependencies = [
  "photo-stamp-http",
  "serde",

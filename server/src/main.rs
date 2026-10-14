@@ -13,7 +13,7 @@ use photo_stamp_server::store::Store;
 /// The photo-stamp place server: holds the full place data and names points for your family's
 /// photo-stamp clients.
 #[derive(Parser)]
-#[command(version)]
+#[command(version = photo_stamp_http::VERSION)]
 struct Cli {
     /// Where the server keeps its data (place data, Overture mirror, accounts)
     #[arg(long, global = true, env = "PHOTO_STAMP_SERVER_DATA", default_value = "/data")]
@@ -140,7 +140,7 @@ fn run(command: Command, layout: &Layout) -> anyhow::Result<()> {
             let listener = TcpListener::bind(&listen)?;
             log::info!(
                 "photo-stamp-server {} listening on {listen} (data in {}, {})",
-                env!("CARGO_PKG_VERSION"),
+                photo_stamp_http::VERSION,
                 layout.root.display(),
                 service.data().data_version()
             );

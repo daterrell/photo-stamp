@@ -230,7 +230,7 @@ impl Overture {
             .unwrap_or(DEFAULT_CACHE_MB);
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(60)))
-            .user_agent(concat!("photo-stamp/", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("photo-stamp/{}", photo_stamp_http::VERSION))
             .build()
             .into();
         let state = std::fs::read_to_string(dir.join("release.json"))
@@ -377,7 +377,7 @@ impl Overture {
             let agent: ureq::Agent = ureq::Agent::config_builder()
                 .timeout_connect(Some(Duration::from_secs(30)))
                 .timeout_recv_body(Some(Duration::from_secs(120)))
-                .user_agent(concat!("photo-stamp-server/", env!("CARGO_PKG_VERSION")))
+                .user_agent(format!("photo-stamp-server/{}", photo_stamp_http::VERSION))
                 .build()
                 .into();
             let mut resp =

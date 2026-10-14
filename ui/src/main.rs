@@ -49,7 +49,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-open" => args.open = false,
             "--stop" => args.stop = true,
             "-h" | "--help" => return Err(USAGE.to_owned()),
-            "-V" | "--version" => return Err(format!("photo-stamp-ui {}", env!("CARGO_PKG_VERSION"))),
+            "-V" | "--version" => return Err(format!("photo-stamp-ui {}", photo_stamp_http::VERSION)),
             other => return Err(format!("unknown option {other}\n\n{USAGE}")),
         }
     }

@@ -571,7 +571,7 @@ impl Status {
         let inner = self.inner.lock().unwrap();
         let snap = Snapshot {
             seq: inner.seq,
-            version: env!("CARGO_PKG_VERSION"),
+            version: photo_stamp_http::VERSION,
             root: &self.root,
             outbox: &self.outbox,
             paused: self.is_paused(),
