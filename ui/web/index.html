@@ -28,6 +28,11 @@
   </div>
 </header>
 
+<div class="update-banner" id="update-banner" hidden>
+  <span id="update-text"></span>
+  <button class="primary small" id="update-install" hidden>Install and restart</button>
+</div>
+
 <div class="progress" id="progress" hidden>
   <div class="track"><div class="fill" id="progress-fill"></div></div>
   <div class="progress-text"><span id="progress-count"></span><span id="progress-eta"></span></div>
@@ -135,6 +140,22 @@
         </label>
       </div>
     </form>
+
+    <section class="settings" id="updates">
+      <h2>Updates</h2>
+      <p class="quiet">This is photo-stamp <span id="upd-current"></span>. New versions come from the place server; they're downloaded in the background and installed when you choose.</p>
+      <label class="field">
+        <span>Get</span>
+        <select id="upd-channel">
+          <option value="stable">Releases (stable)</option>
+          <option value="beta">Every build (beta)</option>
+        </select>
+      </label>
+      <div class="form-actions">
+        <button class="ghost" type="button" id="upd-check">Check now</button>
+        <span class="quiet" id="upd-status" role="status"></span>
+      </div>
+    </section>
 
     <form class="settings" id="settings-form">
       <h2>Photos</h2>

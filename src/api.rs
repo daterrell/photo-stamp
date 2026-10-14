@@ -15,6 +15,9 @@
 //! - `GET /api/server`, `PUT /api/server` `{"url", "key"}` (an empty key keeps the current one),
 //!   `DELETE /api/server`: the place server this PC uses; `POST /api/server/test`
 //! - `PUT /api/me` `{"history": bool, "max_wait_hours": n}`: this device's settings on the server
+//! - `POST /api/update/check`; `POST /api/update/install` (installs the downloaded update: finishes
+//!   the photo in hand, then restarts as the new version); `PUT /api/update/channel`
+//!   `{"channel": "stable"|"beta"}`. The updater's state is in `/api/status` (`update`).
 
 use std::io::Write;
 use std::net::TcpListener;
@@ -44,6 +47,12 @@ pub struct Api {
     pub settings_path: Option<PathBuf>,
     /// The place server connection (`None` in tests).
     pub geo: Option<Arc<RemoteGeocoder>>,
+    pub updater: Option<Arc<crate::update::Updater>>,
+}
+
+#[derive(Deserialize)]
+struct ChannelBody {
+    channel: String,
 }
 
 #[derive(Deserialize)]
@@ -226,6 +235,36 @@ pub fn handle(api: &Api, req: Request) -> Response {
                 Err(e) => Response::error(502, &format!("{e:#}")),
             }
         }
+        ("POST", ["api", "update", "check"]) => {
+            let Some(u) = api.updater.clone() else { return Response::error(404, "no updates here") };
+            std::thread::spawn(move || u.check());
+            Response::ok()
+        }
+        ("POST", ["api", "update", "install"]) => {
+            let Some(u) = &api.updater else { return Response::error(404, "no updates here") };
+            match u.request_install() {
+                Ok(version) => {
+                    // The watcher finishes the photo in hand, stops, and main installs.
+                    wake(Wake::Stop);
+                    Response::json(200, &json!({ "version": version }))
+                }
+                Err(e) => Response::error(409, &format!("{e:#}")),
+            }
+        }
+        ("PUT", ["api", "update", "channel"]) => {
+            let Some(u) = api.updater.clone() else { return Response::error(404, "no updates here") };
+            let Ok(body) = req.json::<ChannelBody>() else {
+                return Response::error(400, "expected {\"channel\": \"stable\" or \"beta\"}");
+            };
+            match u.set_channel(&body.channel) {
+                Ok(()) => {
+                    log::info!("update channel set to {}", body.channel);
+                    std::thread::spawn(move || u.check());
+                    Response::ok()
+                }
+                Err(e) => Response::error(400, &format!("{e:#}")),
+            }
+        }
         ("GET", ["api", "settings"]) => Response::json(200, &api.status.settings()),
         ("PUT", ["api", "settings"]) => match req.json::<Settings>() {
             Ok(new) => {
@@ -296,7 +335,17 @@ mod tests {
             "k",
             Settings::default(),
         ));
-        (Api { status, waker: Mutex::new(tx), token: "secret".into(), settings_path: None, geo: None }, rx)
+        (
+            Api {
+                status,
+                waker: Mutex::new(tx),
+                token: "secret".into(),
+                settings_path: None,
+                geo: None,
+                updater: None,
+            },
+            rx,
+        )
     }
 
     fn req(method: &str, path: &str, body: &str) -> Request {

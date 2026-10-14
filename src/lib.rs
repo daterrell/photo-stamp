@@ -14,6 +14,7 @@ pub mod render;
 pub mod settings;
 pub mod stamp;
 pub mod status;
+pub mod update;
 pub mod watch;
 #[cfg(windows)]
 pub mod winsys;

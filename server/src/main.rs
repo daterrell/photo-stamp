@@ -9,6 +9,7 @@ use photo_stamp_server::import::{self, ImportOptions};
 use photo_stamp_server::overture::Dataset;
 use photo_stamp_server::service::{Data, Layout, Service};
 use photo_stamp_server::store::Store;
+use photo_stamp_server::updates::{Updates, UpdatesConfig};
 
 /// The photo-stamp place server: holds the full place data and names points for your family's
 /// photo-stamp clients.
@@ -135,7 +136,12 @@ fn run(command: Command, layout: &Layout) -> anyhow::Result<()> {
             }
             let data = Data::load(layout, offline)?;
             data.gazetteer.warm_up();
-            let service = Arc::new(Service::new(store()?, data, layout.clone(), offline));
+            let updates = UpdatesConfig::from_env().map(Updates::new);
+            match &updates {
+                Some(_) => log::info!("client updates: relaying builds from the package registry"),
+                None => log::info!("client updates: off (set PHOTO_STAMP_UPDATES_TOKEN to offer them)"),
+            }
+            let service = Arc::new(Service::new(store()?, data, layout.clone(), offline, updates));
             service.watch_for_new_data(Duration::from_secs(60));
             let listener = TcpListener::bind(&listen)?;
             log::info!(

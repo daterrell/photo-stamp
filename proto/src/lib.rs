@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub mod api;
 #[cfg(feature = "places")]
 pub mod places;
+pub mod version;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GpsPoint {

@@ -17,6 +17,7 @@ use photo_stamp_proto::places::{FILE_NAME, PlacesDb, TOWNS_FILE_NAME};
 use crate::gazetteer::Gazetteer;
 use crate::overture::Overture;
 use crate::store::{Caller, Store};
+use crate::updates::Updates;
 
 /// Where the server keeps everything (`/data` in the container).
 #[derive(Debug, Clone)]
@@ -78,6 +79,8 @@ pub struct Service {
     data: RwLock<Arc<Data>>,
     layout: Layout,
     offline: bool,
+    /// Client updates (`None`: not set up on this server).
+    updates: Option<Updates>,
 }
 
 fn bearer(req: &Request) -> Option<&str> {
@@ -85,8 +88,8 @@ fn bearer(req: &Request) -> Option<&str> {
 }
 
 impl Service {
-    pub fn new(store: Store, data: Data, layout: Layout, offline: bool) -> Self {
-        Self { store, data: RwLock::new(Arc::new(data)), layout, offline }
+    pub fn new(store: Store, data: Data, layout: Layout, offline: bool, updates: Option<Updates>) -> Self {
+        Self { store, data: RwLock::new(Arc::new(data)), layout, offline, updates }
     }
 
     pub fn data(&self) -> Arc<Data> {
@@ -221,6 +224,44 @@ impl Service {
                     _ => Response::error(500, "couldn't read the settings back"),
                 }
             }
+            ("GET", "/v1/client/latest") => {
+                let Some(u) = &self.updates else {
+                    return Response::error(404, "updates aren't set up on this server");
+                };
+                let channel = req.param("channel").unwrap_or_else(|| "stable".into());
+                match u.latest(&channel) {
+                    Ok(Some(update)) => Response::json(200, &update),
+                    Ok(None) => Response::new(204, "application/json", ""),
+                    Err(e) => {
+                        log::warn!("listing client updates: {e:#}");
+                        Response::error(502, &format!("{e:#}"))
+                    }
+                }
+            }
+            ("GET", p) if p.starts_with("/v1/client/download/") => {
+                let Some(u) = &self.updates else {
+                    return Response::error(404, "updates aren't set up on this server");
+                };
+                let version = p.trim_start_matches("/v1/client/download/");
+                match u.download(version) {
+                    Ok((size, mut body)) => {
+                        log::info!(
+                            "{}'s {} is downloading photo-stamp {version}",
+                            caller.user,
+                            caller.device
+                        );
+                        let r = Response::stream(
+                            "application/zip",
+                            Box::new(move |out| photo_stamp_http::pump(&mut body, out)),
+                        );
+                        match size {
+                            Some(n) => r.with_header("Content-Length", &n.to_string()),
+                            None => r,
+                        }
+                    }
+                    Err(e) => Response::error(404, &format!("{e:#}")),
+                }
+            }
             ("GET", "/v1/towns.sqlite") => match std::fs::read(self.layout.towns()) {
                 Ok(bytes) => Response::new(200, "application/vnd.sqlite3", bytes),
                 Err(_) => Response::error(404, "no towns database yet; run photo-stamp-server import"),
@@ -264,7 +305,7 @@ mod tests {
         let key = store.add_device("Dave", "laptop", true).unwrap();
         // Bundled data only (no Overture) keeps the tests offline.
         let data = Data::load(&layout, true).unwrap();
-        (Service::new(store, data, layout, true), key)
+        (Service::new(store, data, layout, true, None), key)
     }
 
     fn req(method: &str, path: &str, key: Option<&str>, body: &str) -> Request {

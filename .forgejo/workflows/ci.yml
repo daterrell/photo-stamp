@@ -7,8 +7,13 @@ name: CI
 # is like 1.2.4-dev.7+g1b37dbe. Pushing a v*.*.* tag on a commit that's on main makes a release:
 # the same build, promoted to the public (a GitHub Release, and :latest/:1.2.3 images).
 #
-# Runs on the self-hosted Forgejo runner. Its Docker daemon keeps images, build layers and the
-# dev.sh cargo volumes between runs, so there's no cache-from/cache-to to manage.
+# What's left after a run is only what's usable, published: the Windows zip in Forgejo's package
+# registry (pushes to main = beta, v* tags = stable; auto-update reads it), the images in its
+# container registry, and a GitHub Release for tags. Pull request builds keep their zip as a
+# short-lived Actions artifact. Every job removes what it created, and the tidy job keeps the
+# runner's shared caches bounded (Docker layer cache, main's cargo target volume, dev images).
+#
+# Runs on the self-hosted Forgejo runner, whose Docker daemon persists between runs.
 on:
   # Branches are checked through their pull request; pushing to one too would build the same
   # commit twice at once.
@@ -27,6 +32,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: forgejo.terrell.ltd
+  # Windows builds in the generic package registry.
+  PACKAGE: photo-stamp-windows
+  # Kept per kind: newest beta zips, and sha-* image tags.
+  KEEP_BUILDS: "10"
 
 jobs:
   check:
@@ -35,9 +44,9 @@ jobs:
     env:
       # The runner's Docker daemon can't bind-mount this checkout; see dev.sh.
       DEV_SH_COPY_SOURCE: "1"
-      # Each branch builds in its own target volume, so runs at the same time can't clobber each
-      # other's half-built crates.
-      DEV_SH_TARGET: ${{ github.head_ref || github.ref_name }}
+      # Main builds in its own long-lived target volume; anything else gets one for this run only
+      # (seeded from main's), so runs at the same time can't clobber each other's crates.
+      DEV_SH_TARGET: ${{ github.ref == 'refs/heads/main' && 'main' || format('run-{0}', github.run_id) }}
     steps:
       - uses: actions/checkout@v4
       # dev.sh runs everything in the dev image, which has the exiftool, libheif and fonts the
@@ -48,6 +57,9 @@ jobs:
         run: ./dev.sh cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: tests
         run: ./dev.sh cargo test --workspace --locked
+      - name: Remove this run's target volume
+        if: always() && env.DEV_SH_TARGET != 'main'
+        run: docker volume rm "photo-stamp-dev-target-$DEV_SH_TARGET" >/dev/null 2>&1 || true
 
   check-windows:
     name: Clippy (Windows target)
@@ -115,7 +127,8 @@ jobs:
             data/places.sqlite
             data/towns.sqlite
           if-no-files-found: error
-          retention-days: 7
+          # Only passed to the later jobs of this run.
+          retention-days: 1
 
   windows:
     name: Windows zip
@@ -153,17 +166,37 @@ jobs:
               exit 1
             fi
           done
+      # Pull requests: a short-lived artifact to try the build. Main and tags: published below.
       - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        if: github.event_name == 'pull_request'
         with:
           name: photo-stamp-windows
-          path: dist/photo-stamp-windows/
-          if-no-files-found: error
-      - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
-        with:
-          name: photo-stamp-windows-zip
           path: dist/photo-stamp-windows.zip
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
+      # Main = beta, v* tags = stable (the version says which). Auto-update reads these.
+      - name: Publish to the package registry
+        if: github.event_name == 'push'
+        env:
+          TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          version=$(scripts/version.sh)
+          url="${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/$PACKAGE/${version//+/%2B}/photo-stamp-windows-${version//+/%2B}.zip"
+          curl -sf -X PUT -H "Authorization: token $TOKEN" --upload-file dist/photo-stamp-windows.zip "$url" \
+            || { echo "::error::couldn't publish $version"; exit 1; }
+          echo "published $PACKAGE $version"
+      # Keep the newest beta builds; stable ones are kept.
+      - name: Remove old beta builds
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          api="${{ github.server_url }}/api/v1/packages/${{ github.repository_owner }}"
+          curl -sf -H "Authorization: token $TOKEN" "$api?type=generic&q=$PACKAGE&limit=200" \
+            | jq -r --arg p "$PACKAGE" '[.[] | select(.name == $p and (.version | test("-dev")))] | sort_by(.created_at) | reverse | .['"$KEEP_BUILDS"':] | .[].version' \
+            | while read -r v; do
+                curl -sf -X DELETE -H "Authorization: token $TOKEN" "$api/generic/$PACKAGE/${v//+/%2B}" && echo "removed $PACKAGE $v"
+              done
 
   docker:
     name: Docker image
@@ -202,6 +235,15 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: PHOTO_STAMP_VERSION=${{ steps.version.outputs.version }}
+      - name: Remove old sha- tags
+        env:
+          TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: scripts/ci-prune-images.sh photo-stamp
+      # The image is in the registry now; the local copy isn't needed.
+      - name: Remove local images
+        if: always()
+        run: |
+          for tag in $(echo "${{ steps.meta.outputs.tags }}"); do docker image rm "$tag" >/dev/null 2>&1 || true; done
 
   server:
     name: Place server image
@@ -261,36 +303,56 @@ jobs:
             docker tag "photo-stamp-server:ci-${{ github.run_id }}" "$tag"
             docker push "$tag"
           done
-      - name: Remove the test image tag
+      - name: Remove old sha- tags
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: scripts/ci-prune-images.sh photo-stamp-server
+      # Everything this job made: the test image and its pushed tags, and the curl image.
+      - name: Remove local images
         if: always()
-        run: docker rmi "photo-stamp-server:ci-${{ github.run_id }}" >/dev/null 2>&1 || true
+        run: |
+          for tag in "photo-stamp-server:ci-${{ github.run_id }}" $(echo "${{ steps.meta.outputs.tags }}") curlimages/curl:8.11.1; do
+            docker image rm "$tag" >/dev/null 2>&1 || true
+          done
 
-  cleanup:
-    name: Remove finished branches' build volumes
-    # A push to main is a merge (or a direct commit): branches whose pull request is no longer open
-    # don't need their dev.sh target volume (see DEV_SH_TARGET) any more.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  tidy:
+    name: Tidy the runner
+    # After everything else, on every run: remove leftovers of runs that didn't clean up (e.g.
+    # cancelled), and keep the shared caches bounded.
+    needs: [check, check-windows, places, windows, docker, server]
+    if: always()
     runs-on: ubuntu-24.04
     steps:
-      - name: Remove volumes of branches without an open pull request
-        env:
-          TOKEN: ${{ github.token }}
+      - uses: actions/checkout@v4
+      - name: Remove leftover per-run volumes, containers and networks
         run: |
-          # Named as dev.sh names them.
-          volume() { printf 'photo-stamp-dev-target-%s' "$(printf '%s' "$1" | tr -c 'a-zA-Z0-9_.-' '-')"; }
-          api="${{ github.server_url }}/api/v1/repos/${{ github.repository }}/pulls?state=open&limit=50"
-          # If the list of open pull requests can't be read, remove nothing.
-          prs=$(curl -sf -H "Authorization: token $TOKEN" "$api") || { echo "::warning::couldn't list open pull requests; leaving volumes alone"; exit 0; }
-          keep=$(echo "$prs" | jq -r '.[].head.ref' | while read -r ref; do volume "$ref"; echo; done)
-          for v in $(docker volume ls -q --filter name=photo-stamp-dev-target-); do
-            if echo "$keep" | grep -qxF "$v"; then
-              echo "keeping $v (open pull request)"
-            elif docker volume rm "$v" >/dev/null 2>&1; then
-              echo "removed $v"
-            else
-              echo "$v is in use; leaving it for next time"
-            fi
+          # In-use ones (another run still going) refuse to go and are left alone.
+          for v in $(docker volume ls -q --filter name=photo-stamp-dev-target-run- --filter name=ps-ci-); do
+            docker volume rm "$v" >/dev/null 2>&1 && echo "removed volume $v"
           done
+          for n in $(docker network ls -q --filter name=ps-ci-); do docker network rm "$n" >/dev/null 2>&1 || true; done
+      - name: Remove old dev images
+        run: |
+          current="photo-stamp-dev:$(sha256sum docker/Dockerfile | cut -c1-12)"
+          for img in $(docker image ls --format '{{.Repository}}:{{.Tag}}' photo-stamp-dev); do
+            [ "$img" = "$current" ] || { docker image rm "$img" >/dev/null 2>&1 && echo "removed $img"; }
+          done
+          docker image prune -f >/dev/null
+      - name: Keep the shared caches bounded
+        run: |
+          # Docker's build cache (the Windows codecs, Rust layers): at most 20 GB.
+          docker builder prune -f --keep-storage 20GB >/dev/null 2>&1 || docker builder prune -f --max-used-space 20GB >/dev/null 2>&1 || true
+          # Main's cargo target volume: start over if it passes 25 GB.
+          if docker volume inspect photo-stamp-dev-target >/dev/null 2>&1; then
+            current="photo-stamp-dev:$(sha256sum docker/Dockerfile | cut -c1-12)"
+            kb=$(docker run --rm -v photo-stamp-dev-target:/t "$current" du -sk /t 2>/dev/null | cut -f1 || echo 0)
+            echo "main's target volume: $((kb / 1048576)) GB"
+            if [ "${kb:-0}" -gt $((25 * 1048576)) ]; then
+              docker volume rm photo-stamp-dev-target >/dev/null 2>&1 && echo "removed main's target volume (over 25 GB)"
+            fi
+          fi
+          docker system df
 
   release:
     name: GitHub Release
@@ -313,9 +375,13 @@ jobs:
             echo "::error::$GITHUB_REF_NAME isn't on main; tag a commit on main to release it"
             exit 1
           fi
-      - uses: https://code.forgejo.org/forgejo/download-artifact@v4
-        with:
-          name: photo-stamp-windows-zip
+      - name: Get the published build
+        env:
+          TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          curl -sfL -H "Authorization: token $TOKEN" -o photo-stamp-windows.zip \
+            "${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/$PACKAGE/$version/photo-stamp-windows-$version.zip"
       - name: Install gh
         run: |
           curl -fsSL https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz | tar xz -C /tmp
@@ -341,3 +407,4 @@ jobs:
           } > notes.md
           gh release create "$GITHUB_REF_NAME" "$zip" --verify-tag --title "photo-stamp $GITHUB_REF_NAME" \
             --notes-file notes.md --generate-notes
+          rm -f "$zip" /usr/local/bin/gh

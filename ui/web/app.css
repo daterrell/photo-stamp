@@ -149,6 +149,14 @@ button { font: inherit; cursor: pointer; border: 0; }
 .state[data-state="stopped"]::before { background: var(--bad); }
 @keyframes pulse { 50% { box-shadow: 0 0 0 6px transparent; } }
 
+/* Update ready */
+.update-banner {
+  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+  padding: .6rem var(--gutter); background: var(--accent-soft); border-bottom: 1px solid var(--line);
+}
+.update-banner span { font-weight: 550; }
+.field select { font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: .4rem .6rem; max-width: 20rem; }
+
 /* Progress */
 .progress { padding: .6rem var(--gutter) 0; }
 .track { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
