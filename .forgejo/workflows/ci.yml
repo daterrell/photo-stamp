@@ -265,6 +265,33 @@ jobs:
         if: always()
         run: docker rmi "photo-stamp-server:ci-${{ github.run_id }}" >/dev/null 2>&1 || true
 
+  cleanup:
+    name: Remove finished branches' build volumes
+    # A push to main is a merge (or a direct commit): branches whose pull request is no longer open
+    # don't need their dev.sh target volume (see DEV_SH_TARGET) any more.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Remove volumes of branches without an open pull request
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          # Named as dev.sh names them.
+          volume() { printf 'photo-stamp-dev-target-%s' "$(printf '%s' "$1" | tr -c 'a-zA-Z0-9_.-' '-')"; }
+          api="${{ github.server_url }}/api/v1/repos/${{ github.repository }}/pulls?state=open&limit=50"
+          # If the list of open pull requests can't be read, remove nothing.
+          prs=$(curl -sf -H "Authorization: token $TOKEN" "$api") || { echo "::warning::couldn't list open pull requests; leaving volumes alone"; exit 0; }
+          keep=$(echo "$prs" | jq -r '.[].head.ref' | while read -r ref; do volume "$ref"; echo; done)
+          for v in $(docker volume ls -q --filter name=photo-stamp-dev-target-); do
+            if echo "$keep" | grep -qxF "$v"; then
+              echo "keeping $v (open pull request)"
+            elif docker volume rm "$v" >/dev/null 2>&1; then
+              echo "removed $v"
+            else
+              echo "$v is in use; leaving it for next time"
+            fi
+          done
+
   release:
     name: GitHub Release
     needs: windows
