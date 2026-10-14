@@ -17,7 +17,7 @@ use photo_stamp_proto::version::Version;
 use serde::Deserialize;
 
 /// Re-list the registry at most this often.
-const LIST_EVERY: Duration = Duration::from_secs(5 * 60);
+const LIST_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct UpdatesConfig {

@@ -25,6 +25,16 @@ fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
 }
 
+/// Don't let Windows show error dialogs for this process (e.g. "not a valid Win32 application"
+/// when starting a damaged program, which would otherwise wait for someone to click OK): the
+/// call fails instead, and we deal with it.
+pub fn no_error_dialogs() {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, SetErrorMode,
+    };
+    unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX) };
+}
+
 /// Show output in the terminal we were started from, if any. Returns whether there is one.
 pub fn attach_parent_console() -> bool {
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }

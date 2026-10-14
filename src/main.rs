@@ -329,6 +329,9 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
 
 /// Install the downloaded update and start it; if it doesn't come up, go back to this version.
 fn hand_over(updater: &Updater, key: &str, data: Option<&Path>) -> ExitCode {
+    // A damaged new version must fail to start, not wait on an error dialog nobody sees.
+    #[cfg(windows)]
+    photo_stamp::winsys::no_error_dialogs();
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let Ok(exe) = std::env::current_exe() else { return ExitCode::FAILURE };
     let install = match updater.take_install() {
