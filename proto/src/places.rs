@@ -1,6 +1,6 @@
-//! The bundled places database (built by `scripts/build-places-db.py`): towns, regions and countries
-//! from GeoNames, Wikidata "fame" (Wikipedia sitelink counts) and famous landmarks. Always available,
-//! no network, so the town/region/country line never waits on an online service.
+//! The places database (built by `scripts/build-places-db.py`): towns, regions and countries from
+//! GeoNames, Wikidata "fame" (Wikipedia sitelink counts) and famous landmarks. The server reads the
+//! full build; clients keep a small towns-only build (same schema) for previews and fallbacks.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -8,10 +8,14 @@ use std::sync::Mutex;
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use crate::geo::Name;
-use crate::metadata::GpsPoint;
+use crate::{GpsPoint, Name};
 
+/// The server's full database.
 pub const FILE_NAME: &str = "places.sqlite";
+/// The clients' small towns-only database.
+pub const TOWNS_FILE_NAME: &str = "towns.sqlite";
+/// Folder beside the client program holding its bundled files.
+pub const SUPPORT_DIR: &str = "photo-stamp-files";
 /// Like Immich: the nearest populated place within this distance names the town.
 const TOWN_RADIUS_KM: f64 = 25.0;
 const KM_PER_DEG: f64 = 111.32;
@@ -38,17 +42,17 @@ pub struct PlacesDb {
     conn: Mutex<Connection>,
 }
 
-/// Where to find the database: `PHOTO_STAMP_PLACES_DB`, then beside the program
-/// (`photo-stamp-files/places.sqlite`), then `/usr/share/photo-stamp/places.sqlite`.
-pub fn locate() -> Option<PathBuf> {
+/// Where to find `file`: the path in environment variable `env`, then beside the program
+/// (`photo-stamp-files/<file>`), then `/usr/share/photo-stamp/<file>`.
+pub fn locate(file: &str, env: &str) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(p) = std::env::var_os("PHOTO_STAMP_PLACES_DB") {
+    if let Some(p) = std::env::var_os(env) {
         candidates.push(p.into());
     }
     if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_owned)) {
-        candidates.push(dir.join(crate::outbox::SUPPORT_DIR).join(FILE_NAME));
+        candidates.push(dir.join(SUPPORT_DIR).join(file));
     }
-    candidates.push(PathBuf::from("/usr/share/photo-stamp").join(FILE_NAME));
+    candidates.push(PathBuf::from("/usr/share/photo-stamp").join(file));
     candidates.into_iter().find(|p| p.is_file())
 }
 
@@ -92,15 +96,6 @@ impl PlacesDb {
     pub fn built(&self) -> Option<String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT value FROM meta WHERE key = 'built'", [], |r| r.get(0)).ok()
-    }
-
-    /// Open the database found by [`locate`].
-    pub fn open_default() -> anyhow::Result<Self> {
-        let path = locate().context(
-            "places database not found: keep photo-stamp-files\\places.sqlite next to the program \
-             (or set PHOTO_STAMP_PLACES_DB)",
-        )?;
-        Self::open(&path)
     }
 
     /// The nearest town within 25 km, as Immich does.
@@ -248,7 +243,8 @@ pub(crate) mod tests {
 
     /// A small real-data database around the test locations (tests/fixtures/places.sqlite).
     pub fn fixture_db() -> PlacesDb {
-        PlacesDb::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/places.sqlite")).unwrap()
+        PlacesDb::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/places.sqlite"))
+            .unwrap()
     }
 
     #[test]

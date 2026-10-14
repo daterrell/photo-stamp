@@ -391,6 +391,7 @@ impl Host {
                 .header("Authorization", &auth)
                 .header("Content-Type", "application/json")
                 .send(body),
+            "DELETE" => self.agent.delete(&url).header("Authorization", &auth).call(),
             _ => self.agent.get(&url).header("Authorization", &auth).call(),
         }
     }

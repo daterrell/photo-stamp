@@ -9,11 +9,9 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use log::{error, info};
-use photo_stamp::gazetteer::Gazetteer;
 use photo_stamp::geo::Geocoder;
 use photo_stamp::outbox::{self, Outbox};
-use photo_stamp::overture::{self, Overture};
-use photo_stamp::places::PlacesDb;
+use photo_stamp::remote::RemoteGeocoder;
 use photo_stamp::render::Renderer;
 use photo_stamp::settings::{self, Settings};
 use photo_stamp::stamp::{Options, Outcome, stamp_in_place};
@@ -42,8 +40,7 @@ struct Cli {
 
 #[derive(Args)]
 struct Common {
-    /// Use only the bundled place data (towns, regions, countries, famous landmarks); don't download
-    /// venue/landmark detail from Overture Maps
+    /// Don't ask the place server: name places from this PC's towns database only
     #[arg(long, global = true, env = "PHOTO_STAMP_OFFLINE")]
     offline: bool,
 
@@ -154,13 +151,7 @@ fn main() -> ExitCode {
         }
     };
     let Some(command) = cli.command else { return here(cli.here, &cli.common) };
-    let geo: Box<dyn Geocoder> = match gazetteer(cli.common.offline) {
-        Ok(g) => Box::new(g),
-        Err(e) => {
-            tell(&format!("{e:#}"), true);
-            return ExitCode::FAILURE;
-        }
-    };
+    let geo = RemoteGeocoder::new(paths::data_dir().as_deref(), cli.common.offline);
     let quality = cli.common.quality.unwrap_or(settings::DEFAULT_QUALITY);
     console();
     let _ = logging::init(None, true);
@@ -169,7 +160,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     match command {
-        Command::Stamp { paths, dry_run } => stamp_paths(&paths, geo.as_ref(), Options { dry_run, quality }),
+        Command::Stamp { paths, dry_run } => stamp_paths(&paths, &geo, Options { dry_run, quality }),
         Command::Watch { root, settle_secs, poll_secs, no_events } => {
             let config = watch::Config {
                 settle: Duration::from_secs(settle_secs),
@@ -178,7 +169,7 @@ fn main() -> ExitCode {
                 quality,
             };
             geo.warm_up();
-            match watch::Inbox::new(&root, config, geo.as_ref()).and_then(|inbox| inbox.run()) {
+            match watch::Inbox::new(&root, config, &geo).and_then(|inbox| inbox.run()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("error: {e:#}");
@@ -187,19 +178,6 @@ fn main() -> ExitCode {
             }
         }
     }
-}
-
-/// Bundled place data, plus Overture Maps on demand unless `offline`.
-fn gazetteer(offline: bool) -> anyhow::Result<Gazetteer> {
-    let places = PlacesDb::open_default()?;
-    let overture = if offline {
-        None
-    } else {
-        let dir =
-            overture::default_dir().ok_or_else(|| anyhow::anyhow!("no folder for the Overture cache"))?;
-        Some(Overture::new(&dir)?)
-    };
-    Ok(Gazetteer::new(places, overture))
 }
 
 /// `p` made absolute against the current folder (it may be used later from elsewhere, e.g. at login).
@@ -263,15 +241,12 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
     };
     let settings = overrides.apply(settings_path.as_deref().map(Settings::load).unwrap_or_default());
     let outbox = settings.outbox.as_deref().map_or_else(|| root.join(outbox::OUTBOX_DIR), absolute);
+    let originals = settings.originals.as_deref().map_or_else(|| root.join(outbox::ORIGINALS_DIR), absolute);
 
-    let geo = match gazetteer(settings.offline) {
-        Ok(g) => g,
-        Err(e) => {
-            error!("{e:#}");
-            tell(&format!("{e:#}"), true);
-            return ExitCode::FAILURE;
-        }
-    };
+    let geo = RemoteGeocoder::new(data.as_deref(), settings.offline);
+    if geo.server().is_none() && !settings.offline {
+        info!("no place server set up (dashboard: Settings > Place server); naming places by nearest town");
+    }
     let status = Arc::new(Status::new(&root, &outbox, data.as_deref(), &key, settings));
     {
         let status = status.clone();
@@ -287,7 +262,12 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
     status.set_notifier(Box::new(|title, body| info!("{title}: {body}")));
 
     geo.warm_up();
-    let config = outbox::Config { outbox: outbox.clone(), events: true };
+    let config = outbox::Config {
+        outbox: outbox.clone(),
+        events: true,
+        originals: Some(originals),
+        waiting_file: data.as_deref().map(|d| d.join(format!("waiting-{key}.json"))),
+    };
     let watcher = match Outbox::new(&root, config, &geo, status.clone()) {
         Ok(w) => w,
         Err(e) => {
@@ -305,7 +285,8 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
     }
 
     // The dashboard's way in.
-    let registration = start_api(&status, &watcher, settings_path, &root, &outbox, &key, exe.as_deref());
+    let registration =
+        start_api(&status, &watcher, &geo, settings_path, &root, &outbox, &key, exe.as_deref());
     let result = watcher.run();
     if let (Some(mut reg), Some(data)) = (registration, data.as_deref()) {
         reg.running = false;
@@ -326,9 +307,11 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
 const DASHBOARD_URL: &str = "http://127.0.0.1:8765/";
 
 /// Start the local API and record how to reach it, for the dashboard.
+#[allow(clippy::too_many_arguments)]
 fn start_api(
     status: &Arc<Status>,
     watcher: &Outbox,
+    geo: &Arc<RemoteGeocoder>,
     settings_path: Option<PathBuf>,
     root: &Path,
     outbox: &Path,
@@ -343,6 +326,7 @@ fn start_api(
             waker: Mutex::new(watcher.waker()),
             token: token.clone(),
             settings_path,
+            geo: Some(geo.clone()),
         }))?;
         let reg = Registration {
             key: key.to_owned(),

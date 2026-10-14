@@ -66,7 +66,10 @@
         </figcaption>
       </figure>
       <aside class="queue">
-        <h2>Waiting <span class="count" id="queue-count"></span></h2>
+        <div class="queue-head">
+          <h2>Waiting <span class="count" id="queue-count"></span></h2>
+          <button class="ghost small" id="stamp-all" hidden title="Stop waiting for the place server and stamp every waiting photo with what this PC knows">Stamp all now</button>
+        </div>
         <ul id="queue-list"></ul>
         <p class="quiet" id="queue-empty">Nothing waiting.</p>
       </aside>
@@ -91,7 +94,7 @@
 
   <section class="panel" id="tab-exceptions" data-panel="exceptions" hidden>
     <p class="lede">Photos moved to the outbox without a stamp, and photos that couldn't be processed. Ones that couldn't be processed stay where they were dropped.</p>
-    <div id="exceptions"></div>
+    <div id="exceptions-list"></div>
     <p class="quiet" id="exceptions-empty">Every photo so far has been stamped.</p>
   </section>
 
@@ -106,11 +109,44 @@
   </section>
 
   <section class="panel" id="tab-settings" data-panel="settings" hidden>
-    <form class="settings" id="settings">
+    <form class="settings" id="server-form">
+      <h2>Place server</h2>
+      <p class="quiet" id="server-intro">Your family's place server names where photos were taken. Without one, photos are named by the nearest town.</p>
+      <label class="field">
+        <span>Address</span>
+        <input type="url" id="srv-url" placeholder="https://places.example.com" spellcheck="false" autocomplete="off">
+      </label>
+      <label class="field">
+        <span>Device key</span>
+        <input type="password" id="srv-key" placeholder="psk_…" spellcheck="false" autocomplete="off">
+        <small id="srv-key-hint">From <code>photo-stamp-server device add &lt;person&gt; &lt;device&gt;</code> on the server.</small>
+      </label>
+      <div class="form-actions">
+        <button class="primary" type="submit" id="srv-save">Connect</button>
+        <button class="ghost" type="button" id="srv-remove" hidden>Disconnect</button>
+        <span class="quiet" id="srv-status" role="status"></span>
+      </div>
+      <div class="server-prefs" id="srv-prefs" hidden>
+        <label class="check"><input type="checkbox" id="srv-history"> <span>Keep a history of where this device's photos were taken <small>(on the server, for trips and the map)</small></span></label>
+        <label class="field">
+          <span>When the place server can't be reached</span>
+          <span class="with-unit">wait up to <input type="number" id="srv-wait" min="0" max="8760"> hours, then stamp with what this PC knows</span>
+          <small>Waiting photos can also be stamped right away from the Activity tab.</small>
+        </label>
+      </div>
+    </form>
+
+    <form class="settings" id="settings-form">
+      <h2>Photos</h2>
       <label class="field">
         <span>Outbox</span>
         <input type="text" name="outbox" id="set-outbox" spellcheck="false">
         <small id="set-outbox-hint">Leave empty to use the outbox folder inside the watched folder. Changing it restarts photo-stamp.</small>
+      </label>
+      <label class="field">
+        <span>Originals</span>
+        <input type="text" name="originals" id="set-originals" spellcheck="false">
+        <small>Where the original of each stamped photo is kept, so it can be stamped again. Leave empty to use the originals folder inside the watched folder.</small>
       </label>
       <label class="field">
         <span>Quality <output id="set-quality-out"></output></span>
@@ -130,7 +166,7 @@
         </label>
       </div>
       <label class="check"><input type="checkbox" name="notify" id="set-notify"> Notify me when a batch is done</label>
-      <label class="check"><input type="checkbox" name="offline" id="set-offline"> <span>Offline: use only the bundled place data <small>(towns and famous landmarks, no venues like golf courses or parks; restarts photo-stamp)</small></span></label>
+      <label class="check"><input type="checkbox" name="offline" id="set-offline"> <span>Don't use the place server <small>(name places by the nearest town only; restarts photo-stamp)</small></span></label>
       <label class="check" id="set-startup-row"><input type="checkbox" id="set-startup"> Start photo-stamp when I log in to Windows</label>
       <div class="form-actions">
         <button class="primary" type="submit" id="set-save">Save settings</button>

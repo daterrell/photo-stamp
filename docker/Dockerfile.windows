@@ -43,6 +43,8 @@ COPY assets assets
 COPY src src
 COPY tests tests
 COPY http http
+COPY proto proto
+COPY server server
 COPY ui ui
 # Link everything (libheif, codecs, libstdc++, libgcc, winpthread) statically into the exe. The
 # codecs' pkg-config files ask for -lstdc++/-lgcc_s by name, and the linker would pick the DLL

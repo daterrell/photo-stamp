@@ -27,11 +27,7 @@ pub struct PhotoInfo {
     pub already_stamped: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct GpsPoint {
-    pub lat: f64,
-    pub lon: f64,
-}
+pub use photo_stamp_proto::GpsPoint;
 
 impl PhotoInfo {
     /// True when there is nothing worth burning in.

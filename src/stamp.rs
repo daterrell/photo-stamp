@@ -8,7 +8,7 @@ use anyhow::Context;
 use image::DynamicImage;
 
 use crate::formats::{self, Kind};
-use crate::geo::{Geocoder, format_coords};
+use crate::geo::{Geocoder, GpsPoint, format_coords};
 use crate::localtime;
 use crate::metadata::{self, PhotoInfo};
 use crate::render::{Line, Renderer};
@@ -45,14 +45,18 @@ pub enum Prepared {
     Stamp(Job),
 }
 
-/// The place lookup failed (e.g. no network). Callers that can wait may retry later rather
-/// than settle for coordinates.
+/// The place lookup failed (e.g. the place server can't be reached). Callers that can wait may
+/// retry later rather than settle for less.
 #[derive(Debug)]
-pub struct GeoUnavailable(pub anyhow::Error);
+pub struct GeoUnavailable {
+    pub error: anyhow::Error,
+    /// Where the photo was taken.
+    pub at: GpsPoint,
+}
 
 impl fmt::Display for GeoUnavailable {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "place lookup failed: {:#}", self.0)
+        write!(f, "place lookup failed: {:#}", self.error)
     }
 }
 
@@ -60,21 +64,28 @@ impl std::error::Error for GeoUnavailable {}
 
 /// Place lines (if GPS) then the time line (if any), top line first.
 /// With `strict_geo`, a failed or partial lookup is an error ([`GeoUnavailable`]) rather than
-/// settling for coordinates or a less specific name.
+/// settling for what's known locally (a remembered answer or the nearest town), or coordinates.
 pub fn caption_lines(info: &PhotoInfo, geo: &dyn Geocoder, strict_geo: bool) -> anyhow::Result<Vec<String>> {
     let place: Vec<String> = match info.gps {
         None => Vec::new(),
         Some(at) => match geo.place(at) {
             Ok(Some(place)) if strict_geo && !place.complete => {
-                return Err(GeoUnavailable(anyhow::anyhow!("venue/landmark lookup incomplete")).into());
+                let error = anyhow::anyhow!("venue/landmark lookup incomplete");
+                return Err(GeoUnavailable { error, at }.into());
             }
             Ok(Some(place)) => place.lines(),
             Ok(None) => vec![format_coords(at)],
-            Err(e) if strict_geo => return Err(GeoUnavailable(e).into()),
-            Err(e) => {
-                log::warn!("place lookup failed, using coordinates: {e:#}");
-                vec![format_coords(at)]
-            }
+            Err(e) if strict_geo => return Err(GeoUnavailable { error: e, at }.into()),
+            Err(e) => match geo.local_place(at) {
+                Some(place) => {
+                    log::info!("place lookup failed ({e:#}); using what's known on this PC");
+                    place.lines()
+                }
+                None => {
+                    log::warn!("place lookup failed, using coordinates: {e:#}");
+                    vec![format_coords(at)]
+                }
+            },
         },
     };
     let tz = info.gps.and_then(localtime::timezone_at);
@@ -214,7 +225,6 @@ pub fn stamp_in_place(
 pub(crate) mod tests {
     use super::*;
     use crate::geo::{NoGeocoder, Place};
-    use crate::metadata::GpsPoint;
     use image::{ImageFormat, Rgb, RgbImage};
     use std::process::Command;
 
@@ -239,6 +249,25 @@ pub(crate) mod tests {
     impl Geocoder for PartialPlace {
         fn place(&self, _: GpsPoint) -> anyhow::Result<Option<Place>> {
             Ok(Some(Place { primary: "Gros-Caillou".into(), ..eiffel(false) }))
+        }
+    }
+
+    /// The place server can't be reached, but this PC knows the town.
+    pub struct OfflineWithTown;
+    impl Geocoder for OfflineWithTown {
+        fn place(&self, _: GpsPoint) -> anyhow::Result<Option<Place>> {
+            anyhow::bail!("server unreachable")
+        }
+        fn local_place(&self, _: GpsPoint) -> Option<Place> {
+            Some(Place {
+                primary: "Paris".into(),
+                near: None,
+                context: Some("France".into()),
+                complete: true,
+            })
+        }
+        fn nearby_town(&self, _: GpsPoint) -> Option<String> {
+            Some("Paris".into())
         }
     }
 
@@ -393,6 +422,12 @@ pub(crate) mod tests {
         }
         let err = caption_lines(&info, &FailingGeocoder, true).unwrap_err();
         assert!(err.downcast_ref::<GeoUnavailable>().is_some());
+
+        // Not waiting any longer: what this PC knows beats coordinates.
+        let lines = caption_lines(&info, &OfflineWithTown, false).unwrap();
+        assert_eq!(lines, ["Paris", "France", "Wed 12 Jun 2024, 14:32 CEST"]);
+        let err = caption_lines(&info, &OfflineWithTown, true).unwrap_err();
+        assert_eq!(err.downcast_ref::<GeoUnavailable>().unwrap().at, info.gps.unwrap());
 
         // A partial answer is good enough when we can't wait, but not when we can.
         let lines = caption_lines(&info, &PartialPlace, false).unwrap();
