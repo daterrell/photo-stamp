@@ -11,8 +11,11 @@ Burns **where** and **when** a photo was taken into its bottom-left corner, usin
 - **Docker:** `docker pull forgejo.terrell.ltd/dave/photo-stamp:latest` (or `:main` for the newest build). It's a
   private package, so log in first with `docker login forgejo.terrell.ltd`.
 
-To release, bump `version` in `Cargo.toml`, then tag and push the tag (`git tag v0.4.0 && git push origin v0.4.0`).
-CI builds and attaches the Windows zip, and publishes the Docker image.
+**Versions come from tags**, not `Cargo.toml`: a build of tag `v0.7.0` is `0.7.0`, and anything in between is
+like `0.7.1-dev.3+g1b37dbe` (`scripts/version.sh`; baked into every program, shown by `--version` and the
+dashboard). To release, tag a commit on `main` and push the tag: `git tag v0.7.0 && git push origin v0.7.0`.
+CI builds it like any other commit, then publishes it: a GitHub Release with the Windows zip, and the `:0.7.0`
+and `:latest` images.
 
 ```
 Pebble Beach Golf Course

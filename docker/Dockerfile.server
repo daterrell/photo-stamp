@@ -11,6 +11,9 @@ COPY http http
 COPY proto proto
 COPY server server
 COPY ui ui
+# The version (from the git tag), passed in by CI: Docker builds can't see .git.
+ARG PHOTO_STAMP_VERSION=0.0.0-dev
+ENV PHOTO_STAMP_VERSION=$PHOTO_STAMP_VERSION
 RUN cargo build --release --locked -p photo-stamp-server
 
 FROM debian:trixie-slim

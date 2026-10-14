@@ -58,6 +58,9 @@ ENV SYSTEM_DEPS_LIBHEIF_LINK=static \
     CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++-posix \
     CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc-posix \
     RUSTFLAGS="-L native=/opt/staticlibs -C link-arg=-static -C link-arg=-static-libgcc -C link-arg=-static-libstdc++"
+# The version (from the git tag), passed in by CI: Docker builds can't see .git.
+ARG PHOTO_STAMP_VERSION=0.0.0-dev
+ENV PHOTO_STAMP_VERSION=$PHOTO_STAMP_VERSION
 RUN cargo build --release --locked --workspace --target x86_64-pc-windows-gnu
 
 # Just the exes, for `docker buildx build --target exe --output type=local,dest=…` (used by CI).

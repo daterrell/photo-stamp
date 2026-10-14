@@ -26,7 +26,7 @@ use photo_stamp_http::registry::Registration;
 /// WebP, TIFF, HEIC/HEIF/AVIF and camera RAW (moved with a stamped JPEG beside it). Photos without
 /// date/location metadata, or already stamped, are moved unchanged.
 #[derive(Parser)]
-#[command(version, args_conflicts_with_subcommands = true)]
+#[command(version = photo_stamp_http::VERSION, args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -336,7 +336,7 @@ fn start_api(
             pid: std::process::id(),
             port: Some(port),
             token,
-            version: env!("CARGO_PKG_VERSION").to_owned(),
+            version: photo_stamp_http::VERSION.to_owned(),
             started: photo_stamp::status::now_ms(),
             running: true,
         };

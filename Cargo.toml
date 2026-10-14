@@ -3,7 +3,8 @@ members = ["http", "proto", "server", "ui"]
 
 [package]
 name = "photo-stamp"
-version = "0.7.0"
+# Not the real version: that comes from the git tag (scripts/version.sh).
+version = "0.0.0"
 edition = "2024"
 description = "Burn when/where a photo was taken into the image, using its EXIF data"
 license = "MIT"

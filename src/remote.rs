@@ -132,7 +132,7 @@ impl RemoteGeocoder {
                 .http_status_as_error(false)
                 .timeout_connect(Some(Duration::from_secs(5)))
                 .timeout_global(Some(Duration::from_secs(30)))
-                .user_agent(concat!("photo-stamp/", env!("CARGO_PKG_VERSION")))
+                .user_agent(format!("photo-stamp/{}", photo_stamp_http::VERSION))
                 .build()
                 .into(),
             answers,

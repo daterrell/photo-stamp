@@ -31,7 +31,8 @@ if [ -n "${PHOTO_STAMP_EXE:-}" ]; then
   cp "$(dirname "$PHOTO_STAMP_EXE")/photo-stamp-ui.exe" "$DIST/photo-stamp-ui.exe"
 else
   echo "building photo-stamp.exe and photo-stamp-ui.exe…"
-  docker build -q --target build -t photo-stamp-win-build -f docker/Dockerfile.windows . >/dev/null
+  docker build -q --target build -t photo-stamp-win-build -f docker/Dockerfile.windows \
+    --build-arg PHOTO_STAMP_VERSION="$(scripts/version.sh)" . >/dev/null
   container=$(docker create photo-stamp-win-build)
   trap 'docker rm -f "$container" >/dev/null' EXIT
   for exe in photo-stamp.exe photo-stamp-ui.exe; do

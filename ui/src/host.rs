@@ -213,7 +213,7 @@ impl Host {
                 }
             }
             ("GET", ["api", "ping"]) => {
-                Response::json(200, &json!({ "app": "photo-stamp-ui", "version": env!("CARGO_PKG_VERSION") }))
+                Response::json(200, &json!({ "app": "photo-stamp-ui", "version": photo_stamp_http::VERSION }))
             }
             ("POST", ["api", "quit"]) => {
                 self.quit.store(true, Ordering::Relaxed);
@@ -286,7 +286,7 @@ impl Host {
         json!({
             "services": services,
             "here": here.map(|(dir, _)| dir),
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": photo_stamp_http::VERSION,
         })
     }
 
