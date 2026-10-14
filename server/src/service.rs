@@ -76,11 +76,22 @@ fn mtime(p: &Path) -> Option<SystemTime> {
 
 pub struct Service {
     pub store: Store,
-    data: RwLock<Arc<Data>>,
+    /// `None` until the first import has produced place data.
+    data: RwLock<Option<Arc<Data>>>,
     layout: Layout,
     offline: bool,
     /// Client updates (`None`: not set up on this server).
     updates: Option<Updates>,
+}
+
+/// While there's no place data, check for it this often.
+const WAITING_CHECK_EVERY: Duration = Duration::from_secs(10);
+
+/// Lookups before the first import has produced place data. Clients treat it like an unreachable
+/// server: photos wait.
+fn still_loading() -> Response {
+    Response::error(503, "the place data is still loading (the first import takes a while); try again later")
+        .with_header("Retry-After", "60")
 }
 
 fn bearer(req: &Request) -> Option<&str> {
@@ -88,41 +99,59 @@ fn bearer(req: &Request) -> Option<&str> {
 }
 
 impl Service {
-    pub fn new(store: Store, data: Data, layout: Layout, offline: bool, updates: Option<Updates>) -> Self {
-        Self { store, data: RwLock::new(Arc::new(data)), layout, offline, updates }
+    /// `data`: `None` while there's no place data yet (a new server before its first import): the
+    /// server answers anyway, with 503 for lookups, and picks the data up when it appears.
+    pub fn new(
+        store: Store,
+        data: Option<Data>,
+        layout: Layout,
+        offline: bool,
+        updates: Option<Updates>,
+    ) -> Self {
+        Self { store, data: RwLock::new(data.map(Arc::new)), layout, offline, updates }
     }
 
-    pub fn data(&self) -> Arc<Data> {
+    /// The place data, if it's loaded.
+    pub fn data(&self) -> Option<Arc<Data>> {
         self.data.read().unwrap().clone()
     }
 
-    /// Load a new `places.sqlite` if one has been put in place since; returns whether it did.
+    /// Load `places.sqlite` if it's appeared or changed since; returns whether it did.
     pub fn reload_if_changed(&self) -> bool {
         let current = self.data();
         let now = mtime(&self.layout.places());
-        if now.is_none() || now == current.places_mtime {
+        if now.is_none() || current.as_ref().is_some_and(|c| now == c.places_mtime) {
             return false;
         }
         match Data::load(&self.layout, self.offline) {
             Ok(d) => {
                 d.gazetteer.warm_up();
-                log::info!("loaded new place data ({})", d.data_version());
-                *self.data.write().unwrap() = Arc::new(d);
+                match current {
+                    Some(_) => log::info!("loaded new place data ({})", d.data_version()),
+                    None => log::info!("place data loaded ({}); answering lookups", d.data_version()),
+                }
+                *self.data.write().unwrap() = Some(Arc::new(d));
                 true
             }
-            Err(e) => {
+            Err(e) if current.is_some() => {
                 log::warn!("couldn't load the new place data, keeping the old: {e:#}");
+                false
+            }
+            Err(e) => {
+                log::warn!("couldn't load the place data yet: {e:#}");
                 false
             }
         }
     }
 
-    /// Check for new place data every `every`, in the background.
+    /// Check for new place data in the background: every `every`, or every few seconds while
+    /// there's none yet.
     pub fn watch_for_new_data(self: &Arc<Self>, every: Duration) {
         let me = self.clone();
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(every);
+                let wait = if me.data().is_some() { every } else { WAITING_CHECK_EVERY };
+                std::thread::sleep(wait);
                 me.reload_if_changed();
             }
         });
@@ -153,16 +182,23 @@ impl Service {
             history: caller.history,
             max_wait_hours: caller.max_wait_hours,
             rev: caller.rev,
-            data_version: data.data_version(),
+            data_version: data.as_ref().map_or_else(|| "loading".into(), |d| d.data_version()),
             server_version: photo_stamp_http::VERSION.into(),
-            places_built: data.gazetteer.places_built(),
-            overture_release: data.gazetteer.overture_health().and_then(|o| o.release),
+            places_built: data.as_ref().and_then(|d| d.gazetteer.places_built()),
+            overture_release: data.and_then(|d| d.gazetteer.overture_health()).and_then(|o| o.release),
         }
     }
 
     pub fn handle(&self, req: Request) -> Response {
         if req.method == "GET" && req.path == "/healthz" {
-            return Response::new(200, "text/plain", "ok");
+            return match self.data() {
+                Some(_) => Response::new(200, "text/plain", "ok"),
+                None => Response::new(
+                    503,
+                    "text/plain",
+                    "loading: waiting for the first import to build the place data",
+                ),
+            };
         }
         let caller = match bearer(&req).map(|k| self.store.authenticate(k)) {
             Some(Ok(Some(c))) => c,
@@ -177,7 +213,7 @@ impl Service {
                 let Ok(body) = req.json::<PlaceRequest>() else {
                     return Response::error(400, "expected {\"lat\": …, \"lon\": …}");
                 };
-                let data = self.data();
+                let Some(data) = self.data() else { return still_loading() };
                 match self.lookup(&data, &body, &caller) {
                     Ok(reply) => {
                         self.remember(&caller, &[body.at()]);
@@ -193,7 +229,7 @@ impl Service {
                 if body.points.len() > MAX_BATCH {
                     return Response::error(400, &format!("at most {MAX_BATCH} points at a time"));
                 }
-                let data = self.data();
+                let Some(data) = self.data() else { return still_loading() };
                 let mut replies = Vec::with_capacity(body.points.len());
                 for p in &body.points {
                     match self.lookup(&data, p, &caller) {
@@ -264,6 +300,7 @@ impl Service {
             }
             ("GET", "/v1/towns.sqlite") => match std::fs::read(self.layout.towns()) {
                 Ok(bytes) => Response::new(200, "application/vnd.sqlite3", bytes),
+                Err(_) if self.data().is_none() => still_loading(),
                 Err(_) => Response::error(404, "no towns database yet; run photo-stamp-server import"),
             },
             (_, p) if p.starts_with("/v1/") => Response::error(404, "no such endpoint"),
@@ -305,7 +342,7 @@ mod tests {
         let key = store.add_device("Dave", "laptop", true).unwrap();
         // Bundled data only (no Overture) keeps the tests offline.
         let data = Data::load(&layout, true).unwrap();
-        (Service::new(store, data, layout, true, None), key)
+        (Service::new(store, Some(data), layout, true, None), key)
     }
 
     fn req(method: &str, path: &str, key: Option<&str>, body: &str) -> Request {
@@ -346,6 +383,39 @@ mod tests {
         assert_eq!(svc.handle(req("POST", "/v1/place", Some(&key), r#"{"lat":95,"lon":0}"#)).status, 400);
         let caller = svc.store.authenticate(&key).unwrap().unwrap();
         assert_eq!(svc.store.point_count(caller.user_id).unwrap(), 1, "history is on for this device");
+    }
+
+    #[test]
+    fn answers_while_loading_then_picks_the_data_up() {
+        let layout = layout();
+        let places = layout.places();
+        let saved = places.with_extension("later");
+        std::fs::rename(&places, &saved).unwrap();
+        let store = Store::in_memory().unwrap();
+        store.add_user("Dave").unwrap();
+        let key = store.add_device("Dave", "laptop", true).unwrap();
+        let svc = Service::new(store, None, layout.clone(), true, None);
+
+        // Up, and honest about it.
+        let r = svc.handle(req("GET", "/healthz", None, ""));
+        assert_eq!(r.status, 503);
+        let r = svc.handle(req("POST", "/v1/place", Some(&key), r#"{"lat":48.8556,"lon":2.2986}"#));
+        assert_eq!(r.status, 503);
+        assert!(r.headers.iter().any(|(n, v)| n == "Retry-After" && v == "60"));
+        assert!(json(r)["error"].as_str().unwrap().contains("still loading"));
+        assert_eq!(svc.handle(req("GET", "/v1/towns.sqlite", Some(&key), "")).status, 503);
+        // Who you are still works (the dashboard can connect and say why).
+        let me = json(svc.handle(req("GET", "/v1/me", Some(&key), "")));
+        assert_eq!((me["user"].as_str(), me["data_version"].as_str()), (Some("Dave"), Some("loading")));
+        assert_eq!(svc.handle(req("POST", "/v1/place", None, "{}")).status, 401, "keys are still checked");
+
+        // The import finishes: picked up without a restart.
+        assert!(!svc.reload_if_changed(), "nothing there yet");
+        std::fs::rename(&saved, &places).unwrap();
+        assert!(svc.reload_if_changed());
+        assert_eq!(svc.handle(req("GET", "/healthz", None, "")).status, 200);
+        let r = svc.handle(req("POST", "/v1/place", Some(&key), r#"{"lat":48.8556,"lon":2.2986}"#));
+        assert_eq!(r.status, 200);
     }
 
     #[test]

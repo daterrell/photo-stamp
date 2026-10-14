@@ -127,15 +127,18 @@ fn run(command: Command, layout: &Layout) -> anyhow::Result<()> {
     let store = || Store::open(&layout.app_db());
     match command {
         Command::Serve { listen, offline } => {
-            // A new server has no place data until its first import finishes.
-            if !layout.places().is_file() {
-                log::info!("waiting for place data: run `photo-stamp-server import` (the compose file does)");
-                while !layout.places().is_file() {
-                    std::thread::sleep(Duration::from_secs(30));
-                }
-            }
-            let data = Data::load(layout, offline)?;
-            data.gazetteer.warm_up();
+            // A new server has no place data until its first import finishes: it answers anyway
+            // (503 for lookups, which clients wait out) and picks the data up when it appears.
+            let data = if layout.places().is_file() {
+                let data = Data::load(layout, offline)?;
+                data.gazetteer.warm_up();
+                Some(data)
+            } else {
+                log::info!(
+                    "no place data yet: answering 503 until `photo-stamp-server import` (the compose file runs it) has built it"
+                );
+                None
+            };
             let updates = UpdatesConfig::from_env().map(Updates::new);
             match &updates {
                 Some(_) => log::info!("client updates: relaying builds from the package registry"),
@@ -148,7 +151,7 @@ fn run(command: Command, layout: &Layout) -> anyhow::Result<()> {
                 "photo-stamp-server {} listening on {listen} (data in {}, {})",
                 photo_stamp_http::VERSION,
                 layout.root.display(),
-                service.data().data_version()
+                service.data().map_or_else(|| "place data loading".into(), |d| d.data_version())
             );
             photo_stamp_http::serve(listener, Arc::new(move |req| service.handle(req)));
             Ok(())
