@@ -258,6 +258,8 @@ function connect() {
 async function refresh() {
   try {
     const snap = await api(svc("status"));
+    // Several photos can be in progress; older versions only report one.
+    snap.working = snap.working || (snap.current ? [snap.current] : []);
     state.snap = snap;
     state.results = snap.recent.map(norm);
     state.oldestLoaded = state.results.length ? state.results[state.results.length - 1].id : null;
@@ -270,6 +272,12 @@ async function refresh() {
   }
 }
 
+// The newest photo in progress is the one the "now" panel shows.
+function setWorking(s, working) {
+  s.working = working;
+  s.current = working.length ? working[working.length - 1] : null;
+}
+
 function apply(ev) {
   const s = state.snap;
   switch (ev.type) {
@@ -279,32 +287,33 @@ function apply(ev) {
       renderQueue();
       break;
     case "started":
-      s.current = ev.current;
+      setWorking(s, s.working.filter((c) => c.id !== ev.current.id).concat([ev.current]));
       setProgress(ev.progress);
       s.queue = s.queue.filter((q) => q.path !== ev.current.path);
       renderQueue();
       renderNow();
       break;
     case "stage":
-      if (s.current && s.current.id === ev.id) s.current = ev.current;
+      setWorking(s, s.working.map((c) => (c.id === ev.id ? { ...c, ...ev.current } : c)));
       renderNow();
       break;
     case "preview":
-      if (s.current && s.current.id === ev.id) {
-        if (ev.which === "before") s.current.preview = true;
-        if (ev.which === "after") s.current.stamped = true;
+      for (const c of s.working) {
+        if (c.id !== ev.id) continue;
+        if (ev.which === "before") c.preview = true;
+        if (ev.which === "after") c.stamped = true;
       }
       renderNow();
       break;
     case "deferred":
-      s.current = null;
+      setWorking(s, s.working.filter((c) => c.id !== ev.id));
       s.queue = s.queue.filter((q) => q.path !== ev.queued.path).concat([ev.queued]);
       setProgress(ev.progress);
       renderQueue();
       renderNow();
       break;
     case "done":
-      s.current = null;
+      setWorking(s, s.working.filter((c) => c.id !== ev.entry.id));
       s.session = ev.session;
       s.batch = ev.batch;
       setProgress(ev.progress);
@@ -357,9 +366,9 @@ function setState(kind, text) {
 function renderState() {
   const s = state.snap;
   if (!s) return;
-  const busy = !!s.current;
-  if (s.paused) setState("paused", "Paused");
-  else if (busy) setState("working", "Stamping");
+  const busy = s.working.length;
+  if (s.paused) setState("paused", busy ? `Pausing (finishing ${busy})` : "Paused");
+  else if (busy) setState("working", busy > 1 ? `Stamping ${busy} at once` : "Stamping");
   else setState("running", "Watching");
   $("btn-pause").hidden = s.paused;
   $("btn-resume").hidden = !s.paused;
@@ -406,7 +415,8 @@ function renderNow() {
   renderState();
   if (cur) {
     now.dataset.busy = "";
-    $("now-path").textContent = cur.path;
+    const more = s.working.length - 1;
+    $("now-path").textContent = more > 0 ? `${cur.path} (and ${more} more in progress)` : cur.path;
     $("now-placeholder").hidden = cur.preview;
     $("now-placeholder").textContent = "Reading the photo";
     const which = cur.stamped ? "after" : "before";
@@ -729,6 +739,7 @@ function renderSettings() {
   $("set-quality-out").textContent = st.quality;
   $("set-settle").value = st.settle_secs;
   $("set-poll").value = st.poll_secs;
+  $("set-workers").value = st.workers ?? 0;
   $("set-notify").checked = st.notify;
   $("set-offline").checked = st.offline;
 }
@@ -752,6 +763,7 @@ $("settings-form").addEventListener("submit", async (e) => {
     quality: Number($("set-quality").value),
     settle_secs: Number($("set-settle").value),
     poll_secs: Number($("set-poll").value),
+    workers: Number($("set-workers").value),
     notify: $("set-notify").checked,
     offline: $("set-offline").checked,
   };
@@ -948,7 +960,7 @@ $("btn-resume").onclick = () => api(svc("resume"), { method: "POST", body: {} })
 $("btn-start").onclick = () => (state.key ? startService() : startHere());
 $("btn-stop").onclick = async () => {
   const busy = state.snap && state.snap.current;
-  const note = busy ? " It finishes the photo it's working on first." : "";
+  const note = busy ? " It finishes the photos it's working on first." : "";
   if (!confirm(`Stop photo-stamp? Photos dropped into the folder won't be stamped until it's started again.${note}`)) return;
   setState("loading", "Stopping");
   try {

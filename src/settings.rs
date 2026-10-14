@@ -6,6 +6,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_QUALITY: u8 = 92;
+pub const MAX_WORKERS: usize = 16;
+
+/// Each photo in hand takes a core while it's drawn and a few hundred MB while it's decoded, and
+/// a request at the place server: half the cores keeps the PC usable, at most 6 keeps memory and
+/// the server's load modest.
+fn auto_workers(cores: usize) -> usize {
+    (cores / 2).clamp(2, 6)
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -27,6 +35,8 @@ pub struct Settings {
     pub notify: bool,
     /// Notice new photos but don't process them.
     pub paused: bool,
+    /// How many photos to stamp at a time; 0 picks a number from this PC's cores.
+    pub workers: usize,
 }
 
 impl Default for Settings {
@@ -40,6 +50,7 @@ impl Default for Settings {
             offline: false,
             notify: true,
             paused: false,
+            workers: 0,
         }
     }
 }
@@ -74,8 +85,17 @@ impl Settings {
         self.quality = self.quality.clamp(1, 100);
         self.settle_secs = self.settle_secs.min(3600);
         self.poll_secs = self.poll_secs.clamp(1, 3600);
+        self.workers = self.workers.min(MAX_WORKERS);
         self.outbox = self.outbox.filter(|p| !p.as_os_str().is_empty());
         self
+    }
+
+    /// How many photos to stamp at a time: the setting, or for 0 half the cores (2 to 6).
+    pub fn worker_count(&self) -> usize {
+        match self.workers {
+            0 => auto_workers(std::thread::available_parallelism().map_or(4, |n| n.get())),
+            n => n,
+        }
     }
 
     /// Whether going from `self` to `new` needs the service restarted to take effect.
@@ -136,6 +156,17 @@ mod tests {
         let s = Overrides::default().apply(Settings::load(&path));
         assert_eq!((s.quality, s.poll_secs), (1, 30));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn worker_count_is_automatic_or_set() {
+        assert_eq!(auto_workers(1), 2);
+        assert_eq!(auto_workers(8), 4);
+        assert_eq!(auto_workers(24), 6);
+        let s = Settings { workers: 3, ..Settings::default() };
+        assert_eq!(s.worker_count(), 3);
+        assert!((2..=6).contains(&Settings::default().worker_count()));
+        assert_eq!(Settings { workers: 99, ..Settings::default() }.sanitized().workers, MAX_WORKERS);
     }
 
     #[test]

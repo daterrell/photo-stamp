@@ -15,12 +15,17 @@
 //!
 //! As in the inbox watcher, filesystem events give instant pickup and polling is the backup; a
 //! file is only processed once it has stopped changing.
+//!
+//! Several photos are stamped at a time (the `workers` setting): each worker takes a photo through
+//! the whole way (metadata, place lookup, drawing, saving, moving), while the watcher hands out
+//! photos and keeps the books on one thread.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{FileTimes, Metadata};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
@@ -86,6 +91,67 @@ struct Delivered {
     /// Where the original was kept.
     original: Option<PathBuf>,
     gps: Option<GpsPoint>,
+    /// Reading the metadata and looking the place up.
+    lookup: Duration,
+}
+
+/// A photo handed to a worker.
+struct Job {
+    path: PathBuf,
+    id: u64,
+    strict_geo: bool,
+}
+
+/// A worker's answer for a [`Job`].
+struct Done {
+    job: Job,
+    result: anyhow::Result<Delivered>,
+    took: Duration,
+}
+
+/// What the workers share: everything a photo needs on its way to the outbox.
+struct Ctx<'a> {
+    root: PathBuf,
+    config: Config,
+    geo: &'a (dyn Geocoder + Sync),
+    status: Arc<Status>,
+    /// Names in the outbox and originals chosen by photos in hand but maybe not written yet, so
+    /// two workers can't pick the same one.
+    claimed: Mutex<HashSet<PathBuf>>,
+}
+
+/// The names one photo has claimed (see [`Ctx::claimed`]); given back when dropped.
+struct Claims<'c> {
+    all: &'c Mutex<HashSet<PathBuf>>,
+    mine: Vec<PathBuf>,
+}
+
+impl Claims<'_> {
+    /// A free name in `dir` (see [`free_name`]) that no other photo in hand has chosen either.
+    fn free_name(&mut self, dir: &Path, name: &std::ffi::OsStr, companion: Option<&str>) -> PathBuf {
+        let mut all = self.all.lock().unwrap();
+        let path = free_name_where(dir, name, companion, |p| all.contains(p));
+        let mut claim = vec![path.clone()];
+        if let Some(c) = companion {
+            let mut n = path.as_os_str().to_owned();
+            n.push(c);
+            claim.push(n.into());
+        }
+        for c in claim {
+            all.insert(c.clone());
+            self.mine.push(c);
+        }
+        path
+    }
+}
+
+impl Drop for Claims<'_> {
+    fn drop(&mut self) {
+        let mut all = self.all.lock().unwrap_or_else(|e| e.into_inner());
+        for p in &self.mine {
+            all.remove(p);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -117,8 +183,9 @@ struct Deferred {
 pub struct Outbox<'a> {
     root: PathBuf,
     config: Config,
-    geo: &'a dyn Geocoder,
-    renderer: Renderer,
+    geo: &'a (dyn Geocoder + Sync),
+    /// One per worker, kept between batches (each holds the loaded fonts).
+    renderers: Vec<Renderer>,
     pending: HashMap<PathBuf, Pending>,
     /// Files that couldn't be moved (e.g. undecodable), as we last saw them; retried if they change.
     settled: HashMap<PathBuf, Fingerprint>,
@@ -138,7 +205,7 @@ impl<'a> Outbox<'a> {
     pub fn new(
         root: &Path,
         config: Config,
-        geo: &'a dyn Geocoder,
+        geo: &'a (dyn Geocoder + Sync),
         status: Arc<Status>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(root.is_dir(), "{} is not a folder", root.display());
@@ -158,7 +225,7 @@ impl<'a> Outbox<'a> {
             root: root.to_owned(),
             config,
             geo,
-            renderer: Renderer::new(),
+            renderers: Vec::new(),
             pending: HashMap::new(),
             settled: HashMap::new(),
             deferred: HashMap::new(),
@@ -368,16 +435,95 @@ impl<'a> Outbox<'a> {
             .map(|(p, _)| p.clone())
             .collect();
         ready.sort();
-        for path in ready {
-            // Paused or stopped part-way through a batch.
-            if self.status.is_paused() || self.take_wakes() {
-                break;
-            }
-            self.process(&path);
-            // Map data may have been downloaded, indexes built.
-            self.status.set_health(self.geo.health());
+        if !ready.is_empty() {
+            self.process_all(ready);
         }
         self.report_queue();
+    }
+
+    /// Stamp `ready` with several workers, handing each a photo as it comes free. Pausing or
+    /// stopping part-way lets the photos in hand finish but starts no more.
+    fn process_all(&mut self, ready: Vec<PathBuf>) {
+        let workers = self.status.settings().worker_count().clamp(1, ready.len());
+        self.status.set_workers(workers);
+        while self.renderers.len() < workers {
+            self.renderers.push(Renderer::new());
+        }
+        let mut renderers = std::mem::take(&mut self.renderers);
+        let ctx = Ctx {
+            root: self.root.clone(),
+            config: self.config.clone(),
+            geo: self.geo,
+            status: self.status.clone(),
+            claimed: Mutex::new(HashSet::new()),
+        };
+        let started = Instant::now();
+        let (mut count, mut lookups, mut busy) = (0u32, Duration::ZERO, Duration::ZERO);
+        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let job_rx = Mutex::new(job_rx);
+        let (done_tx, done_rx) = mpsc::channel::<Done>();
+        std::thread::scope(|scope| {
+            for renderer in renderers.iter_mut().take(workers) {
+                let (ctx, job_rx, done_tx) = (&ctx, &job_rx, done_tx.clone());
+                scope.spawn(move || {
+                    loop {
+                        let job = job_rx.lock().unwrap().recv();
+                        let Ok(job) = job else { return };
+                        let t = Instant::now();
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            deliver(ctx, renderer, &job.path, job.id, job.strict_geo)
+                        }))
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("photo-stamp crashed while stamping it")));
+                        if done_tx.send(Done { job, result, took: t.elapsed() }).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(done_tx);
+
+            let mut ready = ready.into_iter();
+            let mut in_hand = 0;
+            loop {
+                // Keep every worker busy until the batch runs out, is paused or stopped.
+                while in_hand < workers && !self.status.is_paused() && !self.take_wakes() {
+                    let Some(path) = ready.next() else { break };
+                    // Settled or gone meanwhile (e.g. a retry of something else): skip.
+                    if !self.pending.contains_key(&path) {
+                        continue;
+                    }
+                    let job = self.begin(path);
+                    if job_tx.send(job).is_err() {
+                        break;
+                    }
+                    in_hand += 1;
+                }
+                if in_hand == 0 {
+                    break;
+                }
+                let Ok(done) = done_rx.recv() else { break };
+                in_hand -= 1;
+                count += 1;
+                busy += done.took;
+                if let Ok(d) = &done.result {
+                    lookups += d.lookup;
+                }
+                self.apply(done.job, done.result);
+                // Map data may have been downloaded, indexes built.
+                self.status.set_health(self.geo.health());
+            }
+            // Let the workers go.
+            drop(job_tx);
+        });
+        self.renderers = renderers;
+        if count > 1 {
+            info!(
+                "{count} photos in {:.1} s with {workers} at a time (lookups {:.1} s, stamping {:.1} s of worker time)",
+                started.elapsed().as_secs_f64(),
+                lookups.as_secs_f64(),
+                busy.saturating_sub(lookups).as_secs_f64(),
+            );
+        }
     }
 
     /// Handle requests that arrived while processing (retries); returns whether to stop.
@@ -458,124 +604,41 @@ impl<'a> Outbox<'a> {
         }
     }
 
-    /// Stamp `path` into the outbox (or move it there unchanged) and remove it from here.
-    fn deliver(&mut self, path: &Path, id: u64, strict_geo: bool) -> anyhow::Result<Delivered> {
-        let rel = self.rel(path).to_owned();
-        let dir = self.config.outbox.join(rel.parent().unwrap_or(Path::new("")));
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let name = path.file_name().context("no file name")?.to_owned();
-
-        let job = match prepare(path, self.geo, strict_geo)? {
-            Prepared::Skip(why) => {
-                self.status.stage(Stage::Moving);
-                let dest = free_name(&dir, &name, None);
-                move_file(path, &dest)?;
-                info!("moved       {} (unstamped: {why})", self.show_out(&dest));
-                return Ok(Delivered {
-                    outcome: Outcome::Unchanged,
-                    reason: Some(why.to_string()),
-                    caption: Vec::new(),
-                    output: dest,
-                    thumbs: false,
-                    original: None,
-                    gps: None,
-                });
-            }
-            Prepared::Stamp(job) => job,
-        };
-
-        self.status.stage(Stage::Drawing);
-        let status = self.status.clone();
-        let mut on_image = |picture: Picture, img: &image::DynamicImage| match picture {
-            Picture::Original => status.save_thumb(id, Which::Before, img),
-            Picture::Stamped => {
-                status.save_thumb(id, Which::After, img);
-                status.stage(Stage::Saving);
-            }
-        };
-        let quality = self.status.settings().quality;
-        let before = std::fs::metadata(path)?;
-        let mut original = None;
-        let output = if job.kind == Kind::Raw {
-            // The untouched RAW and its stamped JPEG travel together under matching names.
-            let raw = free_name(&dir, &name, Some(".jpg"));
-            let jpg = dir.join(formats::output_name(&raw, job.kind));
-            write_stamped_with(path, &job, &mut self.renderer, &jpg, quality, &mut on_image)?;
-            if let Err(e) = move_file(path, &raw) {
-                let _ = std::fs::remove_file(&jpg);
-                return Err(e);
-            }
-            jpg
-        } else {
-            let dest = free_name(&dir, &name, None);
-            write_stamped_with(path, &job, &mut self.renderer, &dest, quality, &mut on_image)?;
-            // Only once the original is moved aside (or gone) is the photo delivered; otherwise
-            // try again later.
-            let put_aside = match &self.config.originals {
-                Some(o) => {
-                    let odir = o.join(rel.parent().unwrap_or(Path::new("")));
-                    std::fs::create_dir_all(&odir).map_err(anyhow::Error::from).and_then(|()| {
-                        let kept = free_name(&odir, &name, None);
-                        move_file(path, &kept).map(|()| Some(kept))
-                    })
-                }
-                None => std::fs::remove_file(path)
-                    .map(|()| None)
-                    .with_context(|| format!("removing {}", path.display())),
-            };
-            match put_aside {
-                Ok(kept) => original = kept,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&dest);
-                    return Err(e);
-                }
-            }
-            if let Err(e) = keep_times(&dest, &before) {
-                warn!("couldn't keep the file dates of {}: {e}", self.show_out(&dest));
-            }
-            dest
-        };
-        info!("stamped     {}: {}", self.show_out(&output), job.lines.join(" | "));
-        Ok(Delivered {
-            outcome: Outcome::Stamped,
-            reason: None,
-            caption: job.lines,
-            output,
-            thumbs: true,
-            original,
-            gps: job.info.gps,
-        })
-    }
-
     fn show_out(&self, path: &Path) -> String {
-        let base = self.config.outbox.parent().unwrap_or(&self.config.outbox);
-        path.strip_prefix(base).unwrap_or(path).to_string_lossy().into_owned()
+        show_out(&self.config, path)
     }
 
-    fn process(&mut self, path: &Path) {
-        let (geo_attempts, lock_attempts) =
-            self.deferred.get(path).map_or((0, 0), |d| (d.geo_attempts, d.lock_attempts));
+    /// Mark `path` as in progress and say how to stamp it.
+    fn begin(&mut self, path: PathBuf) -> Job {
+        let geo_attempts = self.deferred.get(&path).map_or(0, |d| d.geo_attempts);
         // Wait for the place server unless asked not to, or the photo has waited long enough.
-        let forced = self.stamp_now.contains(path);
-        let overdue = self.overdue(path);
-        let strict_geo = !forced && !overdue;
+        let forced = self.stamp_now.contains(&path);
+        let overdue = self.overdue(&path);
         if overdue && !forced && geo_attempts > 0 {
             info!(
                 "waited long enough for the place server: stamping {} with local place data",
-                self.show(path)
+                self.show(&path)
             );
         }
+        let id = self.status.start(&self.show(&path));
+        Job { path, id, strict_geo: !forced && !overdue }
+    }
 
+    /// Keep the books for a photo a worker is done with: delivered, back in the queue, or failed.
+    fn apply(&mut self, job: Job, result: anyhow::Result<Delivered>) {
+        let Job { path, id, .. } = job;
+        let path = path.as_path();
+        let (geo_attempts, lock_attempts) =
+            self.deferred.get(path).map_or((0, 0), |d| (d.geo_attempts, d.lock_attempts));
         let rel = self.show(path);
-        let id = self.status.start(&rel);
-        let result = self.deliver(path, id, strict_geo);
         let entry = |outcome,
                      reason,
                      caption,
                      output: Option<String>,
                      thumbs,
                      original: Option<String>,
-                     gps: Option<GpsPoint>| Entry {
+                     gps: Option<GpsPoint>,
+                     lookup: Duration| Entry {
             id,
             path: rel.clone(),
             outcome,
@@ -588,6 +651,7 @@ impl<'a> Outbox<'a> {
             finished: 0,
             original,
             gps: gps.map(|g| [g.lat, g.lon]),
+            lookup_ms: lookup.as_millis() as u64,
         };
         match result {
             Ok(d) => {
@@ -595,7 +659,9 @@ impl<'a> Outbox<'a> {
                 self.stamp_now.remove(path);
                 let output = Some(self.show_out(&d.output));
                 let original = d.original.as_deref().map(|o| self.show_out(o));
-                self.status.finish(entry(d.outcome, d.reason, d.caption, output, d.thumbs, original, d.gps));
+                self.status.finish(entry(
+                    d.outcome, d.reason, d.caption, output, d.thumbs, original, d.gps, d.lookup,
+                ));
                 return;
             }
             Err(e) if e.downcast_ref::<GeoUnavailable>().is_some() => {
@@ -649,6 +715,7 @@ impl<'a> Outbox<'a> {
                     false,
                     None,
                     None,
+                    Duration::ZERO,
                 ));
                 return;
             }
@@ -666,8 +733,126 @@ impl<'a> Outbox<'a> {
             },
             None => Waiting::Ready,
         };
-        self.status.deferred(Queued { path: rel, waiting });
+        self.status.deferred(id, Queued { path: rel, waiting });
     }
+}
+
+impl Ctx<'_> {
+    fn rel<'p>(&self, path: &'p Path) -> &'p Path {
+        path.strip_prefix(&self.root).unwrap_or(path)
+    }
+
+    fn show_out(&self, path: &Path) -> String {
+        show_out(&self.config, path)
+    }
+}
+
+/// `path` (in the outbox or originals) relative to the folder holding the outbox, for messages.
+fn show_out(config: &Config, path: &Path) -> String {
+    let base = config.outbox.parent().unwrap_or(&config.outbox);
+    path.strip_prefix(base).unwrap_or(path).to_string_lossy().into_owned()
+}
+
+/// Stamp `path` into the outbox (or move it there unchanged) and remove it from here. Runs on a
+/// worker; `renderer` is that worker's own.
+fn deliver(
+    ctx: &Ctx,
+    renderer: &mut Renderer,
+    path: &Path,
+    id: u64,
+    strict_geo: bool,
+) -> anyhow::Result<Delivered> {
+    let mut names = Claims { all: &ctx.claimed, mine: Vec::new() };
+    let rel = ctx.rel(path).to_owned();
+    let dir = ctx.config.outbox.join(rel.parent().unwrap_or(Path::new("")));
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let name = path.file_name().context("no file name")?.to_owned();
+
+    let looking = Instant::now();
+    let prepared = prepare(path, ctx.geo, strict_geo)?;
+    let lookup = looking.elapsed();
+    let job = match prepared {
+        Prepared::Skip(why) => {
+            ctx.status.stage(id, Stage::Moving);
+            let dest = names.free_name(&dir, &name, None);
+            move_file(path, &dest)?;
+            info!("moved       {} (unstamped: {why})", ctx.show_out(&dest));
+            return Ok(Delivered {
+                outcome: Outcome::Unchanged,
+                reason: Some(why.to_string()),
+                caption: Vec::new(),
+                output: dest,
+                thumbs: false,
+                original: None,
+                gps: None,
+                lookup,
+            });
+        }
+        Prepared::Stamp(job) => job,
+    };
+
+    ctx.status.stage(id, Stage::Drawing);
+    let status = &ctx.status;
+    let mut on_image = |picture: Picture, img: &image::DynamicImage| match picture {
+        Picture::Original => status.save_thumb(id, Which::Before, img),
+        Picture::Stamped => {
+            status.save_thumb(id, Which::After, img);
+            status.stage(id, Stage::Saving);
+        }
+    };
+    let quality = ctx.status.settings().quality;
+    let before = std::fs::metadata(path)?;
+    let mut original = None;
+    let output = if job.kind == Kind::Raw {
+        // The untouched RAW and its stamped JPEG travel together under matching names.
+        let raw = names.free_name(&dir, &name, Some(".jpg"));
+        let jpg = dir.join(formats::output_name(&raw, job.kind));
+        write_stamped_with(path, &job, renderer, &jpg, quality, &mut on_image)?;
+        if let Err(e) = move_file(path, &raw) {
+            let _ = std::fs::remove_file(&jpg);
+            return Err(e);
+        }
+        jpg
+    } else {
+        let dest = names.free_name(&dir, &name, None);
+        write_stamped_with(path, &job, renderer, &dest, quality, &mut on_image)?;
+        // Only once the original is moved aside (or gone) is the photo delivered; otherwise
+        // try again later.
+        let put_aside = match &ctx.config.originals {
+            Some(o) => {
+                let odir = o.join(rel.parent().unwrap_or(Path::new("")));
+                std::fs::create_dir_all(&odir).map_err(anyhow::Error::from).and_then(|()| {
+                    let kept = names.free_name(&odir, &name, None);
+                    move_file(path, &kept).map(|()| Some(kept))
+                })
+            }
+            None => std::fs::remove_file(path)
+                .map(|()| None)
+                .with_context(|| format!("removing {}", path.display())),
+        };
+        match put_aside {
+            Ok(kept) => original = kept,
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                return Err(e);
+            }
+        }
+        if let Err(e) = keep_times(&dest, &before) {
+            warn!("couldn't keep the file dates of {}: {e}", ctx.show_out(&dest));
+        }
+        dest
+    };
+    info!("stamped     {}: {}", ctx.show_out(&output), job.lines.join(" | "));
+    Ok(Delivered {
+        outcome: Outcome::Stamped,
+        reason: None,
+        caption: job.lines,
+        output,
+        thumbs: true,
+        original,
+        gps: job.info.gps,
+        lookup,
+    })
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -677,13 +862,25 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 /// `dir/name`, or `dir/name (2).ext`, `(3)`… if taken. With `companion`, the name with that suffix
 /// appended (a RAW's stamped `.jpg`) must be free too.
+#[cfg(test)]
 fn free_name(dir: &Path, name: &std::ffi::OsStr, companion: Option<&str>) -> PathBuf {
+    free_name_where(dir, name, companion, |_| false)
+}
+
+/// [`free_name`], also passing over names `claimed` says are taken.
+fn free_name_where(
+    dir: &Path,
+    name: &std::ffi::OsStr,
+    companion: Option<&str>,
+    claimed: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let used = |p: &Path| claimed(p) || p.exists();
     let taken = |p: &Path| {
-        p.exists()
+        used(p)
             || companion.is_some_and(|c| {
                 let mut n = p.as_os_str().to_owned();
                 n.push(c);
-                Path::new(&n).exists()
+                used(Path::new(&n))
             })
     };
     let first = dir.join(name);
@@ -881,6 +1078,149 @@ mod tests {
         // A RAW whose stamped JPEG name is taken moves under a new name, so the pair still matches.
         std::fs::write(dir.join("c.dng.jpg"), "").unwrap();
         assert_eq!(free_name(&dir, "c.dng".as_ref(), Some(".jpg")), dir.join("c (2).dng"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Stamping `n` at a time.
+    fn status_with_workers(root: &Path, n: usize) -> Arc<Status> {
+        let st = status(root);
+        st.set_settings(Settings { workers: n, ..st.settings() });
+        st
+    }
+
+    /// Answers like [`FixedPlace`] after `delay`, counting how many lookups overlap, and calls
+    /// `hook` first (to pause or stop the watcher mid-batch).
+    #[derive(Default)]
+    struct SlowPlace {
+        delay: Duration,
+        now: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+        hook: Mutex<Option<Box<dyn Fn() + Send>>>,
+    }
+    impl Geocoder for SlowPlace {
+        fn place(&self, at: GpsPoint) -> anyhow::Result<Option<Place>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if let Some(hook) = self.hook.lock().unwrap().as_ref() {
+                hook();
+            }
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.most.fetch_max(n, SeqCst);
+            std::thread::sleep(self.delay);
+            self.now.fetch_sub(1, SeqCst);
+            FixedPlace.place(at)
+        }
+    }
+
+    fn count_files(dir: &Path) -> usize {
+        WalkDir::new(dir).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()).count()
+    }
+
+    #[test]
+    fn stamps_a_batch_several_at_a_time() {
+        let root = temp_dir("outbox-parallel");
+        let st = status_with_workers(&root, 4);
+        let mut w = Outbox::new(&root, config(&root), &FixedPlace, st.clone()).unwrap();
+        for i in 0..12 {
+            let dir = root.join(format!("day {}", i % 3));
+            std::fs::create_dir_all(&dir).unwrap();
+            make_photo(&dir.join(format!("p{i}.jpg")), EIFFEL_TAGS);
+        }
+        w.scan_once();
+        for i in 0..12 {
+            let rel = format!("day {}/p{i}.jpg", i % 3);
+            assert!(stamped(&root.join(OUTBOX_DIR).join(&rel)), "{rel}");
+            assert!(root.join(ORIGINALS_DIR).join(&rel).exists(), "original of {rel} kept");
+            assert!(!root.join(&rel).exists());
+        }
+        assert_eq!(w.renderers.len(), 4, "a renderer per worker, kept for the next batch");
+        st.snapshot(|s| {
+            assert!(s.working.is_empty() && s.current.is_none());
+            assert_eq!(s.recent.len(), 12);
+            let ids: HashSet<u64> = s.recent.iter().map(|e| e.id).collect();
+            assert_eq!(ids.len(), 12, "each photo has its own id");
+            assert!(s.recent.iter().all(|e| e.outcome == Outcome::Stamped));
+        });
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn lookups_overlap_but_never_exceed_the_worker_count() {
+        let root = temp_dir("outbox-overlap");
+        let geo = SlowPlace { delay: Duration::from_millis(300), ..Default::default() };
+        let mut w = Outbox::new(&root, config(&root), &geo, status_with_workers(&root, 4)).unwrap();
+        for i in 0..8 {
+            make_photo(&root.join(format!("p{i}.jpg")), EIFFEL_TAGS);
+        }
+        let t = Instant::now();
+        w.scan_once();
+        let took = t.elapsed();
+        assert_eq!(count_files(&root.join(OUTBOX_DIR)), 8);
+        let most = geo.most.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(most, 4, "four lookups at once, no more");
+        // One at a time the lookups alone would take 8 × 300 ms.
+        assert!(took < Duration::from_millis(8 * 300), "took {took:?}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pausing_mid_batch_lets_the_photos_in_hand_finish() {
+        let root = temp_dir("outbox-pause");
+        let st = status_with_workers(&root, 2);
+        let geo = SlowPlace { delay: Duration::from_millis(50), ..Default::default() };
+        let pauser = st.clone();
+        *geo.hook.lock().unwrap() = Some(Box::new(move || pauser.set_paused(true)));
+        let mut w = Outbox::new(&root, config(&root), &geo, st.clone()).unwrap();
+        for i in 0..6 {
+            make_photo(&root.join(format!("p{i}.jpg")), EIFFEL_TAGS);
+        }
+        w.scan_once();
+        assert_eq!(count_files(&root.join(OUTBOX_DIR)), 2, "the two in hand finish");
+        assert_eq!(w.pending.len(), 4, "the rest wait");
+        st.snapshot(|s| assert!(s.working.is_empty()));
+        // Resumed: the rest go through.
+        *geo.hook.lock().unwrap() = None;
+        st.set_paused(false);
+        w.scan_once();
+        assert_eq!(count_files(&root.join(OUTBOX_DIR)), 6);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stopping_mid_batch_finishes_the_photos_in_hand() {
+        let root = temp_dir("outbox-stop-mid-batch");
+        let geo = SlowPlace { delay: Duration::from_millis(50), ..Default::default() };
+        let mut w = Outbox::new(&root, config(&root), &geo, status_with_workers(&root, 3)).unwrap();
+        let stop = Mutex::new(w.waker());
+        *geo.hook.lock().unwrap() = Some(Box::new(move || {
+            let _ = stop.lock().unwrap().send(Wake::Stop);
+        }));
+        for i in 0..9 {
+            make_photo(&root.join(format!("p{i}.jpg")), EIFFEL_TAGS);
+        }
+        w.scan_once();
+        assert!(w.stopping);
+        assert_eq!(count_files(&root.join(OUTBOX_DIR)), 3, "the three in hand finish");
+        assert_eq!(w.pending.len(), 6);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn photos_in_hand_never_pick_the_same_name() {
+        let dir = temp_dir("outbox-claims");
+        std::fs::write(dir.join("a.jpg"), "").unwrap();
+        let all = Mutex::new(HashSet::new());
+        let mut one = Claims { all: &all, mine: Vec::new() };
+        let mut two = Claims { all: &all, mine: Vec::new() };
+        assert_eq!(one.free_name(&dir, "a.jpg".as_ref(), None), dir.join("a (2).jpg"));
+        assert_eq!(two.free_name(&dir, "a.jpg".as_ref(), None), dir.join("a (3).jpg"), "(2) is claimed");
+        // A RAW claims its stamped JPEG's name too, so a photo already called that moves aside.
+        assert_eq!(one.free_name(&dir, "c.dng".as_ref(), Some(".jpg")), dir.join("c.dng"));
+        assert_eq!(two.free_name(&dir, "c.dng.jpg".as_ref(), None), dir.join("c.dng (2).jpg"));
+        drop(one);
+        let mut three = Claims { all: &all, mine: Vec::new() };
+        assert_eq!(three.free_name(&dir, "a.jpg".as_ref(), None), dir.join("a (2).jpg"), "given back");
+        drop((two, three));
+        assert!(all.lock().unwrap().is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

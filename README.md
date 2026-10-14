@@ -124,7 +124,7 @@ and it opens `http://127.0.0.1:8765/`, with a button to start photo-stamp if it 
 
 - **Activity:**
   - the photo being stamped, as a small preview that changes from the original to the stamped result, with
-    the steps (finding the place, drawing the caption, saving);
+    the steps (finding the place, drawing the caption, saving), and how many more are in progress;
   - the queue, with why each photo is waiting (still copying, map data unreachable, open in another program,
     paused);
   - a progress bar with photos done and time left, estimated separately for new spots (map data to download)
@@ -134,7 +134,9 @@ and it opens `http://127.0.0.1:8765/`, with a button to start photo-stamp if it 
   **Try again**.
 - **Health:** map data release, indexes, cache and connection; the bundled place data; all-time totals; and the
   live log.
-- **Settings:** outbox, quality, timing, offline mode, a notification when a batch is done, and start at login.
+- **Settings:** outbox, quality, photos at a time, timing, offline mode, a notification when a batch is done,
+  and start at login. Several photos are stamped at once, each all the way through (place lookup, drawing,
+  saving). **Photos at a time** set to 0 (automatic) uses half the PC's processor cores, 2 to 6.
 - **Pause / Resume** (new photos are still noticed and queued), **Stop**, and **Start**.
 
 How it fits together: photo-stamp serves a small API on 127.0.0.1 (a random port), protected by a random token.
