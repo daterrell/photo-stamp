@@ -1,14 +1,15 @@
 # photo-stamp
 
-[![CI](https://github.com/daterrell/photo-stamp/actions/workflows/ci.yml/badge.svg)](https://github.com/daterrell/photo-stamp/actions/workflows/ci.yml)
+(If you're reading this on GitHub, you're reading a mirror).
 
 Burns **where** and **when** a photo was taken into its bottom-left corner, using the photo's own metadata.
 
 **Downloads**
 - **Windows:** `photo-stamp-windows-<version>.zip` on the [Releases](https://github.com/daterrell/photo-stamp/releases)
-  page. Every CI run on `main` also has a `photo-stamp-windows` artifact with the latest build.
-- **Docker:** `docker pull ghcr.io/daterrell/photo-stamp:latest` (or `:main` for the newest build). It's a
-  private package, so log in first with `docker login ghcr.io`.
+  page. Every CI run on `main` (on [Forgejo](https://forgejo.terrell.ltd/dave/photo-stamp/actions)) also has a
+  `photo-stamp-windows` artifact with the latest build.
+- **Docker:** `docker pull forgejo.terrell.ltd/dave/photo-stamp:latest` (or `:main` for the newest build). It's a
+  private package, so log in first with `docker login forgejo.terrell.ltd`.
 
 To release, bump `version` in `Cargo.toml`, then tag and push the tag (`git tag v0.4.0 && git push origin v0.4.0`).
 CI builds and attaches the Windows zip, and publishes the Docker image.
@@ -179,6 +180,7 @@ Remembered answers live in the `cache` volume.
 in Docker at home (or on a small VPS later): see [`server/compose.yaml`](server/compose.yaml).
 
 ```sh
+docker login forgejo.terrell.ltd              # the image is a private package
 cd server
 docker compose up -d                          # the server on :8080, plus the monthly import
 docker compose run --rm server user add Dave
@@ -201,9 +203,9 @@ docker compose run --rm server device add Dave laptop      # prints the device k
 - **API** (`/v1`, JSON, `Authorization: Bearer <device key>`): `POST /v1/place` `{"lat","lon"}` →
   `{"place": {"primary","near","context"}, "complete", "data_version", "rev"}`; `POST /v1/places` (up to 100);
   `GET|PUT /v1/me`; `GET /v1/towns.sqlite`; `GET /healthz`. Types are in `proto/src/api.rs`.
-- **Reaching it from outside:** it speaks plain HTTP on port 8080. Put TLS in front: Tailscale or a Cloudflare
-  Tunnel to port 8080, or open ports 80/443 and run the included Caddy (`PLACES_DOMAIN=places.example.com
-  docker compose --profile tls up -d`) for an automatic certificate.
+- **Reaching it from outside:** it speaks plain HTTP on port 8080. Put TLS in front: a proxy host in an existing
+  reverse proxy (e.g. Nginx Proxy Manager) pointing at port 8080, Tailscale, a Cloudflare Tunnel, or the included
+  Caddy (`PLACES_DOMAIN=places.example.com docker compose --profile tls up -d`) for an automatic certificate.
 
 ## Command line
 

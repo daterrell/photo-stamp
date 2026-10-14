@@ -11,7 +11,7 @@
 # ports 80/443 and run the TLS proxy:  PLACES_DOMAIN=places.example.com docker compose --profile tls up -d
 services:
   server:
-    image: ghcr.io/daterrell/photo-stamp-server:latest
+    image: forgejo.terrell.ltd/dave/photo-stamp-server:latest
     build:
       context: ..
       dockerfile: docker/Dockerfile.server
@@ -25,7 +25,7 @@ services:
 
   # Brings the place data up to date now, then every 30 days. The server picks up new data by itself.
   import:
-    image: ghcr.io/daterrell/photo-stamp-server:latest
+    image: forgejo.terrell.ltd/dave/photo-stamp-server:latest
     init: true
     restart: unless-stopped
     user: "${PUID:-1000}:${PGID:-1000}"
