@@ -101,9 +101,22 @@ async function loadServices() {
   try {
     list = await api("/api/services");
   } catch (e) {
+    // During an update the dashboard server restarts too: keep trying for a while.
+    if (state.updating && (state.retries = (state.retries || 0) + 1) < 60) {
+      setState("loading", "Updating");
+      setTimeout(loadServices, 2000);
+      return;
+    }
     showEmpty("The dashboard can't be reached", "Start photo-stamp-ui again, then reload this page.");
     return;
   }
+  state.retries = 0;
+  // A new version of the dashboard is serving: load its page.
+  if (state.pageVersion && list.version !== state.pageVersion) {
+    location.reload();
+    return;
+  }
+  state.pageVersion = list.version;
   state.services = list.services;
   state.here = list.here;
   const pick = $("folder-select");
@@ -145,9 +158,17 @@ function select(key) {
   $("folder-name").textContent = state.services.length < 2 ? s.root : "";
   renderStartup();
   if (!s.running) {
+    // Restarting after an update: wait for the new version (the old one comes back if it fails).
+    if (state.updating && (state.retries = (state.retries || 0) + 1) < 90) {
+      setState("loading", "Updating");
+      setTimeout(loadServices, 2000);
+      return;
+    }
+    state.updating = false;
     stopped();
     return;
   }
+  state.updating = false;
   connect();
 }
 
@@ -308,6 +329,10 @@ function apply(ev) {
       s.settings = ev.settings;
       s.paused = ev.settings.paused;
       renderState();
+      break;
+    case "update":
+      s.update = ev.update;
+      renderUpdate();
       break;
     case "health":
       s.health = ev.health;
@@ -758,6 +783,73 @@ $("settings-form").addEventListener("submit", async (e) => {
   }
 });
 
+// ------------------------------------------------------------------ updates
+
+function mbs(n) {
+  return `${(n / 1048576).toFixed(n < 10485760 ? 1 : 0)} MB`;
+}
+
+function renderUpdate() {
+  const u = state.snap && state.snap.update;
+  const banner = $("update-banner");
+  if (!u || !u.info) {
+    banner.hidden = true;
+    return;
+  }
+  const i = u.info;
+  $("upd-current").textContent = u.current;
+  if (document.activeElement !== $("upd-channel")) $("upd-channel").value = u.channel;
+  const status = {
+    off: () => `Updates aren't available here: ${i.reason}.`,
+    idle: () => "",
+    checking: () => "Checking",
+    up_to_date: () => `Up to date (checked ${clock(i.checked)}).`,
+    downloading: () => `Downloading ${i.version}${i.total ? `: ${mbs(i.done)} of ${mbs(i.total)}` : ""}`,
+    ready: () => `Version ${i.version} is downloaded and ready to install.`,
+    installing: () => `Installing ${i.version}; photo-stamp restarts in a moment.`,
+    failed: () => i.error,
+  }[i.state];
+  $("upd-status").textContent = status ? status() : "";
+  $("upd-check").disabled = i.state === "off" || i.state === "checking" || i.state === "downloading" || i.state === "installing";
+  $("upd-channel").disabled = i.state === "off";
+  banner.hidden = !(i.state === "ready" || i.state === "installing");
+  if (i.state === "ready") {
+    $("update-text").textContent = `photo-stamp ${i.version} is ready.`;
+    $("update-install").hidden = false;
+  } else if (i.state === "installing") {
+    $("update-text").textContent = `Installing photo-stamp ${i.version}. It finishes the photo in hand, then restarts.`;
+    $("update-install").hidden = true;
+  }
+}
+
+$("update-install").onclick = async () => {
+  const i = state.snap.update.info;
+  if (!confirm(`Install photo-stamp ${i.version} now? It finishes the photo in hand, then restarts with the new version. If the new version doesn't start, the current one comes back.`)) return;
+  try {
+    await api(svc("update/install"), { method: "POST", body: {} });
+    state.updating = true;
+  } catch (e) {
+    toast(e.message);
+  }
+};
+
+$("upd-check").onclick = async () => {
+  try {
+    await api(svc("update/check"), { method: "POST", body: {} });
+  } catch (e) {
+    toast(e.message);
+  }
+};
+
+$("upd-channel").addEventListener("change", async (e) => {
+  try {
+    await api(svc("update/channel"), { method: "PUT", body: { channel: e.target.value } });
+    toast(e.target.value === "beta" ? "Getting every build (beta)" : "Getting releases only");
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
 // ------------------------------------------------------------------ place server
 
 async function renderServer() {
@@ -870,6 +962,7 @@ $("btn-stop").onclick = async () => {
 };
 
 function renderAll() {
+  renderUpdate();
   renderState();
   renderProgress();
   renderNow();

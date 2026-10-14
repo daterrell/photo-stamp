@@ -5,6 +5,8 @@
 //! - `POST /v1/places` [`BatchRequest`] → [`BatchReply`] (up to [`MAX_BATCH`] points)
 //! - `GET  /v1/me` → [`Me`]; `PUT /v1/me` [`MeUpdate`] → [`Me`]
 //! - `GET  /v1/towns.sqlite`: the small towns database clients keep for previews and fallbacks
+//! - `GET  /v1/client/latest?channel=stable|beta` → [`ClientUpdate`] (204: none published)
+//! - `GET  /v1/client/download/<version>`: that build's Windows zip
 //! - `GET  /healthz` (no key): `ok`
 
 use serde::{Deserialize, Serialize};
@@ -91,6 +93,16 @@ pub struct MeUpdate {
     pub history: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wait_hours: Option<u32>,
+}
+
+/// The newest Windows build on a channel ("stable": releases; "beta": every build of main).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientUpdate {
+    pub version: String,
+    /// Of the zip, hex.
+    pub sha256: String,
+    /// Where to download it, on this server (`/v1/client/download/<version>`).
+    pub path: String,
 }
 
 /// `{"error": "..."}` on failures.

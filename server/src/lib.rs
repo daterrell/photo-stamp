@@ -6,6 +6,7 @@ pub mod import;
 pub mod overture;
 pub mod service;
 pub mod store;
+pub mod updates;
 pub mod wkb;
 
 use log::{Level, LevelFilter, Log, Metadata, Record};

@@ -18,6 +18,9 @@ services:
     init: true
     restart: unless-stopped
     user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      # A Forgejo token that can read packages: the server then offers client updates.
+      PHOTO_STAMP_UPDATES_TOKEN: "${PHOTO_STAMP_UPDATES_TOKEN:-}"
     ports:
       - "${PLACES_PORT:-8080}:8080"
     volumes:

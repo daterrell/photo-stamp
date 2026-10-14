@@ -37,6 +37,13 @@ processed, photos that weren't stamped, and the log. You can pause, resume, stop
 there, and change its settings. Only this PC can open it. It closes by itself after half an hour with
 no dashboard open.
 
+UPDATES
+
+New versions come through your place server. photo-stamp checks every few hours, downloads a
+newer one in the background, and the dashboard offers "Install and restart". If the new version
+doesn't start, the old one is put back automatically. Settings > Updates chooses releases only
+(the default) or every build.
+
 COMMANDS (from a terminal in the folder)
 
     photo-stamp.exe --install-startup     start at login (and start now)

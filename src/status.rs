@@ -204,6 +204,8 @@ struct Inner {
     settings: Settings,
     /// Lines in the history file, to know when to trim it.
     history_lines: usize,
+    /// The updater's state (see `crate::update`).
+    update: serde_json::Value,
 }
 
 /// Called with a summary when a batch finishes (title, body).
@@ -246,6 +248,7 @@ pub struct Snapshot<'a> {
     pub log: Vec<LogLine>,
     pub health: GeoHealth,
     pub settings: Settings,
+    pub update: serde_json::Value,
 }
 
 impl Status {
@@ -296,6 +299,7 @@ impl Status {
                 health: GeoHealth::default(),
                 settings,
                 history_lines,
+                update: serde_json::Value::Null,
             }),
             subscribers: Mutex::new(Vec::new()),
             paused: AtomicBool::new(paused),
@@ -352,6 +356,15 @@ impl Status {
         let mut inner = self.inner.lock().unwrap();
         inner.settings = settings.clone();
         self.emit(&mut inner, "settings", json!({ "settings": settings }));
+    }
+
+    /// What the updater is doing (shown in the dashboard).
+    pub fn set_update(&self, update: serde_json::Value) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.update != update {
+            inner.update = update.clone();
+            self.emit(&mut inner, "update", json!({ "update": update }));
+        }
     }
 
     pub fn set_health(&self, health: GeoHealth) {
@@ -586,6 +599,7 @@ impl Status {
             log: inner.log.iter().rev().take(200).rev().cloned().collect(),
             health: inner.health.clone(),
             settings: inner.settings.clone(),
+            update: inner.update.clone(),
         };
         f(&snap)
     }

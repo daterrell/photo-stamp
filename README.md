@@ -17,6 +17,21 @@ dashboard). To release, tag a commit on `main` and push the tag: `git tag v0.7.0
 CI builds it like any other commit, then publishes it: a GitHub Release with the Windows zip, and the `:0.7.0`
 and `:latest` images.
 
+**Builds** leave only usable artifacts, published: every build of `main` (beta) and every tag (stable) puts the
+Windows zip in Forgejo's package registry (`photo-stamp-windows`; the newest 10 betas are kept) and the images in
+its container registry (version tags, `:main`, `:latest`, and the newest 10 `sha-…` tags). Pull request builds
+keep their zip as an Actions artifact for 3 days. Each CI job removes what it created on the runner; a final job
+removes leftovers of cancelled runs and keeps the shared caches bounded (Docker build cache 20 GB, `main`'s
+cargo target 25 GB).
+
+**Updates** reach Windows installs through the place server: it relays the builds from the package registry, so
+clients need nothing but their device key. A client checks every 6 hours (or with **Check now** in the
+dashboard), downloads a newer build on its channel (Settings > Updates: releases, or every build), checks its
+SHA-256, and offers it: **Install and restart** finishes the photo in hand, swaps the program files (the old ones
+are kept as `*.old`), and starts the new version, restarting the dashboard server too. If the new version doesn't
+come up within 90 s, the old files are put back and the old version starts again. Two minutes after a successful
+update the `.old` files and the download are removed.
+
 ```
 Pebble Beach Golf Course
 Pebble Beach, California, United States
@@ -203,6 +218,9 @@ docker compose run --rm server device add Dave laptop      # prints the device k
   `device revoke <id or person/name>`. Each device has its own key; revoking one doesn't affect the others.
 - **History:** for devices with history on (the default, changeable in the dashboard), the points they ask about
   are kept, for trips and the map (coming next). With history off, nothing is kept.
+- **Client updates:** set `PHOTO_STAMP_UPDATES_TOKEN` (a Forgejo token that can read packages) and the server
+  offers the builds in the package registry: `GET /v1/client/latest?channel=stable|beta` and
+  `GET /v1/client/download/<version>`. `PHOTO_STAMP_UPDATES_URL`, `_OWNER` and `_PACKAGE` point elsewhere.
 - **API** (`/v1`, JSON, `Authorization: Bearer <device key>`): `POST /v1/place` `{"lat","lon"}` →
   `{"place": {"primary","near","context"}, "complete", "data_version", "rev"}`; `POST /v1/places` (up to 100);
   `GET|PUT /v1/me`; `GET /v1/towns.sqlite`; `GET /healthz`. Types are in `proto/src/api.rs`.

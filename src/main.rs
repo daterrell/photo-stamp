@@ -16,6 +16,7 @@ use photo_stamp::render::Renderer;
 use photo_stamp::settings::{self, Settings};
 use photo_stamp::stamp::{Options, Outcome, stamp_in_place};
 use photo_stamp::status::Status;
+use photo_stamp::update::Updater;
 use photo_stamp::{api, formats, logging, metadata, paths, watch};
 use photo_stamp_http::registry::Registration;
 
@@ -211,7 +212,7 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
     }
 
     #[cfg(windows)]
-    let _instance = match photo_stamp::winsys::single_instance(&root) {
+    let instance = match photo_stamp::winsys::single_instance(&root) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
             tell(&format!("photo-stamp is already watching {}.", root.display()), false);
@@ -262,6 +263,15 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
     status.set_notifier(Box::new(|title, body| info!("{title}: {body}")));
 
     geo.warm_up();
+    // Updates (Windows installs): checked in the background, installed when asked from the dashboard.
+    let updater = data
+        .as_deref()
+        .zip(exe.as_deref().and_then(Path::parent))
+        .map(|(d, dir)| Updater::new(geo.clone(), status.clone(), d, dir));
+    if let Some(u) = &updater {
+        u.after_restart();
+        u.check_periodically(Duration::from_secs(60));
+    }
     let config = outbox::Config {
         outbox: outbox.clone(),
         events: true,
@@ -285,9 +295,24 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
     }
 
     // The dashboard's way in.
-    let registration =
-        start_api(&status, &watcher, &geo, settings_path, &root, &outbox, &key, exe.as_deref());
+    let registration = start_api(
+        &status,
+        &watcher,
+        &geo,
+        updater.clone(),
+        settings_path,
+        &root,
+        &outbox,
+        &key,
+        exe.as_deref(),
+    );
     let result = watcher.run();
+    // Stopped to install an update: hand over to the new version (and watch that it starts).
+    if let Some(u) = updater.as_ref().filter(|u| u.install_requested()) {
+        #[cfg(windows)]
+        drop(instance);
+        return hand_over(u, &key, data.as_deref());
+    }
     if let (Some(mut reg), Some(data)) = (registration, data.as_deref()) {
         reg.running = false;
         reg.port = None;
@@ -302,6 +327,113 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
     }
 }
 
+/// Install the downloaded update and start it; if it doesn't come up, go back to this version.
+fn hand_over(updater: &Updater, key: &str, data: Option<&Path>) -> ExitCode {
+    // A damaged new version must fail to start, not wait on an error dialog nobody sees.
+    #[cfg(windows)]
+    photo_stamp::winsys::no_error_dialogs();
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let Ok(exe) = std::env::current_exe() else { return ExitCode::FAILURE };
+    let install = match updater.take_install() {
+        Ok(i) => i,
+        Err(e) => {
+            // Nothing was changed: carry on as this version.
+            error!("couldn't install the update: {e:#}; restarting as {}", photo_stamp_http::VERSION);
+            let _ = spawn_detached(&exe, &args);
+            return ExitCode::FAILURE;
+        }
+    };
+    info!("installed photo-stamp {}; starting it", install.to);
+    let started = spawn_detached(&exe, &args);
+    let came_up = match (started, data) {
+        (Ok(mut child), Some(data)) => {
+            let deadline = std::time::Instant::now() + photo_stamp::update::HANDOFF_WAIT;
+            let ok = loop {
+                if let Some(reg) = Registration::load(data, key)
+                    && reg.pid == child.id()
+                    && reg.running
+                    && reg.version == install.to
+                {
+                    break true;
+                }
+                if matches!(child.try_wait(), Ok(Some(_))) || std::time::Instant::now() > deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            };
+            if !ok {
+                let _ = child.kill();
+            }
+            ok
+        }
+        (Ok(_), None) => true,
+        (Err(e), _) => {
+            error!("couldn't start the new version: {e}");
+            false
+        }
+    };
+    if came_up {
+        info!("photo-stamp {} is running; this copy ({}) is done", install.to, photo_stamp_http::VERSION);
+        restart_dashboard(exe.parent());
+        return ExitCode::SUCCESS;
+    }
+    error!("photo-stamp {} didn't start; going back to {}", install.to, photo_stamp_http::VERSION);
+    updater.roll_back(install);
+    let _ = spawn_detached(&exe, &args);
+    ExitCode::FAILURE
+}
+
+/// Start `exe` independently of this process (it outlives us).
+fn spawn_detached(exe: &Path, args: &[std::ffi::OsString]) -> std::io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(exe);
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd.spawn()
+}
+
+/// After an update: if the dashboard server is running, restart it as the new version.
+fn restart_dashboard(dir: Option<&Path>) {
+    let Some(dir) = dir else { return };
+    let port: u16 = std::env::var("PHOTO_STAMP_UI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8765);
+    let base = format!("http://127.0.0.1:{port}");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(3)))
+        .build()
+        .into();
+    let running = |agent: &ureq::Agent| {
+        agent
+            .get(&format!("{base}/api/ping"))
+            .call()
+            .ok()
+            .and_then(|mut r| r.body_mut().read_to_string().ok())
+            .is_some_and(|b| b.contains("photo-stamp-ui"))
+    };
+    if !running(&agent) {
+        return;
+    }
+    let _ = agent.post(&format!("{base}/api/quit")).header("Origin", &base).send_empty();
+    for _ in 0..20 {
+        std::thread::sleep(Duration::from_millis(250));
+        if !running(&agent) {
+            break;
+        }
+    }
+    let ui = dir.join(if cfg!(windows) { "photo-stamp-ui.exe" } else { "photo-stamp-ui" });
+    let args: [std::ffi::OsString; 1] = ["--no-open".into()];
+    match spawn_detached(&ui, &args) {
+        Ok(_) => info!("restarted the dashboard server as the new version"),
+        Err(e) => log::warn!("couldn't restart the dashboard server: {e}"),
+    }
+}
+
 /// Where the dashboard (photo-stamp-ui) serves its page.
 #[cfg(windows)]
 const DASHBOARD_URL: &str = "http://127.0.0.1:8765/";
@@ -312,6 +444,7 @@ fn start_api(
     status: &Arc<Status>,
     watcher: &Outbox,
     geo: &Arc<RemoteGeocoder>,
+    updater: Option<Arc<Updater>>,
     settings_path: Option<PathBuf>,
     root: &Path,
     outbox: &Path,
@@ -327,6 +460,7 @@ fn start_api(
             token: token.clone(),
             settings_path,
             geo: Some(geo.clone()),
+            updater,
         }))?;
         let reg = Registration {
             key: key.to_owned(),
