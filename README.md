@@ -214,6 +214,9 @@ docker compose run --rm server device add Dave laptop      # prints the device k
   Overture release and rebuilds the place databases. Downloads resume if interrupted. A running server switches
   to new data by itself; until its mirror is complete, files it doesn't have yet are read from Overture's cloud
   copy (just the byte ranges needed). `--bbox west,east,south,north` and `--datasets` limit what's mirrored.
+- **Before the first import** has built `places.sqlite`, the server is up but answers `503` (`/healthz`: "loading";
+  lookups: "still loading", which clients wait out), and switches over by itself when the data appears.
+  `import --skip-overture` builds just the place database, for answers sooner.
 - **Accounts:** `user add|list`, `device add <person> <name> [--no-history]`, `device list`,
   `device revoke <id or person/name>`. Each device has its own key; revoking one doesn't affect the others.
 - **History:** for devices with history on (the default, changeable in the dashboard), the points they ask about
