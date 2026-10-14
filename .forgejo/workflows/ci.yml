@@ -10,8 +10,10 @@ name: CI
 # Runs on the self-hosted Forgejo runner. Its Docker daemon keeps images, build layers and the
 # dev.sh cargo volumes between runs, so there's no cache-from/cache-to to manage.
 on:
+  # Branches are checked through their pull request; pushing to one too would build the same
+  # commit twice at once.
   push:
-    branches: ["**"]
+    branches: ["main"]
     tags: ["v*.*.*"]
   pull_request:
 
@@ -33,6 +35,9 @@ jobs:
     env:
       # The runner's Docker daemon can't bind-mount this checkout; see dev.sh.
       DEV_SH_COPY_SOURCE: "1"
+      # Each branch builds in its own target volume, so runs at the same time can't clobber each
+      # other's half-built crates.
+      DEV_SH_TARGET: ${{ github.head_ref || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       # dev.sh runs everything in the dev image, which has the exiftool, libheif and fonts the
