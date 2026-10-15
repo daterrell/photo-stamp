@@ -72,6 +72,9 @@ pub struct Entry {
     #[serde(default)]
     pub thumbs: bool,
     pub finished: u64,
+    /// Of `ms`: reading the metadata and looking the place up.
+    #[serde(default)]
+    pub lookup_ms: u64,
     /// Where the original was kept (relative to the outbox's parent), so it can be stamped again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original: Option<String>,
@@ -189,7 +192,10 @@ pub struct Progress {
 struct Inner {
     seq: u64,
     next_id: u64,
-    current: Option<Current>,
+    /// Photos being processed now, oldest first.
+    working: Vec<Current>,
+    /// How many are processed at a time (for the time-left estimate).
+    workers: usize,
     queue: Vec<Queued>,
     recent: VecDeque<Entry>,
     session: Totals,
@@ -238,7 +244,10 @@ pub struct Snapshot<'a> {
     pub outbox: &'a Path,
     pub paused: bool,
     pub started: u64,
+    /// The newest photo in progress (for the "now" panel).
     pub current: Option<Current>,
+    /// Every photo in progress, oldest first.
+    pub working: Vec<Current>,
     pub queue: Vec<Queued>,
     pub progress: Progress,
     pub batch: Batch,
@@ -286,7 +295,8 @@ impl Status {
             inner: Mutex::new(Inner {
                 seq: 0,
                 next_id,
-                current: None,
+                working: Vec::new(),
+                workers: 1,
                 queue: Vec::new(),
                 recent,
                 session: Totals::default(),
@@ -381,12 +391,17 @@ impl Status {
         if inner.queue == queue {
             return;
         }
-        if inner.queue.is_empty() && inner.current.is_none() && !queue.is_empty() {
+        if inner.queue.is_empty() && inner.working.is_empty() && !queue.is_empty() {
             inner.batch = Batch { started: now_ms(), ..Batch::default() };
         }
         inner.queue = queue;
         let (queue, progress) = (inner.queue.clone(), progress(&inner));
         self.emit(&mut inner, "queue", json!({ "queue": queue, "progress": progress }));
+    }
+
+    /// How many photos are processed at a time.
+    pub fn set_workers(&self, n: usize) {
+        self.inner.lock().unwrap().workers = n.max(1);
     }
 
     /// A photo is being processed; returns its id.
@@ -400,25 +415,25 @@ impl Status {
         inner.queue.retain(|q| q.path != path);
         let current =
             Current { id, path: path.to_owned(), stage: Stage::Locating, started: now_ms(), preview: false };
-        inner.current = Some(current.clone());
+        inner.working.push(current.clone());
         let progress = progress(&inner);
         self.emit(&mut inner, "started", json!({ "current": current, "progress": progress }));
         id
     }
 
-    pub fn stage(&self, stage: Stage) {
+    pub fn stage(&self, id: u64, stage: Stage) {
         let mut inner = self.inner.lock().unwrap();
-        let Some(current) = inner.current.as_mut() else { return };
+        let Some(current) = inner.working.iter_mut().find(|c| c.id == id) else { return };
         current.stage = stage;
-        let (id, current) = (current.id, current.clone());
+        let current = current.clone();
         self.emit(&mut inner, "stage", json!({ "id": id, "current": current }));
     }
 
-    /// The current photo was put back in the queue (to retry later).
-    pub fn deferred(&self, queued: Queued) {
+    /// Photo `id` was put back in the queue (to retry later).
+    pub fn deferred(&self, id: u64, queued: Queued) {
         let mut inner = self.inner.lock().unwrap();
         // Its id is used up; it gets a new one when it's tried again.
-        let id = inner.current.take().map(|c| c.id);
+        inner.working.retain(|c| c.id != id);
         inner.queue.retain(|q| q.path != queued.path);
         inner.queue.push(queued.clone());
         let progress = progress(&inner);
@@ -450,18 +465,18 @@ impl Status {
         }
         let mut inner = self.inner.lock().unwrap();
         if which == Which::Before
-            && let Some(c) = inner.current.as_mut().filter(|c| c.id == id)
+            && let Some(c) = inner.working.iter_mut().find(|c| c.id == id)
         {
             c.preview = true;
         }
         self.emit(&mut inner, "preview", json!({ "id": id, "which": which.name() }));
     }
 
-    /// The current photo is finished.
+    /// Photo `entry.id` is finished.
     pub fn finish(&self, mut entry: Entry) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(c) = inner.current.take() {
-            entry.id = c.id;
+        if let Some(i) = inner.working.iter().position(|c| c.id == entry.id) {
+            let c = inner.working.remove(i);
             entry.ms = now_ms().saturating_sub(c.started);
         }
         entry.finished = now_ms();
@@ -497,8 +512,8 @@ impl Status {
             json!({ "entry": entry, "progress": progress, "session": session, "batch": batch }),
         );
 
-        // The batch is over: tell the user.
-        if inner.queue.is_empty() {
+        // The batch is over (nothing waiting or in progress): tell the user.
+        if inner.queue.is_empty() && inner.working.is_empty() {
             let batch = std::mem::take(&mut inner.batch);
             let notify = inner.settings.notify;
             self.emit(&mut inner, "idle", json!({ "batch": batch }));
@@ -589,7 +604,8 @@ impl Status {
             outbox: &self.outbox,
             paused: self.is_paused(),
             started: self.started,
-            current: inner.current.clone(),
+            current: inner.working.last().cloned(),
+            working: inner.working.clone(),
             queue: inner.queue.clone(),
             progress: progress(&inner),
             batch: inner.batch,
@@ -652,7 +668,7 @@ pub fn batch_summary(b: &Batch) -> (String, String) {
 
 /// Batch progress and an estimate of the time left.
 fn progress(inner: &Inner) -> Progress {
-    let waiting = inner.queue.len() as u64 + u64::from(inner.current.is_some());
+    let waiting = (inner.queue.len() + inner.working.len()) as u64;
     let done = inner.batch.done;
     if waiting == 0 {
         return Progress { done, total: done, eta_secs: None, per_min: None };
@@ -666,11 +682,13 @@ fn progress(inner: &Inner) -> Progress {
         (Some(x), None) | (None, Some(x)) => x,
         (None, None) => DEFAULT_SECS,
     };
-    let mut eta = waiting as f64 * per_photo;
-    // The photo in hand is partly done.
-    if let Some(c) = &inner.current {
+    // Several at a time: each takes as long, but they overlap.
+    let workers = inner.workers.max(1) as f64;
+    let mut eta = waiting as f64 * per_photo / workers;
+    // The photos in hand are partly done.
+    for c in &inner.working {
         let elapsed = now_ms().saturating_sub(c.started) as f64 / 1000.0;
-        eta -= elapsed.min(per_photo * 0.9);
+        eta -= elapsed.min(per_photo * 0.9) / workers;
     }
     let per_min = (done > 0 && inner.batch.started > 0).then(|| {
         let mins = now_ms().saturating_sub(inner.batch.started) as f64 / 60_000.0;
@@ -713,6 +731,7 @@ mod tests {
             finished: 0,
             original: None,
             gps: None,
+            lookup_ms: 0,
         }
     }
 
@@ -729,14 +748,12 @@ mod tests {
             assert_eq!((snap.progress.done, snap.progress.total), (0, 3));
             assert_eq!(snap.progress.eta_secs, Some(15), "5 s each until something has been timed");
         });
-        s.start("a.jpg");
+        let id = s.start("a.jpg");
         s.snapshot(|snap| {
             assert_eq!(snap.queue.len(), 2, "the photo in hand leaves the queue");
             assert_eq!(snap.progress.total, 3);
         });
-        let mut e = entry(Outcome::Stamped, 0);
-        e.ms = 2000;
-        s.finish(e);
+        s.finish(Entry { id, ..entry(Outcome::Stamped, 0) });
         // `finish` times the photo itself; pretend the repeat-spot average is 2 s.
         s.inner.lock().unwrap().ema_repeat = Some(2.0);
         s.snapshot(|snap| {
@@ -760,11 +777,11 @@ mod tests {
         let sink = said.clone();
         s.set_notifier(Box::new(move |t, b| sink.lock().unwrap().push(format!("{t} / {b}"))));
         s.set_queue(vec![queued("a.jpg"), queued("b.jpg")]);
-        s.start("a.jpg");
-        s.finish(entry(Outcome::Stamped, 10));
+        let id = s.start("a.jpg");
+        s.finish(Entry { id, ..entry(Outcome::Stamped, 10) });
         assert!(said.lock().unwrap().is_empty(), "b.jpg is still waiting");
-        s.start("b.jpg");
-        s.finish(entry(Outcome::Unchanged, 0));
+        let id = s.start("b.jpg");
+        s.finish(Entry { id, ..entry(Outcome::Unchanged, 0) });
         assert_eq!(*said.lock().unwrap(), ["1 photo stamped / 1 moved unchanged."]);
         s.snapshot(|snap| assert_eq!(snap.batch.done, 0, "next batch starts from zero"));
     }
@@ -775,8 +792,8 @@ mod tests {
         {
             let s = status(Some(&dir));
             for _ in 0..3 {
-                s.start("a.jpg");
-                s.finish(entry(Outcome::Stamped, 1));
+                let id = s.start("a.jpg");
+                s.finish(Entry { id, ..entry(Outcome::Stamped, 1) });
             }
         }
         let s = status(Some(&dir));
@@ -805,6 +822,36 @@ mod tests {
         assert_eq!((saved.width(), saved.height()), (640, 320));
         s.snapshot(|snap| assert!(snap.current.as_ref().unwrap().preview));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn several_in_progress_at_once() {
+        let s = status(None);
+        s.set_workers(2);
+        s.set_queue(vec![queued("a.jpg"), queued("b.jpg"), queued("c.jpg"), queued("d.jpg")]);
+        let a = s.start("a.jpg");
+        let b = s.start("b.jpg");
+        s.stage(a, Stage::Drawing);
+        s.snapshot(|snap| {
+            assert_eq!(snap.working.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), ["a.jpg", "b.jpg"]);
+            assert_eq!(snap.current.as_ref().unwrap().path, "b.jpg", "newest in the now panel");
+            assert_eq!(snap.working[0].stage, Stage::Drawing);
+            assert_eq!(snap.progress.total, 4);
+            // 4 waiting at 5 s each, two at a time (minus a sliver already done).
+            assert!(snap.progress.eta_secs.is_some_and(|e| (9..=10).contains(&e)), "{:?}", snap.progress);
+        });
+        // b finishes first: a is still in progress, so no "batch done" yet.
+        let said = Arc::new(Mutex::new(0));
+        let sink = said.clone();
+        s.set_notifier(Box::new(move |_, _| *sink.lock().unwrap() += 1));
+        s.finish(Entry { id: b, ..entry(Outcome::Stamped, 0) });
+        s.snapshot(|snap| assert_eq!(snap.working.len(), 1));
+        s.deferred(a, queued("a.jpg"));
+        s.snapshot(|snap| {
+            assert!(snap.working.is_empty());
+            assert!(snap.queue.iter().any(|q| q.path == "a.jpg"), "back in the queue");
+        });
+        assert_eq!(*said.lock().unwrap(), 0, "c, d and a still to do");
     }
 
     #[test]
