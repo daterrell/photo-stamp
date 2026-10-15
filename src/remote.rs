@@ -290,10 +290,15 @@ impl RemoteGeocoder {
                 .send(b),
             _ => self.agent.get(&url).header("Authorization", &auth).call(),
         };
+        // Whether a failure means lookups can't be answered now (unreachable, wrong key, loading
+        // or broken), as opposed to the server answering "no" to this one request (e.g. 404 from a
+        // server without client updates): only the former makes lookups wait.
+        let mut unavailable = true;
         let outcome = (|| -> anyhow::Result<Vec<u8>> {
             let mut resp =
                 result.with_context(|| format!("can't reach the place server at {}", server.url))?;
             let status = resp.status().as_u16();
+            unavailable = status == 401 || status >= 500;
             let bytes = resp.body_mut().with_config().limit(64 * 1024 * 1024).read_to_vec()?;
             match status {
                 200 | 204 => Ok(bytes),
@@ -314,6 +319,10 @@ impl RemoteGeocoder {
                 net.last_error = None;
                 net.latency_ms = Some(start.elapsed().as_millis() as u64);
                 net.retry_at = None;
+            }
+            Err(_) if !unavailable => {
+                net.connected = Some(true);
+                net.latency_ms = Some(start.elapsed().as_millis() as u64);
             }
             Err(e) => {
                 if net.connected != Some(false) {
@@ -595,6 +604,21 @@ mod tests {
         assert!(again.place(GpsPoint { lat: 12.0, lon: 22.0 }).is_err());
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(again.health().server.unwrap().connected, Some(false));
+        std::fs::remove_dir_all(&data).unwrap();
+    }
+
+    #[test]
+    fn a_refused_request_doesnt_make_lookups_wait() {
+        let data = temp("refused");
+        let geo = RemoteGeocoder::new(Some(&data), false);
+        geo.set_server(Some(ServerConfig {
+            url: fake_server(Arc::new(AtomicU64::new(0))),
+            key: "psk_test_key".into(),
+        }));
+        // This server doesn't offer client updates (404): it's still up.
+        assert!(geo.latest_update().is_err());
+        assert_eq!(geo.health().server.unwrap().connected, Some(true));
+        assert_eq!(geo.place(GpsPoint { lat: 3.0, lon: 4.0 }).unwrap().unwrap().primary, "Somewhere");
         std::fs::remove_dir_all(&data).unwrap();
     }
 
