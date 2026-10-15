@@ -9,8 +9,8 @@
 #   dist/photo-stamp-setup.exe     (what people download: installer/photo-stamp.nsi)
 #
 # Needs only Docker (makensis is used directly if it's installed). The exe is cross-compiled with HEIC support linked in statically.
-# Set PHOTO_STAMP_EXE to package an exe that was already built, PHOTO_STAMP_PLACES_DB for the place data
-# (default data/places.sqlite, built with scripts/build-places-db.py if missing).
+# Set PHOTO_STAMP_EXE to package an exe that was already built, PHOTO_STAMP_TOWNS_DB for the towns database
+# (default data/towns.sqlite, downloaded with scripts/fetch-places.sh if missing).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -62,14 +62,12 @@ with zipfile.ZipFile(src) as z:
             w.write(r.read())
 EOF
 
-# Bundled place data (towns, regions, countries, famous landmarks).
-places="${PHOTO_STAMP_PLACES_DB:-data/places.sqlite}"
-if [ ! -f "$places" ]; then
-  echo "building $places…"
-  python3 scripts/build-places-db.py "$places"
+# Bundled place data: the small towns database (towns, regions, countries); the place server has the rest.
+towns="${PHOTO_STAMP_TOWNS_DB:-data/towns.sqlite}"
+if [ ! -f "$towns" ]; then
+  scripts/fetch-places.sh "$(dirname "$towns")" towns.sqlite
 fi
-# Clients keep only the small towns database; the place server has the rest.
-python3 scripts/make-towns-db.py "$places" "$DIST/photo-stamp-files/towns.sqlite"
+cp "$towns" "$DIST/photo-stamp-files/towns.sqlite"
 
 cp scripts/windows-README.txt "$DIST/README.txt"
 (cd dist && python3 -m zipfile -c photo-stamp-windows.zip photo-stamp-windows/)
