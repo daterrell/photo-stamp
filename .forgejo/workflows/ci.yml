@@ -86,31 +86,6 @@ jobs:
       TOKEN: ${{ secrets.PACKAGES_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      # ONE-TIME SEED, removed once it has run: publish the place data this repo's CI last built
-      # (cached) as the first photo-stamp-places version, so nobody asks GeoNames/QLever again.
-      - id: seed
-        run: |
-          api="${{ github.server_url }}/api/v1/packages/${{ github.repository_owner }}"
-          n=$(curl -sf -H "Authorization: token $TOKEN" "$api?type=generic&q=photo-stamp-places&limit=50" | jq '[.[] | select(.name == "photo-stamp-places")] | length')
-          echo "published=$n" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v4
-        if: steps.seed.outputs.published == '0'
-        with:
-          path: data/places.sqlite
-          key: places-db-none
-          restore-keys: places-db-
-      - name: Seed photo-stamp-places
-        if: steps.seed.outputs.published == '0'
-        run: |
-          test -f data/places.sqlite
-          python3 scripts/make-towns-db.py data/places.sqlite data/towns.sqlite
-          version=$(date -u +%Y.%m)
-          for f in towns.sqlite places.sqlite; do
-            curl -sf -X PUT -H "Authorization: token $TOKEN" --upload-file "data/$f" \
-              "${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/photo-stamp-places/$version/$f"
-          done
-          echo "seeded photo-stamp-places $version"
-          rm -rf data
       # The newest place data, built monthly by dave/photo-stamp-places. Clients get only the small
       # towns database; the place server downloads the full one itself.
       - run: scripts/fetch-places.sh data towns.sqlite && ls -la data/
