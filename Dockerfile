@@ -10,7 +10,6 @@ COPY src src
 # Workspace members (only photo-stamp is built, but cargo needs them all to resolve).
 COPY http http
 COPY proto proto
-COPY server server
 COPY web web
 COPY build.rs build.rs
 # The version (from the git tag), passed in by CI: Docker builds can't see .git.

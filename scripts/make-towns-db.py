@@ -6,7 +6,7 @@
 Same schema as places.sqlite, keeping towns of 5,000+ people and every region and country (no
 landmarks or fame). photo-stamp uses it to show where waiting photos are from, and to stamp them
 when the place server can't be reached. photo-stamp-server builds the same file during `import`
-(server/src/import.rs) and serves it to clients.
+(in its own repo, dave/photo-stamp-server) and serves it to clients.
 """
 import sqlite3
 import sys

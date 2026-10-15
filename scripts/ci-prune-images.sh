@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Remove all but the newest $KEEP_BUILDS `sha-*` tags of a container image in Forgejo's registry
 # (version tags, :main and :latest are kept). Used by CI after pushing an image.
-#   TOKEN=<package write token> scripts/ci-prune-images.sh photo-stamp-server
+#   TOKEN=<package write token> scripts/ci-prune-images.sh photo-stamp
 set -euo pipefail
 name=$1
 keep=${KEEP_BUILDS:-10}
