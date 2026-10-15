@@ -1,4 +1,4 @@
-//! The places database (built by `scripts/build-places-db.py`): towns, regions and countries from
+//! The places database (built monthly by dave/photo-stamp-places): towns, regions and countries from
 //! GeoNames, Wikidata "fame" (Wikipedia sitelink counts) and famous landmarks. The server reads the
 //! full build; clients keep a small towns-only build (same schema) for previews and fallbacks.
 

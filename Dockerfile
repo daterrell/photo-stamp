@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libimage-exiftool-perl fonts-dejavu-core fonts-noto-core fonts-noto-cjk ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/photo-stamp /usr/local/bin/photo-stamp
-# The small towns database (scripts/make-towns-db.py); set PHOTO_STAMP_SERVER_URL and
+# The small towns database (from dave/photo-stamp-places, see scripts/fetch-places.sh); set PHOTO_STAMP_SERVER_URL and
 # PHOTO_STAMP_SERVER_KEY to name places with your place server.
 COPY data/towns.sqlite /usr/share/photo-stamp/towns.sqlite
 # World-writable so the container can run as any user (see `user:` in compose.yaml).

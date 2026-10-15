@@ -167,7 +167,10 @@ scripts/build-windows.sh
 ```
 
 `docker/Dockerfile.windows` cross-compiles libde265, x265 and libheif as static libraries with mingw-w64,
-then builds the exe against them. The script adds the portable exiftool release, verified by checksum.
+then builds the exe against them. The script adds the portable exiftool release, verified by checksum. It also adds the
+towns database, the newest one [dave/photo-stamp-places](https://forgejo.terrell.ltd/dave/photo-stamp-places)
+builds monthly, downloaded with `scripts/fetch-places.sh`. That needs a Forgejo token that can read packages, in
+`$TOKEN` or `~/.config/forgejo/token`.
 
 ## Watch folder (Docker)
 

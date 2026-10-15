@@ -82,50 +82,18 @@ jobs:
   places:
     name: Place data
     runs-on: ubuntu-24.04
+    env:
+      TOKEN: ${{ secrets.PACKAGES_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      # Rebuilt monthly (GeoNames and Wikidata change slowly) and when the build script changes. The
-      # public Wikidata endpoint rate-limits, so a failed rebuild falls back to the previous database
-      # instead of holding up the Windows zip, Docker image and releases.
-      - id: month
-        run: echo "month=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
-      - id: db
-        uses: actions/cache/restore@v4
-        with:
-          path: data/places.sqlite
-          key: places-db-${{ steps.month.outputs.month }}-${{ hashFiles('scripts/build-places-db.py') }}
-          restore-keys: places-db-
-      - uses: actions/cache@v4
-        if: steps.db.outputs.cache-hit != 'true'
-        with:
-          path: ~/.cache/photo-stamp-dev/places-src
-          key: places-src-${{ steps.month.outputs.month }}
-          restore-keys: places-src-
-      - name: Rebuild places.sqlite
-        id: build
-        if: steps.db.outputs.cache-hit != 'true'
-        continue-on-error: true
-        timeout-minutes: 45
-        run: python3 scripts/build-places-db.py data/new-places.sqlite && mv data/new-places.sqlite data/places.sqlite
-      - name: Fall back to the previous place data
-        if: steps.build.outcome == 'failure'
-        run: |
-          test -f data/places.sqlite || { echo "::error::couldn't build the place data and no previous build is cached"; exit 1; }
-          echo "::warning::couldn't rebuild the place data this month; using the previous build"
-      - uses: actions/cache/save@v4
-        if: steps.build.outcome == 'success'
-        with:
-          path: data/places.sqlite
-          key: places-db-${{ steps.month.outputs.month }}-${{ hashFiles('scripts/build-places-db.py') }}
-      # Clients get the small towns database; the place server builds its own full one.
-      - run: python3 scripts/make-towns-db.py data/places.sqlite data/towns.sqlite && ls -la data/
+      # The newest place data, built monthly by dave/photo-stamp-places. Clients get only the small
+      # towns database; the place server downloads the full one itself.
+      - run: scripts/fetch-places.sh data towns.sqlite && ls -la data/
       # Forgejo's fork: GitHub's upload/download-artifact v4+ don't work against Forgejo.
       - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
           name: places-db
-          path: |
-            data/places.sqlite
-            data/towns.sqlite
+          path: data/towns.sqlite
           if-no-files-found: error
           # Only passed to the later jobs of this run.
           retention-days: 1
