@@ -21,8 +21,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     KillTimer, LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW,
     PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow,
     SetMenuDefaultItem, SetTimer, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
-    WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_POPUP,
+    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_TIMER, WNDCLASSW,
+    WS_POPUP,
 };
 
 use crate::api::Api;
@@ -308,13 +308,15 @@ enum Handled {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let handled = with_ctx(|c| match msg {
         WM_TRAY => {
-            // With NOTIFYICON_VERSION_4 the event is in the low word of lparam.
+            // With NOTIFYICON_VERSION_4 the event is in the low word of lparam. A click also sends
+            // the plain mouse messages (WM_LBUTTONUP, WM_RBUTTONUP): only the click events count,
+            // or each click would act twice.
             match (lparam & 0xffff) as u32 {
-                NIN_SELECT | NIN_KEYSELECT | WM_LBUTTONUP => {
+                NIN_SELECT | NIN_KEYSELECT => {
                     desktop::open(&c.url);
                     Handled::Yes
                 }
-                WM_CONTEXTMENU | WM_RBUTTONUP => Handled::ShowMenu,
+                WM_CONTEXTMENU => Handled::ShowMenu,
                 _ => Handled::Yes,
             }
         }
