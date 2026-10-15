@@ -1,5 +1,5 @@
 [workspace]
-members = ["http", "proto", "server"]
+members = ["http", "proto"]
 
 [package]
 name = "photo-stamp"

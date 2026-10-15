@@ -47,7 +47,7 @@ Tue 3 Jun 2025, 15:10 PDT
   2. "near …" a clearly famous landmark close by, when line 1 is a venue.
   3. **Neighborhood** (Overture), then **town, region, country** ([GeoNames](https://www.geonames.org), as
      [Immich](https://immich.app) uses) — "Pebble Beach, California, United States".
-- **Places come from your own place server** (`photo-stamp-server`, below), which holds the full data: an
+- **Places come from your own place server** (`photo-stamp-server`, see below), which holds the full data: an
   Overture Maps mirror, GeoNames and [Wikidata](https://www.wikidata.org). A client sends just the point (about
   30 bytes) and gets the caption back (about 200 bytes), typically in well under a second.
 - **On the client** (where the photos are): answers are remembered (`answers.sqlite`), so repeat spots are
@@ -208,42 +208,10 @@ Remembered answers live in the `cache` volume.
 
 ## Place server
 
-`photo-stamp-server` holds the full place data and names points for the family's photo-stamp clients. It runs
-in Docker at home (or on a small VPS later): see [`server/compose.yaml`](server/compose.yaml).
-
-```sh
-docker login forgejo.terrell.ltd              # the image is a private package
-cd server
-docker compose up -d                          # the server on :8080, plus the monthly import
-docker compose run --rm server user add Dave
-docker compose run --rm server device add Dave laptop      # prints the device key, once
-```
-
-- **Data** (in the `data` volume; put it on a disk with ~60 GB free):
-  - a local **mirror of Overture Maps** (places, land use, infrastructure, divisions: about 45 GB);
-  - `places.sqlite`, GeoNames towns and Wikidata landmarks/fame (built by `scripts/build-places-db.py`);
-  - `towns.sqlite`, the small database clients download;
-  - `app.sqlite`: people, devices (only a hash of each key), and history.
-- **Import** (`photo-stamp-server import`; the compose file runs it now and every 30 days) mirrors the newest
-  Overture release and rebuilds the place databases. Downloads resume if interrupted. A running server switches
-  to new data by itself; until its mirror is complete, files it doesn't have yet are read from Overture's cloud
-  copy (just the byte ranges needed). `--bbox west,east,south,north` and `--datasets` limit what's mirrored.
-- **Before the first import** has built `places.sqlite`, the server is up but answers `503` (`/healthz`: "loading";
-  lookups: "still loading", which clients wait out), and switches over by itself when the data appears.
-  `import --skip-overture` builds just the place database, for answers sooner.
-- **Accounts:** `user add|list`, `device add <person> <name> [--no-history]`, `device list`,
-  `device revoke <id or person/name>`. Each device has its own key; revoking one doesn't affect the others.
-- **History:** for devices with history on (the default, changeable in the dashboard), the points they ask about
-  are kept, for trips and the map (coming next). With history off, nothing is kept.
-- **Client updates:** set `PHOTO_STAMP_UPDATES_TOKEN` (a Forgejo token that can read packages) and the server
-  offers the builds in the package registry: `GET /v1/client/latest?channel=stable|beta` and
-  `GET /v1/client/download/<version>`. `PHOTO_STAMP_UPDATES_URL`, `_OWNER` and `_PACKAGE` point elsewhere.
-- **API** (`/v1`, JSON, `Authorization: Bearer <device key>`): `POST /v1/place` `{"lat","lon"}` →
-  `{"place": {"primary","near","context"}, "complete", "data_version", "rev"}`; `POST /v1/places` (up to 100);
-  `GET|PUT /v1/me`; `GET /v1/towns.sqlite`; `GET /healthz`. Types are in `proto/src/api.rs`.
-- **Reaching it from outside:** it speaks plain HTTP on port 8080. Put TLS in front: a proxy host in an existing
-  reverse proxy (e.g. Nginx Proxy Manager) pointing at port 8080, Tailscale, a Cloudflare Tunnel, or the included
-  Caddy (`PLACES_DOMAIN=places.example.com docker compose --profile tls up -d`) for an automatic certificate.
+`photo-stamp-server` holds the full place data and names points for the family's photo-stamp clients. It lives in
+its own repo, [dave/photo-stamp-server](https://forgejo.terrell.ltd/dave/photo-stamp-server), with how to run it.
+The `/v1` protocol (`proto/`) and the HTTP server (`http/`) are copied there: a change to the protocol has to be
+made in both repos.
 
 ## Command line
 
@@ -251,7 +219,6 @@ docker compose run --rm server device add Dave laptop      # prints the device k
 photo-stamp watch <ROOT> [--poll-secs 5] [--settle-secs 3] [--no-events]
 photo-stamp stamp [-n|--dry-run] <PATHS>...     # IN PLACE; RAW → "<name>.jpg" alongside
   global: --offline  --quality <Q>
-photo-stamp-server serve | import | user … | device …   # see "Place server"
 ```
 
 Running outside Docker needs `exiftool` on the PATH (and libheif for HEIC; build with
@@ -292,12 +259,6 @@ rebuilt automatically when it changes. The cargo registry is cached in `~/.cache
 | `installer/`      | The Windows setup program (NSIS)                                     |
 | `assets/`         | Windows icons and manifest (`scripts/make-icons.sh`), caption font   |
 | `proto/`          | Place types, the `/v1` protocol, the places/towns database reader     |
-| `server/src/gazetteer.rs` | Naming a spot: venue / landmark / neighborhood / town scoring |
-| `server/src/overture.rs`  | Overture Maps reads: local mirror, else range requests; row-group pruning |
-| `server/src/wkb.rs`       | Point-in-polygon on WKB geometry                              |
-| `server/src/service.rs`   | The `/v1` API                                                 |
-| `server/src/store.rs`     | People, devices and keys, history (`app.sqlite`)              |
-| `server/src/import.rs`    | Mirroring Overture, building the place databases              |
 
 ## Limitations / next steps
 
@@ -306,7 +267,7 @@ rebuilt automatically when it changes. The cargo registry is cached in `~/.cache
 - For HEIF, rotation comes from the container (as the spec requires); EXIF Orientation is ignored there.
 - RAW output quality is that of the camera's embedded preview (usually full-size JPEG).
 - The embedded EXIF thumbnail is removed rather than regenerated.
-- Location ranking is heuristic; tune the weights in `server/src/gazetteer.rs`.
+- Location ranking is heuristic; its weights are in photo-stamp-server's `server/src/gazetteer.rs`.
 
 ## License
 
