@@ -136,6 +136,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        # All history and tags: scripts/version.sh describes the commit from the newest tag.
+        with:
+          fetch-depth: 0
       - uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: places-db
@@ -144,7 +147,6 @@ jobs:
       # cache skips it.
       - name: Build photo-stamp.exe and photo-stamp-ui.exe
         run: |
-          git fetch --tags --force --quiet || true
           docker build -f docker/Dockerfile.windows --target exe -o type=local,dest=build-out \
             --build-arg PHOTO_STAMP_VERSION="$(scripts/version.sh)" .
       - uses: actions/cache@v4
@@ -205,6 +207,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        # All history and tags: scripts/version.sh describes the commit from the newest tag.
+        with:
+          fetch-depth: 0
       - uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
           name: places-db
@@ -226,7 +231,6 @@ jobs:
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
       - id: version
         run: |
-          git fetch --tags --force --quiet || true
           echo "version=$(scripts/version.sh)" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v7
         with:
@@ -254,9 +258,11 @@ jobs:
       SRV: ps-ci-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
+        # All history and tags: scripts/version.sh describes the commit from the newest tag.
+        with:
+          fetch-depth: 0
       - name: Build
         run: |
-          git fetch --tags --force --quiet || true
           docker build -f docker/Dockerfile.server -t photo-stamp-server:ci-${{ github.run_id }} \
             --build-arg PHOTO_STAMP_VERSION="$(scripts/version.sh)" .
       # Smoke test: a real lookup with the test place data and a fresh device key. The runner's
