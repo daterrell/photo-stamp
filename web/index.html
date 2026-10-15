@@ -14,17 +14,14 @@
     <img src="icon.svg" alt="" width="26" height="26">
     <span>photo-stamp</span>
   </div>
-  <label class="folder" id="folder-pick" hidden>
-    <span class="sr">Watched folder</span>
-    <select id="folder-select"></select>
-  </label>
-  <div class="folder-name" id="folder-name"></div>
+  <div class="folder">
+    <span class="folder-name" id="folder-name" title="The drop folder"></span>
+    <button class="ghost small" id="btn-folder" hidden title="Show the drop folder in File Explorer">Open folder</button>
+  </div>
   <div class="controls">
     <span class="state" id="state" data-state="loading">Connecting</span>
     <button class="ghost" id="btn-pause" hidden>Pause</button>
     <button class="primary" id="btn-resume" hidden>Resume</button>
-    <button class="primary" id="btn-start" hidden>Start</button>
-    <button class="ghost" id="btn-stop" hidden>Stop</button>
   </div>
 </header>
 
@@ -193,7 +190,7 @@
       </div>
       <label class="check"><input type="checkbox" name="notify" id="set-notify"> Notify me when a batch is done</label>
       <label class="check"><input type="checkbox" name="offline" id="set-offline"> <span>Don't use the place server <small>(name places by the nearest town only; restarts photo-stamp)</small></span></label>
-      <label class="check" id="set-startup-row"><input type="checkbox" id="set-startup"> Start photo-stamp when I log in to Windows</label>
+      <label class="check" id="set-startup-row"><input type="checkbox" id="set-startup"> Start Photo Stamp when I log in to Windows</label>
       <div class="form-actions">
         <button class="primary" type="submit" id="set-save">Save settings</button>
         <span class="quiet" id="set-status" role="status"></span>

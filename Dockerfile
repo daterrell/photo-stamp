@@ -11,7 +11,8 @@ COPY src src
 COPY http http
 COPY proto proto
 COPY server server
-COPY ui ui
+COPY web web
+COPY build.rs build.rs
 # The version (from the git tag), passed in by CI: Docker builds can't see .git.
 ARG PHOTO_STAMP_VERSION=0.0.0-dev
 ENV PHOTO_STAMP_VERSION=$PHOTO_STAMP_VERSION

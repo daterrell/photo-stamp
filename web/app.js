@@ -1,5 +1,4 @@
-// photo-stamp dashboard. Talks only to photo-stamp-ui (same origin), which passes /api/s/<key>/…
-// on to the service watching that folder.
+// photo-stamp dashboard, served by photo-stamp itself: everything is /api/… on the same origin.
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -22,9 +21,7 @@ function el(tag, attrs = {}, ...children) {
 }
 
 const state = {
-  services: [],
-  here: null,
-  key: null,
+  app: null,         // /api/app: the drop folder, version, start at login
   snap: null,        // last /status snapshot, kept current by events
   events: null,      // EventSource
   results: [],       // newest first
@@ -50,7 +47,7 @@ async function api(path, opts = {}) {
   if (!res.ok) throw new Error((data && data.error) || `${res.status} ${res.statusText}`);
   return data;
 }
-const svc = (path) => `/api/s/${state.key}/${path}`;
+const svc = (path) => `/api/${path}`;
 
 // Results leave out empty fields; fill them in once, where they arrive.
 function norm(e) {
@@ -94,91 +91,43 @@ function since(t) {
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 const thumb = (id, which) => svc(`thumb/${id}/${which}`);
 
-// ------------------------------------------------------------------ services
+// ------------------------------------------------------------------ connecting
 
-async function loadServices() {
-  let list;
+// Find out about this photo-stamp, then follow it live. While it's not answering (restarting after
+// an update or a settings change, or quit from its tray icon) keep trying: the page picks it up
+// again by itself.
+async function loadApp() {
+  let app;
   try {
-    list = await api("/api/services");
+    app = await api("/api/app");
   } catch (e) {
-    // During an update the dashboard server restarts too: keep trying for a while.
-    if (state.updating && (state.retries = (state.retries || 0) + 1) < 60) {
+    state.retries = (state.retries || 0) + 1;
+    if (state.updating && state.retries < 90) {
       setState("loading", "Updating");
-      setTimeout(loadServices, 2000);
-      return;
+    } else if (state.retries > 3) {
+      state.updating = false;
+      setState("stopped", "Not running");
+      $("progress").hidden = true;
+      showEmpty("Photo Stamp isn't running",
+        "Photos dropped into the folder wait until it starts again: when you next log in, or from Photo Stamp in the Start menu. This page reconnects by itself.");
+    } else {
+      setState("loading", "Reconnecting");
     }
-    showEmpty("The dashboard can't be reached", "Start photo-stamp-ui again, then reload this page.");
+    setTimeout(loadApp, 2000);
     return;
   }
   state.retries = 0;
-  // A new version of the dashboard is serving: load its page.
-  if (state.pageVersion && list.version !== state.pageVersion) {
+  state.updating = false;
+  // A new version is running: load its page.
+  if (state.app && app.version !== state.app.version) {
     location.reload();
     return;
   }
-  state.pageVersion = list.version;
-  state.services = list.services;
-  state.here = list.here;
-  const pick = $("folder-select");
-  pick.replaceChildren(...state.services.map((s) => el("option", { value: s.key }, s.root)));
-  $("folder-pick").hidden = state.services.length < 2;
-
-  let saved = null;
-  try { saved = localStorage.getItem("photo-stamp-folder"); } catch { /* private mode */ }
-  const chosen = state.services.find((s) => s.key === state.key) || state.services.find((s) => s.key === saved) || state.services[0];
-  if (!chosen) {
-    setState("stopped", "Not running");
-    if (state.here) {
-      showEmpty("Nothing is being watched yet",
-        `Start photo-stamp to stamp photos dropped into ${state.here}. Stamped photos go to its outbox folder.`,
-        "Start watching this folder", startHere);
-    } else {
-      showEmpty("Nothing is being watched yet",
-        "Run photo-stamp.exe in the folder you want to drop photos into, then reload this page.");
-    }
-    return;
-  }
-  pick.value = chosen.key;
-  select(chosen.key);
-}
-
-function current() {
-  return state.services.find((s) => s.key === state.key);
-}
-
-function select(key) {
-  if (state.events) state.events.close();
-  state.events = null;
-  state.key = key;
-  state.snap = null;
-  state.results = [];
-  state.lastNow = null;
-  try { localStorage.setItem("photo-stamp-folder", key); } catch { /* private mode */ }
-  const s = current();
-  $("folder-name").textContent = state.services.length < 2 ? s.root : "";
+  state.app = app;
+  $("folder-name").textContent = app.root;
+  $("btn-folder").hidden = false;
   renderStartup();
-  if (!s.running) {
-    // Restarting after an update: wait for the new version (the old one comes back if it fails).
-    if (state.updating && (state.retries = (state.retries || 0) + 1) < 90) {
-      setState("loading", "Updating");
-      setTimeout(loadServices, 2000);
-      return;
-    }
-    state.updating = false;
-    stopped();
-    return;
-  }
-  state.updating = false;
   connect();
-}
-
-function stopped() {
-  const s = current();
-  setState("stopped", "Not running");
-  $("progress").hidden = true;
-  showEmpty("photo-stamp isn't running",
-    `Photos dropped into ${s.root} won't be stamped until it's started again.`,
-    s.can_start || state.here ? "Start photo-stamp" : null, startService);
 }
 
 function showEmpty(title, text, action, onAction) {
@@ -195,35 +144,12 @@ function showEmpty(title, text, action, onAction) {
     };
   }
   for (const p of document.querySelectorAll(".panel")) p.hidden = true;
-  $("btn-start").hidden = true; // the page itself offers the action
-  $("btn-pause").hidden = $("btn-resume").hidden = $("btn-stop").hidden = true;
+  $("btn-pause").hidden = $("btn-resume").hidden = true;
 }
 
 function hideEmpty() {
   $("empty").hidden = true;
   showTab(currentTab());
-}
-
-async function startHere() {
-  setState("loading", "Starting");
-  try {
-    const r = await api("/api/start-here", { method: "POST", body: {} });
-    state.key = r.key;
-    await loadServices();
-  } catch (e) {
-    toast(e.message);
-    loadServices();
-  }
-}
-
-async function startService() {
-  setState("loading", "Starting");
-  try {
-    await api(svc("start"), { method: "POST", body: {} });
-  } catch (e) {
-    toast(e.message);
-  }
-  await loadServices();
 }
 
 // ------------------------------------------------------------------ live connection
@@ -246,11 +172,11 @@ function connect() {
     apply(ev);
   };
   es.onerror = () => {
-    // The browser reconnects by itself; if the service is gone, show that instead.
+    // The browser reconnects by itself; if photo-stamp is gone, show that instead.
     if (++failures >= 2) {
       es.close();
       state.events = null;
-      loadServices();
+      loadApp();
     }
   };
 }
@@ -268,7 +194,7 @@ async function refresh() {
     hideEmpty();
     renderAll();
   } catch (e) {
-    loadServices();
+    loadApp();
   }
 }
 
@@ -372,8 +298,6 @@ function renderState() {
   else setState("running", "Watching");
   $("btn-pause").hidden = s.paused;
   $("btn-resume").hidden = !s.paused;
-  $("btn-stop").hidden = false;
-  $("btn-start").hidden = true;
 }
 
 function setProgress(p) {
@@ -745,10 +669,10 @@ function renderSettings() {
 }
 
 function renderStartup() {
-  const s = current();
+  const a = state.app;
   const row = $("set-startup-row");
-  row.hidden = !s || s.startup === null || s.startup === undefined;
-  if (s && !row.hidden) $("set-startup").checked = s.startup;
+  row.hidden = !a || a.startup === null || a.startup === undefined;
+  if (a && !row.hidden) $("set-startup").checked = a.startup;
 }
 
 $("set-quality").addEventListener("input", (e) => ($("set-quality-out").textContent = e.target.value));
@@ -771,20 +695,19 @@ $("settings-form").addEventListener("submit", async (e) => {
   const save = $("set-save");
   save.disabled = true;
   try {
-    const s = current();
     const wantStartup = $("set-startup").checked;
-    if (!$("set-startup-row").hidden && wantStartup !== s.startup) {
+    if (!$("set-startup-row").hidden && wantStartup !== state.app.startup) {
       const r = await api(svc("startup"), { method: "POST", body: { on: wantStartup } });
-      s.startup = r.on;
+      state.app.startup = r.on;
     }
     const r = await api(svc("settings"), { method: "PUT", body: next });
     state.snap.settings = r.settings;
     if (r.restart) {
-      status.textContent = "Restarting photo-stamp to apply the change";
+      status.textContent = "Restarting Photo Stamp to apply the change";
       if (state.events) state.events.close();
       state.events = null;
       await api(svc("restart"), { method: "POST", body: {} });
-      await loadServices();
+      setTimeout(loadApp, 1500);
     }
     status.textContent = "Saved";
     setTimeout(() => (status.textContent = ""), 3000);
@@ -953,25 +876,11 @@ for (const b of document.querySelectorAll(".tabs button")) {
   });
 }
 
-$("folder-select").addEventListener("change", (e) => select(e.target.value));
 
 $("btn-pause").onclick = () => api(svc("pause"), { method: "POST", body: {} }).catch((e) => toast(e.message));
 $("btn-resume").onclick = () => api(svc("resume"), { method: "POST", body: {} }).catch((e) => toast(e.message));
-$("btn-start").onclick = () => (state.key ? startService() : startHere());
-$("btn-stop").onclick = async () => {
-  const busy = state.snap && state.snap.current;
-  const note = busy ? " It finishes the photos it's working on first." : "";
-  if (!confirm(`Stop photo-stamp? Photos dropped into the folder won't be stamped until it's started again.${note}`)) return;
-  setState("loading", "Stopping");
-  try {
-    await api(svc("stop"), { method: "POST", body: {} });
-  } catch (e) {
-    toast(e.message);
-  }
-  if (state.events) state.events.close();
-  state.events = null;
-  setTimeout(loadServices, 1500);
-};
+$("btn-folder").onclick = () =>
+  api(svc("open-folder"), { method: "POST", body: { which: "drop" } }).catch((e) => toast(e.message));
 
 function renderAll() {
   renderUpdate();
@@ -993,4 +902,4 @@ function renderAll() {
 // Open on the tab named in the address (#health, #settings…), so tabs can be bookmarked.
 const startTab = location.hash.slice(1);
 if (document.querySelector(`.tabs [data-tab="${CSS.escape(startTab)}"]`)) showTab(startTab);
-loadServices();
+loadApp();

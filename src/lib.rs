@@ -2,6 +2,9 @@
 
 pub mod answers;
 pub mod api;
+pub mod appconfig;
+pub mod dashboard;
+pub mod desktop;
 pub mod formats;
 pub mod geo;
 pub mod localtime;
@@ -14,6 +17,8 @@ pub mod render;
 pub mod settings;
 pub mod stamp;
 pub mod status;
+#[cfg(windows)]
+pub mod tray;
 pub mod update;
 pub mod watch;
 #[cfg(windows)]

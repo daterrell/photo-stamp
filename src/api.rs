@@ -1,12 +1,16 @@
-//! The service's local API, for the dashboard (`photo-stamp-ui`). It listens on 127.0.0.1 on a
-//! random port and requires the token from this service's registration file
-//! (`services/<folder>.json` in the data folder), so only this user's programs can use it.
+//! The dashboard and its API, served on http://127.0.0.1:8765 (see [`crate::dashboard`] for who
+//! may use it).
 //!
+//! - `GET  /api/ping`: `{"app": "photo-stamp", "version", "pid"}`
+//! - `GET  /api/app`: the drop folder, outbox, version and whether it starts at login
+//! - `POST /api/startup` `{"on": bool}`: start at login or not
+//! - `POST /api/open-folder` `{"which": "drop"|"outbox"}`: show it in Explorer
+//! - `POST /api/restart`: stop and start again (e.g. after changing the outbox)
 //! - `GET  /api/status`: everything at once ([`crate::status::Snapshot`])
 //! - `GET  /api/events`: server-sent events as things happen
 //! - `GET  /api/results?before=<id>&limit=<n>`: older results, newest first
 //! - `GET  /api/thumb/<id>/<before|after>`: small previews of stamped photos
-//! - `POST /api/pause`, `/api/resume`, `/api/stop`
+//! - `POST /api/pause`, `/api/resume`, `/api/stop` (quit)
 //! - `POST /api/retry` `{"path": "<path within the watched folder>"}`
 //! - `POST /api/stamp-now` `{"path": "…"}` or `{}` for every waiting photo: stop waiting for the
 //!   place server and stamp with what's known on this PC
@@ -20,14 +24,13 @@
 //!   `{"channel": "stable"|"beta"}`. The updater's state is in `/api/status` (`update`).
 
 use std::io::Write;
-use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use photo_stamp_http::registry::same_secret;
-use photo_stamp_http::{Request, Response, serve, sse_event};
+use photo_stamp_http::{Request, Response, sse_event};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -42,12 +45,62 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 pub struct Api {
     pub status: Arc<Status>,
     pub waker: Mutex<Sender<Wake>>,
-    pub token: String,
     /// Where settings changes are saved (`None`: not saved).
     pub settings_path: Option<PathBuf>,
     /// The place server connection (`None` in tests).
     pub geo: Option<Arc<RemoteGeocoder>>,
     pub updater: Option<Arc<crate::update::Updater>>,
+    /// The drop folder and where stamped photos go.
+    pub root: PathBuf,
+    pub outbox: PathBuf,
+    /// Where the dashboard is served (set once listening): requests must be addressed to it.
+    pub port: AtomicU16,
+    /// The start-at-login entry, where that's supported (Windows).
+    pub startup: Option<Startup>,
+    /// Asked to restart (stop, then start again).
+    pub restart: AtomicBool,
+    /// Shutting down: open event streams end.
+    pub closing: Arc<AtomicBool>,
+}
+
+/// photo-stamp's start-at-login entry: its name and the command it runs.
+pub struct Startup {
+    pub name: String,
+    pub command: String,
+}
+
+impl Startup {
+    pub fn is_on(&self) -> bool {
+        #[cfg(windows)]
+        return crate::winsys::starts_at_login(&self.name);
+        #[cfg(not(windows))]
+        false
+    }
+
+    pub fn set(&self, on: bool) -> std::io::Result<()> {
+        #[cfg(windows)]
+        return if on {
+            crate::winsys::install_startup(&self.name, &self.command)
+        } else {
+            crate::winsys::uninstall_startup(&self.name).map(drop)
+        };
+        #[cfg(not(windows))]
+        {
+            let _ = on;
+            Err(std::io::Error::other("starting at login is a Windows feature"))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StartupBody {
+    on: bool,
+}
+
+#[derive(Deserialize)]
+struct OpenBody {
+    #[serde(default)]
+    which: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -78,21 +131,66 @@ fn server_view(geo: &RemoteGeocoder) -> serde_json::Value {
     })
 }
 
-/// A random 128-bit token, as hex.
-pub fn new_token() -> anyhow::Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no randomness for the API token: {e}"))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
+impl Api {
+    pub fn new(status: Arc<Status>, waker: Sender<Wake>, root: &Path, outbox: &Path) -> Self {
+        Self {
+            status,
+            waker: Mutex::new(waker),
+            settings_path: None,
+            geo: None,
+            updater: None,
+            root: root.to_owned(),
+            outbox: outbox.to_owned(),
+            port: AtomicU16::new(crate::dashboard::DEFAULT_PORT),
+            startup: None,
+            restart: AtomicBool::new(false),
+            closing: Arc::new(AtomicBool::new(false)),
+        }
+    }
 
-/// Listen on 127.0.0.1 (a free port) in the background; returns the port.
-pub fn start(api: Arc<Api>) -> std::io::Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    std::thread::Builder::new()
-        .name("api".into())
-        .spawn(move || serve(listener, Arc::new(move |req| handle(&api, req))))?;
-    Ok(port)
+    fn wake(&self, w: Wake) {
+        let _ = self.waker.lock().unwrap().send(w);
+    }
+
+    /// Pause or resume (from the dashboard or the tray icon), and remember it.
+    pub fn set_paused(&self, paused: bool, from: &str) {
+        if self.status.is_paused() != paused {
+            log::info!("{} from {from}", if paused { "paused" } else { "resumed" });
+        }
+        self.update_settings(|s| s.paused = paused);
+        if !paused {
+            self.wake(Wake::Fs);
+        }
+    }
+
+    /// Stop, then start again (as the same version).
+    pub fn request_restart(&self) {
+        log::info!("restarting");
+        self.restart.store(true, Ordering::Relaxed);
+        self.wake(Wake::Stop);
+    }
+
+    /// Quit (from the dashboard or the tray icon).
+    pub fn quit(&self, from: &str) {
+        log::info!("quit from {from}");
+        self.wake(Wake::Stop);
+    }
+
+    /// Change the settings, apply them and save them.
+    fn update_settings(&self, change: impl FnOnce(&mut Settings)) {
+        let mut s = self.status.settings();
+        let was_paused = s.paused;
+        change(&mut s);
+        self.status.set_settings(s.clone());
+        if s.paused != was_paused {
+            self.status.set_paused(s.paused);
+        }
+        if let Some(path) = &self.settings_path
+            && let Err(e) = s.save(path)
+        {
+            log::warn!("couldn't save settings to {}: {e}", path.display());
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -107,20 +205,55 @@ fn safe_relative(p: &str) -> Option<PathBuf> {
 }
 
 pub fn handle(api: &Api, req: Request) -> Response {
-    let authorized = req
-        .header("authorization")
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .is_some_and(|t| same_secret(t.trim(), &api.token));
-    if !authorized {
-        return Response::error(401, "missing or wrong token");
+    if let Err(why) = crate::dashboard::allowed(api.port.load(Ordering::Relaxed), &req) {
+        return Response::error(403, why);
     }
-    let wake = |w: Wake| {
-        let _ = api.waker.lock().unwrap().send(w);
-    };
+    let wake = |w: Wake| api.wake(w);
     let segments: Vec<&str> = req.path.trim_matches('/').split('/').collect();
     match (req.method.as_str(), segments.as_slice()) {
+        ("GET", _) if !req.path.starts_with("/api/") => crate::dashboard::asset(&req.path),
+        ("GET", ["api", "ping"]) => Response::json(
+            200,
+            &json!({ "app": "photo-stamp", "version": photo_stamp_http::VERSION, "pid": std::process::id() }),
+        ),
+        ("GET", ["api", "app"]) => Response::json(
+            200,
+            &json!({
+                "root": api.root,
+                "outbox": api.outbox,
+                "version": photo_stamp_http::VERSION,
+                "pid": std::process::id(),
+                "startup": api.startup.as_ref().map(Startup::is_on),
+            }),
+        ),
+        ("POST", ["api", "startup"]) => {
+            let Some(startup) = &api.startup else { return Response::error(404, "not on this system") };
+            let Ok(body) = req.json::<StartupBody>() else {
+                return Response::error(400, "expected {\"on\": true|false}");
+            };
+            match startup.set(body.on) {
+                Ok(()) => {
+                    log::info!("start at login: {}", if body.on { "on" } else { "off" });
+                    Response::json(200, &json!({ "on": startup.is_on() }))
+                }
+                Err(e) => Response::error(500, &format!("couldn't change start at login: {e}")),
+            }
+        }
+        ("POST", ["api", "open-folder"]) => {
+            let body = req.json::<OpenBody>().unwrap_or(OpenBody { which: None });
+            let dir = match body.which.as_deref() {
+                Some("outbox") => &api.outbox,
+                _ => &api.root,
+            };
+            crate::desktop::open(&dir.to_string_lossy());
+            Response::ok()
+        }
+        ("POST", ["api", "restart"]) => {
+            api.request_restart();
+            Response::ok()
+        }
         ("GET", ["api", "status"]) => api.status.snapshot(|s| Response::json(200, s)),
-        ("GET", ["api", "events"]) => events(api.status.clone()),
+        ("GET", ["api", "events"]) => events(api),
         ("GET", ["api", "results"]) => {
             let before = req.param("before").and_then(|b| b.parse().ok());
             let limit = req.param("limit").and_then(|l| l.parse().ok()).unwrap_or(100).min(500);
@@ -138,17 +271,15 @@ pub fn handle(api: &Api, req: Request) -> Response {
             }
         }
         ("POST", ["api", "pause"]) => {
-            update_settings(api, |s| s.paused = true);
+            api.set_paused(true, "the dashboard");
             Response::ok()
         }
         ("POST", ["api", "resume"]) => {
-            update_settings(api, |s| s.paused = false);
-            wake(Wake::Fs);
+            api.set_paused(false, "the dashboard");
             Response::ok()
         }
         ("POST", ["api", "stop"]) => {
-            log::info!("stop requested from the dashboard");
-            wake(Wake::Stop);
+            api.quit("the dashboard");
             Response::ok()
         }
         ("POST", ["api", "retry"]) => match req.json::<RetryBody>().ok().and_then(|b| safe_relative(&b.path))
@@ -270,7 +401,7 @@ pub fn handle(api: &Api, req: Request) -> Response {
             Ok(new) => {
                 let new = new.sanitized();
                 let restart = api.status.settings().needs_restart(&new);
-                update_settings(api, |s| *s = new.clone());
+                api.update_settings(|s| *s = new.clone());
                 wake(Wake::Fs);
                 Response::json(200, &json!({ "settings": new, "restart": restart }))
             }
@@ -281,26 +412,11 @@ pub fn handle(api: &Api, req: Request) -> Response {
     }
 }
 
-/// Change the settings, apply them and save them.
-fn update_settings(api: &Api, change: impl FnOnce(&mut Settings)) {
-    let mut s = api.status.settings();
-    let was_paused = s.paused;
-    change(&mut s);
-    if s.paused != was_paused {
-        log::info!("{} from the dashboard", if s.paused { "paused" } else { "resumed" });
-    }
-    api.status.set_settings(s.clone());
-    if s.paused != was_paused {
-        api.status.set_paused(s.paused);
-    }
-    if let Some(path) = &api.settings_path
-        && let Err(e) = s.save(path)
-    {
-        log::warn!("couldn't save settings to {}: {e}", path.display());
-    }
-}
-
-fn events(status: Arc<Status>) -> Response {
+/// Server-sent events until the page goes away or photo-stamp shuts down (which must close every
+/// connection, so the port is free for the next copy after an update or restart).
+fn events(api: &Api) -> Response {
+    let status = api.status.clone();
+    let closing = api.closing.clone();
     let rx = status.subscribe();
     Response::stream(
         "text/event-stream",
@@ -309,14 +425,23 @@ fn events(status: Arc<Status>) -> Response {
             let seq = status.snapshot(|s| s.seq);
             out.write_all(sse_event(&json!({ "type": "hello", "seq": seq }).to_string()).as_bytes())?;
             out.flush()?;
-            loop {
-                match rx.recv_timeout(KEEPALIVE) {
-                    Ok(msg) => out.write_all(sse_event(&msg).as_bytes())?,
-                    Err(RecvTimeoutError::Timeout) => out.write_all(b": keepalive\n\n")?,
+            let mut quiet_since = Instant::now();
+            while !closing.load(Ordering::Relaxed) {
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(msg) => {
+                        out.write_all(sse_event(&msg).as_bytes())?;
+                        quiet_since = Instant::now();
+                    }
+                    Err(RecvTimeoutError::Timeout) if quiet_since.elapsed() >= KEEPALIVE => {
+                        out.write_all(b": keepalive\n\n")?;
+                        quiet_since = Instant::now();
+                    }
+                    Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => return Ok(()),
                 }
                 out.flush()?;
             }
+            Ok(())
         }),
     )
 }
@@ -335,24 +460,18 @@ mod tests {
             "k",
             Settings::default(),
         ));
-        (
-            Api {
-                status,
-                waker: Mutex::new(tx),
-                token: "secret".into(),
-                settings_path: None,
-                geo: None,
-                updater: None,
-            },
-            rx,
-        )
+        (Api::new(status, tx, Path::new("/drop"), Path::new("/drop/outbox")), rx)
     }
 
+    /// A request from the dashboard page on the default port.
     fn req(method: &str, path: &str, body: &str) -> Request {
         Request {
             method: method.into(),
             path: path.into(),
-            headers: vec![("authorization".into(), "Bearer secret".into())],
+            headers: vec![
+                ("host".into(), "127.0.0.1:8765".into()),
+                ("origin".into(), "http://127.0.0.1:8765".into()),
+            ],
             body: body.as_bytes().to_vec(),
             ..Request::default()
         }
@@ -366,15 +485,39 @@ mod tests {
     }
 
     #[test]
-    fn requires_the_token() {
+    fn only_from_this_pc_and_the_dashboard_page() {
         let (api, _rx) = api();
         let mut r = req("GET", "/api/status", "");
-        r.headers.clear();
-        assert_eq!(handle(&api, r).status, 401);
-        let mut r = req("GET", "/api/status", "");
-        r.headers = vec![("authorization".into(), "Bearer wrong!".into())];
-        assert_eq!(handle(&api, r).status, 401);
+        r.headers = vec![("host".into(), "evil.example:8765".into())];
+        assert_eq!(handle(&api, r).status, 403);
+        let mut r = req("POST", "/api/pause", "");
+        r.headers.retain(|(n, _)| n != "origin");
+        assert_eq!(handle(&api, r).status, 403, "changes need the page's Origin");
+        assert!(!api.status.is_paused());
         assert_eq!(handle(&api, req("GET", "/api/status", "")).status, 200);
+        assert_eq!(handle(&api, req("GET", "/", "")).status, 200, "the page itself");
+    }
+
+    #[test]
+    fn ping_and_app() {
+        let (api, _rx) = api();
+        let v = json_of(handle(&api, req("GET", "/api/ping", "")));
+        assert_eq!(
+            (v["app"].as_str(), v["pid"].as_u64()),
+            (Some("photo-stamp"), Some(u64::from(std::process::id())))
+        );
+        let v = json_of(handle(&api, req("GET", "/api/app", "")));
+        assert_eq!(v["root"], "/drop");
+        assert_eq!(v["startup"], serde_json::Value::Null, "no start-at-login entry here");
+        assert_eq!(handle(&api, req("POST", "/api/startup", r#"{"on": true}"#)).status, 404);
+    }
+
+    #[test]
+    fn restart_stops_and_says_so() {
+        let (api, rx) = api();
+        assert_eq!(handle(&api, req("POST", "/api/restart", "")).status, 200);
+        assert!(api.restart.load(Ordering::Relaxed));
+        assert!(matches!(rx.try_recv(), Ok(Wake::Stop)));
     }
 
     #[test]
@@ -424,9 +567,14 @@ mod tests {
     fn events_stream_over_http() {
         let (api, _rx) = api();
         let api = Arc::new(api);
-        let port = start(api.clone()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        api.port.store(port, Ordering::Relaxed);
+        let a = api.clone();
+        let _server =
+            photo_stamp_http::Server::spawn(listener, Arc::new(move |req| handle(&a, req))).unwrap();
         let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        s.write_all(b"GET /api/events HTTP/1.1\r\nAuthorization: Bearer secret\r\n\r\n").unwrap();
+        write!(s, "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut got = String::new();
         let mut buf = [0u8; 4096];
@@ -442,5 +590,9 @@ mod tests {
         read_until(&mut got, &mut s, &mut buf, "\"paused\"");
         assert!(got.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(got.contains("Content-Type: text/event-stream"));
+        // Shutting down ends the stream (so the port can be let go).
+        api.closing.store(true, Ordering::Relaxed);
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut s, &mut rest).unwrap();
     }
 }

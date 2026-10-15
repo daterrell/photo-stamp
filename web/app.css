@@ -132,10 +132,7 @@ button { font: inherit; cursor: pointer; border: 0; }
   border-bottom: 1px solid var(--line);
 }
 .brand { display: flex; align-items: center; gap: .5rem; font-weight: 700; font-size: 1.05rem; }
-.folder select {
-  font: inherit; color: var(--ink); background: var(--surface);
-  border: 1px solid var(--line); border-radius: 8px; padding: .3rem .5rem; max-width: 38vw;
-}
+.folder { display: flex; align-items: center; gap: .6rem; min-width: 0; }
 .folder-name { color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 .controls { margin-left: auto; display: flex; align-items: center; gap: .5rem; }
 .state {
@@ -334,7 +331,7 @@ dialog::backdrop { background: rgb(10 12 16 / 60%); }
   .tile.wide { grid-column: auto; }
   .now { grid-template-columns: 1fr; }
   .bar { flex-wrap: wrap; }
-  .folder-name { order: 3; width: 100%; }
+  .folder { order: 3; width: 100%; }
   .field-pair { grid-template-columns: 1fr; }
   td.cap, th:nth-child(4), td:nth-child(6), th:nth-child(6) { display: none; }
 }

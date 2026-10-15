@@ -1,23 +1,25 @@
-//! Windows plumbing for running as a quiet background app: console attachment, one instance per
-//! folder, a stop signal, start-at-login, and message boxes.
+//! Windows plumbing for running as a quiet background app: console attachment, one running copy
+//! per user (per data folder), a stop signal, start-at-login, opening things, and message boxes.
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, GetLastError, HANDLE,
 };
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
-use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW};
+use windows_sys::Win32::System::Registry::{
+    HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
+};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
+    CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, OpenMutexW, SetEvent,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MessageBoxW};
 
 use crate::outbox::Wake;
-use crate::paths::folder_key;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
@@ -48,7 +50,7 @@ pub fn message_box(text: &str, error: bool) {
     }
 }
 
-/// Held while this process is the watcher for a folder.
+/// Held while this process is the running photo-stamp.
 pub struct InstanceGuard(HANDLE);
 
 impl Drop for InstanceGuard {
@@ -60,9 +62,13 @@ impl Drop for InstanceGuard {
 // The handle is only ever closed, from whichever thread drops the guard.
 unsafe impl Send for InstanceGuard {}
 
-/// `None` if another photo-stamp is already watching `root`.
-pub fn single_instance(root: &Path) -> std::io::Result<Option<InstanceGuard>> {
-    let name = wide(format!("Local\\photo-stamp-{}", folder_key(root)));
+fn mutex_name(key: &str) -> Vec<u16> {
+    wide(format!("Local\\photo-stamp-{key}"))
+}
+
+/// `None` if another photo-stamp with this `key` (see `instance_key` in main) is already running.
+pub fn single_instance(key: &str) -> std::io::Result<Option<InstanceGuard>> {
+    let name = mutex_name(key);
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if handle.is_null() {
         return Err(std::io::Error::last_os_error());
@@ -74,13 +80,13 @@ pub fn single_instance(root: &Path) -> std::io::Result<Option<InstanceGuard>> {
     Ok(Some(InstanceGuard(handle)))
 }
 
-fn stop_event_name(root: &Path) -> Vec<u16> {
-    wide(format!("Local\\photo-stamp-stop-{}", folder_key(root)))
+fn stop_event_name(key: &str) -> Vec<u16> {
+    wide(format!("Local\\photo-stamp-stop-{key}"))
 }
 
-/// Wake `waker` with [`Wake::Stop`] when another process runs `photo-stamp --stop` for `root`.
-pub fn on_stop_signal(root: &Path, waker: Sender<Wake>) -> std::io::Result<()> {
-    let name = stop_event_name(root);
+/// Wake `waker` with [`Wake::Stop`] when another process runs `photo-stamp --quit`.
+pub fn on_stop_signal(key: &str, waker: Sender<Wake>) -> std::io::Result<()> {
+    let name = stop_event_name(key);
     let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
     if event.is_null() {
         return Err(std::io::Error::last_os_error());
@@ -93,9 +99,9 @@ pub fn on_stop_signal(root: &Path, waker: Sender<Wake>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Ask the watcher for `root` to stop. Returns false if none is running.
-pub fn signal_stop(root: &Path) -> std::io::Result<bool> {
-    let name = stop_event_name(root);
+/// Ask the running photo-stamp to stop. Returns false if none is running.
+pub fn signal_stop(key: &str) -> std::io::Result<bool> {
+    let name = stop_event_name(key);
     let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
     if event.is_null() {
         return match unsafe { GetLastError() } {
@@ -108,14 +114,27 @@ pub fn signal_stop(root: &Path) -> std::io::Result<bool> {
     if ok { Ok(true) } else { Err(std::io::Error::last_os_error()) }
 }
 
-/// The name of this folder's entry under HKCU\…\Run.
-pub fn startup_entry_name(root: &Path) -> String {
-    format!("photo-stamp {}", folder_key(root))
+/// Whether the running photo-stamp with this `key` is gone (its single-instance lock is free).
+pub fn wait_until_gone(key: &str, timeout: Duration) -> bool {
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    let name = mutex_name(key);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let handle = unsafe { OpenMutexW(SYNCHRONIZE, 0, name.as_ptr()) };
+        if handle.is_null() {
+            return true;
+        }
+        unsafe { CloseHandle(handle) };
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
-/// Start `command` at login for this user (no admin needed).
-pub fn install_startup(root: &Path, command: &str) -> std::io::Result<()> {
-    let (key, name, value) = (wide(RUN_KEY), wide(startup_entry_name(root)), wide(command));
+/// Start `command` at login for this user (no admin needed), as the Run entry `name`.
+pub fn install_startup(name: &str, command: &str) -> std::io::Result<()> {
+    let (key, name, value) = (wide(RUN_KEY), wide(name), wide(command));
     let err = unsafe {
         RegSetKeyValueW(
             HKEY_CURRENT_USER,
@@ -129,9 +148,9 @@ pub fn install_startup(root: &Path, command: &str) -> std::io::Result<()> {
     if err == 0 { Ok(()) } else { Err(std::io::Error::from_raw_os_error(err as i32)) }
 }
 
-/// Remove this folder's start-at-login entry. Returns false if there wasn't one.
-pub fn uninstall_startup(root: &Path) -> std::io::Result<bool> {
-    let (key, name) = (wide(RUN_KEY), wide(startup_entry_name(root)));
+/// Remove the start-at-login entry `name`. Returns false if there wasn't one.
+pub fn uninstall_startup(name: &str) -> std::io::Result<bool> {
+    let (key, name) = (wide(RUN_KEY), wide(name));
     match unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) } {
         0 => Ok(true),
         ERROR_FILE_NOT_FOUND => Ok(false),
@@ -139,14 +158,107 @@ pub fn uninstall_startup(root: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Whether the start-at-login entry `name` exists.
+pub fn starts_at_login(name: &str) -> bool {
+    let (key, name) = (wide(RUN_KEY), wide(name));
+    let err = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    err == 0
+}
+
+/// A text value from the registry under HKEY_CURRENT_USER.
+fn read_string(subkey: &str, value: &str) -> Option<String> {
+    let (key, value) = (wide(subkey), wide(value));
+    let mut len: u32 = 0;
+    let query = |buf: *mut std::ffi::c_void, len: &mut u32| unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            buf,
+            len,
+        )
+    };
+    if query(std::ptr::null_mut(), &mut len) != 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; (len as usize).div_ceil(2)];
+    if query(buf.as_mut_ptr().cast(), &mut len) != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+/// Keep the version shown in Settings > Apps current after an update: if this program is the one
+/// the setup program installed (its uninstall entry points at `program_dir`), set the entry's
+/// DisplayVersion to `version`.
+pub fn sync_installed_version(instance: Option<&str>, program_dir: &std::path::Path, version: &str) {
+    let name = match instance {
+        Some(i) => format!("PhotoStamp-{i}"),
+        None => "PhotoStamp".to_owned(),
+    };
+    let subkey = format!(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{name}");
+    let Some(location) = read_string(&subkey, "InstallLocation") else { return };
+    let norm = |p: &str| p.trim_end_matches(['\\', '/']).to_lowercase();
+    if norm(&location) != norm(&program_dir.to_string_lossy()) {
+        return;
+    }
+    if read_string(&subkey, "DisplayVersion").as_deref() == Some(version) {
+        return;
+    }
+    let (key, value_name, value) = (wide(&subkey), wide("DisplayVersion"), wide(version));
+    let err = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value_name.as_ptr(),
+            REG_SZ,
+            value.as_ptr().cast(),
+            (value.len() * 2) as u32,
+        )
+    };
+    if err == 0 {
+        log::info!("Settings > Apps now shows version {version}");
+    }
+}
+
+/// Open a web address or folder as double-clicking it would.
+pub fn shell_open(target: &str) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let (verb, file) = (wide("open"), wide(target));
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+}
+
 /// The name Windows shows on our notifications.
 const APP_ID: &str = "photo-stamp";
 
 /// Register photo-stamp as a notification sender for this user, so toasts show its name
 /// (unpackaged apps need this instead of a Start menu shortcut).
-fn register_app_id() -> std::io::Result<()> {
+pub fn register_app_id() -> std::io::Result<()> {
     let key = wide(format!(r"Software\Classes\AppUserModelId\{APP_ID}"));
-    let (name, value) = (wide("DisplayName"), wide("photo-stamp"));
+    let (name, value) = (wide("DisplayName"), wide("Photo Stamp"));
     let err = unsafe {
         RegSetKeyValueW(
             HKEY_CURRENT_USER,
