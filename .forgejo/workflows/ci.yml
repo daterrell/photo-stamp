@@ -131,7 +131,7 @@ jobs:
           retention-days: 1
 
   windows:
-    name: Windows zip
+    name: Windows zip and setup
     needs: [check, check-windows, places]
     runs-on: ubuntu-24.04
     steps:
@@ -145,7 +145,7 @@ jobs:
           path: data
       # The static libde265/x265/libheif build takes ~10 minutes; the runner's persistent layer
       # cache skips it.
-      - name: Build photo-stamp.exe and photo-stamp-ui.exe
+      - name: Build photo-stamp.exe
         run: |
           docker build -f docker/Dockerfile.windows --target exe -o type=local,dest=build-out \
             --build-arg PHOTO_STAMP_VERSION="$(scripts/version.sh)" .
@@ -153,27 +153,39 @@ jobs:
         with:
           path: ~/.cache/photo-stamp-dev/downloads
           key: downloads-${{ hashFiles('scripts/build-windows.sh') }}
-      - name: Package with exiftool and place data
+      - name: Install NSIS and mingw binutils
+        run: |
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y --no-install-recommends nsis binutils-mingw-w64-x86-64 >/dev/null
+      - name: Package with exiftool and place data, and make the setup program
         run: scripts/build-windows.sh
         env:
           PHOTO_STAMP_EXE: build-out/photo-stamp.exe
-      - name: Only Windows system DLLs
+      - name: Check the exe and the package
         run: |
-          sudo apt-get update >/dev/null
-          sudo apt-get install -y --no-install-recommends binutils-mingw-w64-x86-64 >/dev/null
-          for exe in photo-stamp.exe photo-stamp-ui.exe; do
-            x86_64-w64-mingw32-objdump -p "dist/photo-stamp-windows/$exe" | grep "DLL Name" | sort -uf | tee dlls.txt
-            if grep -iE "libgcc|libstdc|libwinpthread|libheif|libde265|x265" dlls.txt; then
-              echo "::error::$exe depends on non-system DLLs"
-              exit 1
-            fi
-          done
-      # Pull requests: a short-lived artifact to try the build. Main and tags: published below.
+          exe=dist/photo-stamp-windows/photo-stamp.exe
+          x86_64-w64-mingw32-objdump -p "$exe" | grep "DLL Name" | sort -uf | tee dlls.txt
+          if grep -iE "libgcc|libstdc|libwinpthread|libheif|libde265|x265" dlls.txt; then
+            echo "::error::photo-stamp.exe depends on non-system DLLs"
+            exit 1
+          fi
+          # The icon and manifest (assets/photo-stamp.rc) are linked in.
+          x86_64-w64-mingw32-objdump -h "$exe" | grep -q "\.rsrc" \
+            || { echo "::error::photo-stamp.exe has no resources (icon, manifest)"; exit 1; }
+          # One program: the old separate dashboard must not come back.
+          if python3 -m zipfile -l dist/photo-stamp-windows.zip | grep -q photo-stamp-ui; then
+            echo "::error::the zip still has photo-stamp-ui.exe"
+            exit 1
+          fi
+          test -s dist/photo-stamp-setup.exe
+      # Pull requests: short-lived artifacts to try the build. Main and tags: published below.
       - uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         if: github.event_name == 'pull_request'
         with:
           name: photo-stamp-windows
-          path: dist/photo-stamp-windows.zip
+          path: |
+            dist/photo-stamp-setup.exe
+            dist/photo-stamp-windows.zip
           if-no-files-found: error
           retention-days: 3
       # Main = beta, v* tags = stable (the version says which). Auto-update reads these.
@@ -183,9 +195,13 @@ jobs:
           TOKEN: ${{ secrets.PACKAGES_TOKEN }}
         run: |
           version=$(scripts/version.sh)
-          url="${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/$PACKAGE/${version//+/%2B}/photo-stamp-windows-${version//+/%2B}.zip"
-          curl -sf -X PUT -H "Authorization: token $TOKEN" --upload-file dist/photo-stamp-windows.zip "$url" \
-            || { echo "::error::couldn't publish $version"; exit 1; }
+          v=${version//+/%2B}
+          base="${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/$PACKAGE/$v"
+          # The zip is what auto-update installs; the setup program is for new installs.
+          curl -sf -X PUT -H "Authorization: token $TOKEN" --upload-file dist/photo-stamp-windows.zip \
+            "$base/photo-stamp-windows-$v.zip" || { echo "::error::couldn't publish $version"; exit 1; }
+          curl -sf -X PUT -H "Authorization: token $TOKEN" --upload-file dist/photo-stamp-setup.exe \
+            "$base/photo-stamp-setup-$v.exe" || { echo "::error::couldn't publish the setup for $version"; exit 1; }
           echo "published $PACKAGE $version"
       # Keep the newest beta builds; stable ones are kept.
       - name: Remove old beta builds
@@ -386,8 +402,9 @@ jobs:
           TOKEN: ${{ secrets.PACKAGES_TOKEN }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          curl -sfL -H "Authorization: token $TOKEN" -o photo-stamp-windows.zip \
-            "${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/$PACKAGE/$version/photo-stamp-windows-$version.zip"
+          base="${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/$PACKAGE/$version"
+          curl -sfL -H "Authorization: token $TOKEN" -o photo-stamp-windows.zip "$base/photo-stamp-windows-$version.zip"
+          curl -sfL -H "Authorization: token $TOKEN" -o photo-stamp-setup.exe "$base/photo-stamp-setup-$version.exe"
       - name: Install gh
         run: |
           curl -fsSL https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_linux_amd64.tar.gz | tar xz -C /tmp
@@ -403,14 +420,18 @@ jobs:
       - name: Create release
         run: |
           zip="photo-stamp-windows-${GITHUB_REF_NAME}.zip"
+          setup="photo-stamp-setup-${GITHUB_REF_NAME}.exe"
           mv photo-stamp-windows.zip "$zip"
+          mv photo-stamp-setup.exe "$setup"
           {
-            echo "Unzip into an empty folder to drop photos into, and double-click \`photo-stamp.exe\`."
-            echo "Stamped photos go to its \`outbox\` folder. Double-click \`photo-stamp-ui.exe\` to see and"
-            echo "control what it's doing in your browser. See README.txt inside the zip."
+            echo "**Windows:** download \`$setup\` and run it. It asks where you'll drop photos, then"
+            echo "Photo Stamp runs by the clock and starts whenever you log in; it updates itself."
+            echo "If Windows says it protected your PC, click **More info**, then **Run anyway**."
+            echo
+            echo "The zip holds the same program, for updates and manual installs."
             echo
             echo "Docker image: \`${REGISTRY}/${GITHUB_REPOSITORY}:${GITHUB_REF_NAME#v}\`"
           } > notes.md
-          gh release create "$GITHUB_REF_NAME" "$zip" --verify-tag --title "photo-stamp $GITHUB_REF_NAME" \
+          gh release create "$GITHUB_REF_NAME" "$setup" "$zip" --verify-tag --title "photo-stamp $GITHUB_REF_NAME" \
             --notes-file notes.md --generate-notes
-          rm -f "$zip" /usr/local/bin/gh
+          rm -f "$zip" "$setup" /usr/local/bin/gh

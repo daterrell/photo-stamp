@@ -2,14 +2,14 @@
 # Build the Windows release folder and zip:
 #
 #   dist/photo-stamp-windows/
-#     photo-stamp.exe, photo-stamp-ui.exe (the dashboard)
+#     photo-stamp.exe (watches the drop folder, serves the dashboard, tray icon)
 #     photo-stamp-files/exiftool.exe, photo-stamp-files/exiftool_files/, photo-stamp-files/towns.sqlite
 #     README.txt
-#   dist/photo-stamp-windows.zip
+#   dist/photo-stamp-windows.zip   (what auto-update installs)
+#   dist/photo-stamp-setup.exe     (what people download: installer/photo-stamp.nsi)
 #
-# Needs only Docker. The exe is cross-compiled with HEIC support linked in statically.
-# Set PHOTO_STAMP_EXE to package an exe that was already built (photo-stamp-ui.exe is taken from the same
-# folder), PHOTO_STAMP_PLACES_DB for the place data
+# Needs only Docker (makensis is used directly if it's installed). The exe is cross-compiled with HEIC support linked in statically.
+# Set PHOTO_STAMP_EXE to package an exe that was already built, PHOTO_STAMP_PLACES_DB for the place data
 # (default data/places.sqlite, built with scripts/build-places-db.py if missing).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -28,16 +28,13 @@ mkdir -p "$DIST/photo-stamp-files"
 if [ -n "${PHOTO_STAMP_EXE:-}" ]; then
   # Already built (CI builds it with a layer cache, see .forgejo/workflows/ci.yml).
   cp "$PHOTO_STAMP_EXE" "$DIST/photo-stamp.exe"
-  cp "$(dirname "$PHOTO_STAMP_EXE")/photo-stamp-ui.exe" "$DIST/photo-stamp-ui.exe"
 else
-  echo "building photo-stamp.exe and photo-stamp-ui.exe…"
+  echo "building photo-stamp.exe…"
   docker build -q --target build -t photo-stamp-win-build -f docker/Dockerfile.windows \
     --build-arg PHOTO_STAMP_VERSION="$(scripts/version.sh)" . >/dev/null
   container=$(docker create photo-stamp-win-build)
   trap 'docker rm -f "$container" >/dev/null' EXIT
-  for exe in photo-stamp.exe photo-stamp-ui.exe; do
-    docker cp "$container:/src/target/x86_64-pc-windows-gnu/release/$exe" "$DIST/$exe"
-  done
+  docker cp "$container:/src/target/x86_64-pc-windows-gnu/release/photo-stamp.exe" "$DIST/photo-stamp.exe"
 fi
 
 zip="$CACHE/exiftool-${EXIFTOOL_VERSION}_64.zip"
@@ -76,4 +73,19 @@ python3 scripts/make-towns-db.py "$places" "$DIST/photo-stamp-files/towns.sqlite
 
 cp scripts/windows-README.txt "$DIST/README.txt"
 (cd dist && python3 -m zipfile -c photo-stamp-windows.zip photo-stamp-windows/)
-echo "built $DIST ($(du -sh "$DIST" | cut -f1)) and dist/photo-stamp-windows.zip"
+
+# The setup program. Windows wants a four-number version for its file properties: 0.7.1-dev.3+g1b37dbe → 0.7.1.0.
+version=$(scripts/version.sh)
+numeric=$(echo "$version" | sed -E 's/^([0-9]+)\.([0-9]+)\.([0-9]+).*/\1.\2.\3.0/')
+nsis_args=(-V2 -WX "-DVERSION=$version" "-DVIVERSION=$numeric" "-DDIST=../$DIST" "-DOUTFILE=../dist/photo-stamp-setup.exe" installer/photo-stamp.nsi)
+rm -f dist/photo-stamp-setup.exe
+if command -v makensis >/dev/null; then
+  makensis "${nsis_args[@]}"
+else
+  docker build -q -t photo-stamp-nsis - >/dev/null <<'DOCKERFILE'
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends nsis && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
+  docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" -w /w photo-stamp-nsis makensis "${nsis_args[@]}"
+fi
+echo "built $DIST ($(du -sh "$DIST" | cut -f1)), dist/photo-stamp-windows.zip and dist/photo-stamp-setup.exe ($(du -sh dist/photo-stamp-setup.exe | cut -f1))"

@@ -106,21 +106,35 @@ dropped (the original is kept in `originals\`), and the folders stay.
 - **Place server:** set its address and this device's key in the dashboard (Settings > Place server). They're
   kept in `%LOCALAPPDATA%\photo-stamp\client.json`, readable only by you.
 
-Setup: copy `photo-stamp.exe`, `photo-stamp-ui.exe` and `photo-stamp-files\` into an empty drop folder, then double-click
-photo-stamp.exe (or open photo-stamp-ui.exe and start it from the dashboard). From a
-terminal in that folder:
+**Setup:** run `photo-stamp-setup.exe` from the release. It's a per-user installer (no admin rights) made with
+NSIS (`installer/photo-stamp.nsi`):
+- It asks for the drop folder (default `Pictures\Photo Stamp`) and installs to
+  `%LOCALAPPDATA%\Programs\Photo Stamp`.
+- It runs `photo-stamp.exe --configure <folder>`. That records the folder in `%LOCALAPPDATA%\photo-stamp\app.json`,
+  adds the start-at-login entry (`HKCU\…\Run`, `photo-stamp.exe --background`) and registers for notifications.
+- It starts photo-stamp and opens the dashboard.
+
+Settings > Apps uninstalls it. That keeps the drop folder, photos and `%LOCALAPPDATA%\photo-stamp`. Running setup
+again changes the drop folder. The setup isn't code-signed, so SmartScreen asks once ("More info", then "Run anyway").
+
+**Running:** there's one program, `photo-stamp.exe`, and one copy runs per user.
+- It watches the drop folder, serves the dashboard, and puts an icon by the clock. Click the icon for the
+  dashboard; right-click it for Open drop folder, Pause/Resume and Quit. The icon turns gray while paused.
+- Starting it again (the Start menu shortcut) opens the running copy's dashboard.
+- Which folder it watches: `--root`, then `app.json`, then the exe's own folder (handy for a portable copy).
+
+From a terminal:
 
 ```
-photo-stamp.exe --install-startup     # start at login (HKCU Run entry) and start now
-photo-stamp.exe --uninstall-startup
-photo-stamp.exe --stop
+photo-stamp.exe --quit                # quit the running copy (waits for the photos in hand)
+photo-stamp.exe --background          # start without opening the dashboard (what login does)
 photo-stamp.exe stamp <files>         # one-off
 ```
 
 ### Dashboard
 
-`photo-stamp-ui.exe` shows and controls photo-stamp in your browser. It's a separate program: double-click it
-and it opens `http://127.0.0.1:8765/`, with a button to start photo-stamp if it isn't running.
+photo-stamp serves its dashboard at `http://127.0.0.1:8765/` (`--port` or `PHOTO_STAMP_UI_PORT` to change it). It
+opens when photo-stamp is started by hand, from the tray icon, or by clicking a notification.
 
 - **Activity:**
   - the photo being stamped, as a small preview that changes from the original to the stamped result, with
@@ -137,13 +151,11 @@ and it opens `http://127.0.0.1:8765/`, with a button to start photo-stamp if it 
 - **Settings:** outbox, quality, photos at a time, timing, offline mode, a notification when a batch is done,
   and start at login. Several photos are stamped at once, each all the way through (place lookup, drawing,
   saving). **Photos at a time** set to 0 (automatic) uses half the PC's processor cores, 2 to 6.
-- **Pause / Resume** (new photos are still noticed and queued), **Stop**, and **Start**.
+- **Pause / Resume** (new photos are still noticed and queued); quitting is in the tray icon's menu.
 
-How it fits together: photo-stamp serves a small API on 127.0.0.1 (a random port), protected by a random token.
-It writes the port and token to `%LOCALAPPDATA%\photo-stamp\services\<folder>.json`, which only you can
-read. photo-stamp-ui finds services there, passes the page's requests on with the token, and starts them when
-asked. It only answers requests addressed to `127.0.0.1`/`localhost`, and changes must come from its own page.
-It exits after 30 minutes with no dashboard open; `photo-stamp-ui.exe --stop` stops it sooner.
+How it fits together: the page and its API (`src/api.rs`) come from photo-stamp itself, on 127.0.0.1. It only
+answers requests addressed to `127.0.0.1`/`localhost`, and changes must come from its own page (`Origin`). A
+restart or update hands the port over to the new copy, and the open page reconnects by itself.
 
 Settings changed in the dashboard are kept in `%LOCALAPPDATA%\photo-stamp\settings-<folder>.json`; options on the
 command line override them. History and previews (the most recent 2,000) are kept there too.
@@ -276,7 +288,9 @@ rebuilt automatically when it changes. The cargo registry is cached in `~/.cache
 | `src/settings.rs` | Settings the dashboard can change                                     |
 | `src/main.rs`     | CLI                                                                   |
 | `http/`           | Minimal HTTP server and the service registry, shared with the dashboard |
-| `ui/`             | `photo-stamp-ui`: the dashboard server and page (`ui/web/`)           |
+| `web/`            | The dashboard page, served by photo-stamp (`src/dashboard.rs`)      |
+| `installer/`      | The Windows setup program (NSIS)                                     |
+| `assets/`         | Windows icons and manifest (`scripts/make-icons.sh`), caption font   |
 | `proto/`          | Place types, the `/v1` protocol, the places/towns database reader     |
 | `server/src/gazetteer.rs` | Naming a spot: venue / landmark / neighborhood / town scoring |
 | `server/src/overture.rs`  | Overture Maps reads: local mirror, else range requests; row-group pruning |

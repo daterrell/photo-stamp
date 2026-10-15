@@ -1,0 +1,5 @@
+// Windows resources for photo-stamp.exe (compiled by build.rs with mingw's windres): the icon
+// (exe, tray, Settings > Apps), the paused tray icon, and the application manifest.
+1 ICON "photo-stamp.ico"
+2 ICON "photo-stamp-paused.ico"
+1 24 "photo-stamp.manifest"

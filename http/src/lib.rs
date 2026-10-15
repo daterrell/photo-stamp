@@ -6,8 +6,9 @@
 //! Only meant for localhost: there's no TLS, keep-alive or chunked request bodies.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub mod registry;
@@ -118,6 +119,58 @@ pub fn serve(listener: TcpListener, handler: Handler) {
         std::thread::spawn(move || {
             let _ = handle(stream, &handler);
         });
+    }
+}
+
+/// A server running on its own thread, which can be stopped (freeing its port).
+pub struct Server {
+    addr: SocketAddr,
+    stopping: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Server {
+    /// Serve `listener` on a background thread until [`Server::stop`].
+    pub fn spawn(listener: TcpListener, handler: Handler) -> io::Result<Self> {
+        let addr = listener.local_addr()?;
+        let stopping = Arc::new(AtomicBool::new(false));
+        let stop = stopping.clone();
+        let thread = std::thread::Builder::new().name("http".into()).spawn(move || {
+            for stream in listener.incoming() {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(stream) = stream else { continue };
+                let handler = handler.clone();
+                std::thread::spawn(move || {
+                    let _ = handle(stream, &handler);
+                });
+            }
+        })?;
+        Ok(Self { addr, stopping, thread: Some(thread) })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
+    /// Stop accepting connections and close the listening socket. Requests in progress finish on
+    /// their own (long-lived streams should watch for shutdown themselves).
+    pub fn stop(&mut self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        // Wake the accept() so the loop sees the flag.
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_secs(1));
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            self.stop();
+        }
     }
 }
 
@@ -294,6 +347,20 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("Content-Length"));
         assert!(text.ends_with("\r\n\r\ndata: {\"n\":1}\n\ndata: two\ndata: lines\n\n"));
+    }
+
+    #[test]
+    fn a_stopped_server_frees_its_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut server = Server::spawn(listener, Arc::new(|_| Response::ok())).unwrap();
+        let port = server.port();
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut text = String::new();
+        s.read_to_string(&mut text).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200"));
+        server.stop();
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_ok(), "port {port} is free again");
     }
 
     #[test]

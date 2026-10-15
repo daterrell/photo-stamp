@@ -1,4 +1,4 @@
-photo-stamp for Windows
+Photo Stamp for Windows
 =======================
 
 Burns the place and local time each photo was taken into the photo itself, using the photo's
@@ -6,11 +6,21 @@ own metadata (date and GPS position).
 
 SETUP
 
-1. Make an empty folder to drop photos into, e.g. Pictures\Stamp. Copy photo-stamp.exe AND the
-   photo-stamp-files folder into it.
-2. Double-click photo-stamp.exe. Nothing appears on screen: it runs in the background.
-3. To have it start whenever you log in, open a terminal in that folder and run:
-       photo-stamp.exe --install-startup
+Run photo-stamp-setup.exe (from the release page). It asks which folder you'll drop photos into
+(Pictures\Photo Stamp unless you choose another), installs Photo Stamp for you (no admin rights
+needed), starts it, and opens the dashboard. It starts by itself whenever you log in.
+
+If Windows says "Windows protected your PC", click "More info", then "Run anyway": Photo Stamp
+isn't signed with a paid certificate, so Windows doesn't recognize it yet.
+
+To change the drop folder, run the setup program again. To remove Photo Stamp: Settings > Apps >
+Photo Stamp > Uninstall. Your photos, the drop folder and Photo Stamp's settings are kept.
+
+THE ICON BY THE CLOCK
+
+While Photo Stamp is running its icon sits by the clock (it may be under the ^ arrow); it turns
+gray while paused. Click it to open the dashboard. Right-click it to open the drop folder, pause
+or resume, or quit (it starts again when you next log in, or from Photo Stamp in the Start menu).
 
 WHAT IT DOES
 
@@ -26,16 +36,15 @@ WHAT IT DOES
   ARW, ...) are never modified: they're moved with a stamped copy beside them as <name>.jpg.
 - If the outbox already has a photo by that name, the new one becomes "name (2).jpg".
 - Other files (videos, documents, ...) are left where they are, and so are the folders.
-- The outbox, originals and photo-stamp-files folders are ignored. To use a different outbox, start it with
-  --outbox "D:\Stamped".
+- The outbox and originals folders are ignored. Another outbox or originals folder can be chosen in
+  the dashboard: Settings.
 
 DASHBOARD
 
-Double-click photo-stamp-ui.exe to see what photo-stamp is doing, in your browser
-(http://127.0.0.1:8765/): the photo being stamped, what's waiting, progress and time left, everything
-processed, photos that weren't stamped, and the log. You can pause, resume, stop and start photo-stamp
-there, and change its settings. Only this PC can open it. It closes by itself after half an hour with
-no dashboard open.
+Click the icon by the clock (or Photo Stamp in the Start menu) to see what Photo Stamp is doing, in
+your browser (http://127.0.0.1:8765/): the photos being stamped, what's waiting, progress and time
+left, everything processed, photos that weren't stamped, and the log. You can pause and resume
+there, and change its settings. Only this PC can open it.
 
 UPDATES
 
@@ -44,14 +53,11 @@ newer one in the background, and the dashboard offers "Install and restart". If 
 doesn't start, the old one is put back automatically. Settings > Updates chooses releases only
 (the default) or every build.
 
-COMMANDS (from a terminal in the folder)
+COMMANDS (from a terminal in Photo Stamp's program folder, %LOCALAPPDATA%\Programs\Photo Stamp)
 
-    photo-stamp.exe --install-startup     start at login (and start now)
-    photo-stamp.exe --uninstall-startup   stop starting at login
-    photo-stamp.exe --stop                stop the running copy
+    photo-stamp.exe --quit                quit the running copy
     photo-stamp.exe stamp <files>         stamp specific photos once
     photo-stamp.exe --help                everything else
-    photo-stamp-ui.exe --stop             close the dashboard server
 
 LOG
 
