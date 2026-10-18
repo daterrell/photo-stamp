@@ -241,7 +241,9 @@ impl PlacesDb {
 pub(crate) mod tests {
     use super::*;
 
-    /// A small real-data database around the test locations (tests/fixtures/places.sqlite).
+    /// A small real-data database around the test locations (tests/fixtures/places.sqlite), built with
+    /// dave/photo-stamp-places: `scripts/build-places-db.py --near 36.56,-121.94 --near 48.858,2.294
+    /// --radius-km 30 --fame-from tests/fixtures/overture.json tests/fixtures/places.sqlite`.
     pub fn fixture_db() -> PlacesDb {
         PlacesDb::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/places.sqlite"))
             .unwrap()
