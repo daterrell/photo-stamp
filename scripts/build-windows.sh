@@ -64,9 +64,7 @@ EOF
 
 # Bundled place data: the small towns database (towns, regions, countries); the place server has the rest.
 towns="${PHOTO_STAMP_TOWNS_DB:-data/towns.sqlite}"
-if [ ! -f "$towns" ]; then
-  scripts/fetch-places.sh "$(dirname "$towns")" towns.sqlite
-fi
+[ -f "$towns" ] || scripts/fetch-places.sh "$towns"
 cp "$towns" "$DIST/photo-stamp-files/towns.sqlite"
 
 cp scripts/windows-README.txt "$DIST/README.txt"
