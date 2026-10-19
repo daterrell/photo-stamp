@@ -3,7 +3,9 @@
 //! Each connection carries one request and is closed after the response (`Connection: close`),
 //! which keeps this small and makes streamed responses (server-sent events) simple: the body is
 //! written straight to the socket, flushed as it goes, and ends when the connection closes.
-//! Only meant for localhost: there's no TLS, keep-alive or chunked request bodies.
+//! Only meant for localhost: there's no TLS, keep-alive or chunked request bodies. Bodies over
+//! 1 MB (e.g. photos dropped on the dashboard) aren't read up front: the handler reads them from
+//! [`Request::stream`].
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -17,12 +19,14 @@ pub mod registry;
 /// something like `0.6.1-dev.7+g1b37dbe` (see `scripts/version.sh`).
 pub const VERSION: &str = env!("PHOTO_STAMP_VERSION");
 
-/// Largest request body accepted.
-const MAX_BODY: usize = 1024 * 1024;
+/// Largest request body read into memory; bigger ones are left for the handler to stream.
+const MAX_BODY: u64 = 1024 * 1024;
+/// Largest request body accepted at all.
+const MAX_STREAM: u64 = 4 << 30;
 const MAX_HEADER_LINES: usize = 100;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct Request {
     pub method: String,
     /// Path without the query string, e.g. `/api/status`.
@@ -31,7 +35,25 @@ pub struct Request {
     pub query: String,
     /// Header names in lower case.
     pub headers: Vec<(String, String)>,
+    /// The body, when it's at most 1 MB; otherwise empty and the body is in [`Request::stream`].
     pub body: Vec<u8>,
+    /// A body too big to hold in memory, still on the connection (`content_length` bytes).
+    pub stream: Option<BodyStream>,
+}
+
+/// A request body read as it arrives.
+pub struct BodyStream(Box<dyn Read + Send>);
+
+impl Read for BodyStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl std::fmt::Debug for BodyStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("BodyStream")
+    }
 }
 
 impl Request {
@@ -45,6 +67,11 @@ impl Request {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
             (k == name).then(|| percent_decode(v))
         })
+    }
+
+    /// The `Content-Length` (0 if absent).
+    pub fn content_length(&self) -> u64 {
+        self.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0)
     }
 
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
@@ -178,14 +205,41 @@ fn handle(stream: TcpStream, handler: &Handler) -> io::Result<()> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     let _ = stream.set_nodelay(true);
     let mut out = stream.try_clone()?;
-    let response = match read_request(&mut BufReader::new(stream)) {
-        Ok(req) => handler(req),
+    let mut reader = BufReader::new(stream);
+    let response = match read_head(&mut reader) {
+        Ok(req) if req.content_length() > MAX_STREAM => Response::error(413, "request body too large"),
+        Ok(mut req) if req.content_length() > MAX_BODY => {
+            let len = req.content_length();
+            req.stream = Some(BodyStream(Box::new(reader.take(len))));
+            handler(req)
+        }
+        Ok(mut req) => match read_body(&mut reader, &mut req) {
+            Ok(()) => handler(req),
+            Err(e) => Response::error(400, &e.to_string()),
+        },
         Err(e) => Response::error(400, &e.to_string()),
     };
     write_response(&mut out, response)
 }
 
+/// Read a whole request, body included (at most 1 MB).
 pub fn read_request(r: &mut impl BufRead) -> io::Result<Request> {
+    let mut req = read_head(r)?;
+    read_body(r, &mut req)?;
+    Ok(req)
+}
+
+fn read_body(r: &mut impl BufRead, req: &mut Request) -> io::Result<()> {
+    let len = req.content_length();
+    if len > MAX_BODY {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "request body too large"));
+    }
+    req.body = vec![0; len as usize];
+    r.read_exact(&mut req.body)
+}
+
+/// The request line and headers.
+fn read_head(r: &mut impl BufRead) -> io::Result<Request> {
     let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_owned());
     let mut line = String::new();
     r.read_line(&mut line)?;
@@ -211,12 +265,6 @@ pub fn read_request(r: &mut impl BufRead) -> io::Result<Request> {
             req.headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
         }
     }
-    let len: usize = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    if len > MAX_BODY {
-        return Err(bad("request body too large"));
-    }
-    req.body = vec![0; len];
-    r.read_exact(&mut req.body)?;
     Ok(req)
 }
 
@@ -231,6 +279,8 @@ fn reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        413 => "Content Too Large",
+        415 => "Unsupported Media Type",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -361,6 +411,36 @@ mod tests {
         assert!(text.starts_with("HTTP/1.1 200"));
         server.stop();
         assert!(TcpListener::bind(("127.0.0.1", port)).is_ok(), "port {port} is free again");
+    }
+
+    #[test]
+    fn big_bodies_are_streamed_to_the_handler() {
+        use std::sync::Mutex;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let got = Arc::new(Mutex::new((0usize, 0usize)));
+        let seen = got.clone();
+        std::thread::spawn(move || {
+            serve(
+                listener,
+                Arc::new(move |mut req: Request| {
+                    let mut body = Vec::new();
+                    if let Some(s) = req.stream.as_mut() {
+                        s.read_to_end(&mut body).unwrap();
+                    }
+                    *seen.lock().unwrap() = (req.body.len(), body.len());
+                    Response::ok()
+                }),
+            )
+        });
+        let size = 3 * 1024 * 1024;
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.write_all(format!("POST /up HTTP/1.1\r\nContent-Length: {size}\r\n\r\n").as_bytes()).unwrap();
+        s.write_all(&vec![7u8; size]).unwrap();
+        let mut text = String::new();
+        s.read_to_string(&mut text).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert_eq!(*got.lock().unwrap(), (0, size), "in memory: none; streamed: all");
     }
 
     #[test]

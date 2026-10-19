@@ -316,6 +316,31 @@ dialog::backdrop { background: rgb(10 12 16 / 60%); }
 .viewer-close .icon-btn { background: var(--surface); }
 .viewer-meta { padding: 1rem 1.25rem 1.25rem; display: grid; gap: .6rem; }
 .viewer-toggle { display: flex; gap: .4rem; }
+.viewer-bar, .viewer-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .6rem; }
+.viewer-nav { display: flex; align-items: center; gap: .35rem; margin-left: auto; }
+.viewer-nav .icon-btn { display: grid; place-items: center; color: var(--ink); }
+.viewer-nav .icon-btn:disabled { opacity: .35; cursor: default; background: transparent; }
+#viewer-pos { min-width: 5.5rem; text-align: center; font-variant-numeric: tabular-nums; }
+.viewer-edit { display: grid; gap: .6rem; }
+.edit-lines { display: grid; gap: .4rem; }
+.edit-line { display: flex; gap: .3rem; align-items: center; }
+.edit-line input {
+  flex: 1; font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 8px; padding: .4rem .6rem;
+}
+.edit-line:first-child input { font-weight: 600; }
+.results-clear { margin-left: auto; }
+
+/* Dropping photos on the page */
+.dropzone {
+  position: fixed; inset: 0; z-index: 30; display: grid; place-items: center;
+  background: rgb(51 70 200 / 12%); pointer-events: none;
+}
+.dropzone > div {
+  display: grid; gap: .35rem; text-align: center; padding: 2rem 2.75rem;
+  background: var(--surface); border: 2px dashed var(--accent); border-radius: 16px; box-shadow: var(--shadow);
+}
+.dropzone strong { font-size: 1.25rem; }
 
 .toast {
   position: fixed; bottom: 1.25rem; left: 50%; transform: translateX(-50%);

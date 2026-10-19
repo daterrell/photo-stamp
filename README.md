@@ -89,7 +89,8 @@ dropped (the original is kept in `originals\`), and the folders stay.
 - **Every photo is handled**, including ones already in the folder when it starts. File dates don't matter:
   only the `photo-stamp` marker in a photo's metadata says it's already stamped.
 - **Already-stamped photos, and photos with no date or location**, are moved to the outbox unchanged, so the
-  drop folder always empties. The log says which ones weren't stamped and why.
+  drop folder always empties. The dashboard says what each one was missing (no camera metadata at all, as in
+  screenshots; no date taken; no GPS position; a GPS fix of 0, 0), and they can be stamped by hand there.
 - **Camera RAW files** are never modified; they move to the outbox with a stamped `<name>.jpg` beside them.
 - **Name clashes** in the outbox get `a (2).jpg`, `a (3).jpg`… Nothing in the outbox is ever overwritten.
 - Other files (videos, sidecars, documents) are left where they are. Photos that can't be read stay put and
@@ -144,8 +145,13 @@ opens when photo-stamp is started by hand, from the tray icon, or by clicking a 
   - a progress bar with photos done and time left, estimated separately for new spots (map data to download)
     and places you've been before;
   - a running table of everything processed, each with its caption, how long it took and a before/after view.
-- **Not stamped:** photos moved unchanged, grouped by reason, and photos that couldn't be processed, with
-  **Try again**.
+    The viewer steps through them with ← and →, and **Edit stamp** rewrites a caption: the photo is stamped
+    again from its kept original, replacing the stamped copy. **Clear history** empties the table (all-time
+    totals stay); photos also leave it by themselves once they're moved out of the outbox.
+  - Photos (and folders of them) dragged onto the page are copied into the drop folder and stamped like any
+    other.
+- **Not stamped:** photos moved unchanged, grouped by what they were missing, with **Stamp by hand**, and photos
+  that couldn't be processed, with **Try again**.
 - **Health:** map data release, indexes, cache and connection; the bundled place data; all-time totals; and the
   live log.
 - **Settings:** outbox, quality, photos at a time, timing, offline mode, a notification when a batch is done,

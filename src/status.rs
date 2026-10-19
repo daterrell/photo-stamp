@@ -321,6 +321,11 @@ impl Status {
         }
     }
 
+    /// Where finished photos go.
+    pub fn outbox(&self) -> &Path {
+        &self.outbox
+    }
+
     pub fn set_notifier(&self, n: Notifier) {
         *self.notifier.lock().unwrap() = Some(n);
     }
@@ -563,6 +568,116 @@ impl Status {
         }
         inner.log.push_back(line.clone());
         self.emit(&mut inner, "log", json!({ "line": line }));
+    }
+
+    /// Every result kept in the history file (or in memory, without one), oldest first.
+    fn all_entries(&self, inner: &Inner) -> Vec<Entry> {
+        let Some(s) = &self.store else { return inner.recent.iter().cloned().collect() };
+        let text = std::fs::read_to_string(&s.history).unwrap_or_default();
+        text.lines().filter_map(|l| serde_json::from_str::<Entry>(l).ok()).collect()
+    }
+
+    /// Keep only the results `keep` says to (changing them as it likes), in memory and on disk,
+    /// and tell the dashboard to reload them. Returns the ids dropped.
+    fn rewrite_history(&self, inner: &mut Inner, mut keep: impl FnMut(Entry) -> Option<Entry>) -> Vec<u64> {
+        let mut dropped = Vec::new();
+        let mut kept = Vec::new();
+        for e in self.all_entries(inner) {
+            let id = e.id;
+            match keep(e) {
+                Some(e) => kept.push(e),
+                None => dropped.push(id),
+            }
+        }
+        if let Some(s) = &self.store {
+            let write = || -> std::io::Result<()> {
+                let mut text = String::new();
+                for e in &kept {
+                    text.push_str(&serde_json::to_string(e)?);
+                    text.push('\n');
+                }
+                let tmp = s.history.with_extension("tmp");
+                std::fs::write(&tmp, text)?;
+                std::fs::rename(&tmp, &s.history)
+            };
+            if let Err(e) = write() {
+                log::warn!("couldn't save history: {e}");
+            }
+            for id in &dropped {
+                for which in [Which::Before, Which::After] {
+                    let _ = std::fs::remove_file(s.thumbs.join(format!("{id}-{}.jpg", which.name())));
+                }
+            }
+        }
+        inner.history_lines = kept.len();
+        let skip = kept.len().saturating_sub(RECENT_RESULTS);
+        inner.recent = kept.into_iter().skip(skip).collect();
+        self.emit(inner, "history", json!({}));
+        dropped
+    }
+
+    /// Forget every result and its previews ("Clear history" in the dashboard). All-time totals
+    /// are kept; this session's start over.
+    pub fn clear_history(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.session = Totals::default();
+        self.rewrite_history(&mut inner, |_| None);
+        if let Some(s) = &self.store {
+            let _ = std::fs::remove_dir_all(&s.thumbs);
+        }
+    }
+
+    /// Forget the results whose photo is no longer in the outbox (moved out or deleted). Photos
+    /// that couldn't be processed are kept: they're still in the drop folder. Returns how many
+    /// were forgotten.
+    pub fn forget_gone(&self) -> usize {
+        let base = self.outbox.parent().unwrap_or(&self.outbox).to_owned();
+        let mut inner = self.inner.lock().unwrap();
+        let gone = |e: &Entry| {
+            e.outcome != Outcome::Failed && e.output.as_ref().is_some_and(|o| !base.join(o).exists())
+        };
+        if !inner.recent.iter().any(gone)
+            && (self.store.is_none() || !self.all_entries(&inner).iter().any(gone))
+        {
+            return 0;
+        }
+        self.rewrite_history(&mut inner, |e| (!gone(&e)).then_some(e)).len()
+    }
+
+    /// The result with this id, if it's still kept.
+    pub fn entry(&self, id: u64) -> Option<Entry> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .recent
+            .iter()
+            .find(|e| e.id == id)
+            .cloned()
+            .or_else(|| self.all_entries(&inner).into_iter().find(|e| e.id == id))
+    }
+
+    /// A result changed (stamped again from the dashboard); `was` is its outcome before.
+    pub fn amend(&self, entry: Entry, was: Outcome) {
+        let mut guard = self.inner.lock().unwrap();
+        let inner = &mut *guard;
+        if was != entry.outcome {
+            for t in [&mut inner.session, &mut inner.all_time] {
+                match was {
+                    Outcome::Stamped => t.stamped = t.stamped.saturating_sub(1),
+                    Outcome::Unchanged => t.unchanged = t.unchanged.saturating_sub(1),
+                    Outcome::Failed => t.failed = t.failed.saturating_sub(1),
+                }
+                match entry.outcome {
+                    Outcome::Stamped => t.stamped += 1,
+                    Outcome::Unchanged => t.unchanged += 1,
+                    Outcome::Failed => t.failed += 1,
+                }
+            }
+            if let Some(s) = &self.store {
+                let _ = std::fs::write(&s.totals, serde_json::to_vec(&inner.all_time).unwrap_or_default());
+            }
+        }
+        let id = entry.id;
+        self.rewrite_history(inner, |e| Some(if e.id == id { entry.clone() } else { e }));
     }
 
     /// Results older than `before` (an id), newest first.

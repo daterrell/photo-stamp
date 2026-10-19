@@ -349,7 +349,7 @@ impl RemoteGeocoder {
         Ok(me)
     }
 
-    /// Change this device's history setting or the person's wait time on the server.
+    /// Change the person's wait time on the server.
     pub fn update_me(&self, update: &MeUpdate) -> anyhow::Result<Me> {
         let server = self.server().context("no place server set up")?;
         let me: Me = serde_json::from_slice(&self.call(
@@ -480,13 +480,7 @@ impl Geocoder for Arc<RemoteGeocoder> {
         let me = self.clone();
         std::thread::spawn(move || match me.refresh_me() {
             Ok(m) => {
-                log::info!(
-                    "place server: connected as {}'s {} (data {}, history {})",
-                    m.user,
-                    m.device,
-                    m.data_version,
-                    if m.history { "on" } else { "off" }
-                );
+                log::info!("place server: connected as {}'s {} (data {})", m.user, m.device, m.data_version);
                 if let Err(e) = me.update_towns(&m) {
                     log::warn!("couldn't update the towns database: {e:#}");
                 }
@@ -507,7 +501,6 @@ impl Geocoder for Arc<RemoteGeocoder> {
                 latency_ms: net.latency_ms,
                 user: me.as_ref().map(|m| m.user.clone()),
                 device: me.as_ref().map(|m| m.device.clone()),
-                history: me.as_ref().map(|m| m.history),
                 max_wait_hours: me.as_ref().map(|m| m.max_wait_hours),
                 data_version: me.as_ref().map(|m| m.data_version.clone()),
                 server_version: me.as_ref().map(|m| m.server_version.clone()),

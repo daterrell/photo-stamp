@@ -31,7 +31,8 @@ WHAT IT DOES
 - It doesn't matter how old a photo's file dates are. A hidden "photo-stamp" tag in the photo
   marks it as stamped, so nothing is ever stamped twice.
 - Photos that are already stamped, or have no date or location in their metadata, are moved to
-  the outbox unchanged.
+  the outbox unchanged. The dashboard says what each was missing, and you can stamp it by hand
+  there with your own words.
 - JPEG, PNG, WebP, TIFF and HEIC (iPhone) photos are stamped. Camera RAW files (DNG, CR3, NEF,
   ARW, ...) are never modified: they're moved with a stamped copy beside them as <name>.jpg.
 - If the outbox already has a photo by that name, the new one becomes "name (2).jpg".
@@ -45,6 +46,10 @@ Click the icon by the clock (or Photo Stamp in the Start menu) to see what Photo
 your browser (http://127.0.0.1:8765/): the photos being stamped, what's waiting, progress and time
 left, everything processed, photos that weren't stamped, and the log. You can pause and resume
 there, and change its settings. Only this PC can open it.
+
+You can also drag photos, or whole folders of them, onto the dashboard: they're copied into the
+drop folder and stamped. Click a processed photo to see it larger; the arrow keys step through
+them, and "Edit stamp" changes what's written on it.
 
 UPDATES
 

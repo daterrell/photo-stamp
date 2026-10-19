@@ -58,7 +58,6 @@ pub struct ServerHealth {
     /// Who the server says this device is, and its data.
     pub user: Option<String>,
     pub device: Option<String>,
-    pub history: Option<bool>,
     pub max_wait_hours: Option<u32>,
     pub data_version: Option<String>,
     pub server_version: Option<String>,
