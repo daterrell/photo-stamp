@@ -320,7 +320,7 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
     let config_out = outbox::Config {
         outbox: outbox.clone(),
         events: true,
-        originals: Some(originals),
+        originals: Some(originals.clone()),
         waiting_file: data.as_deref().map(|d| d.join(format!("waiting-{folder}.json"))),
     };
     let watcher = match Outbox::new(&root, config_out, &geo, status.clone()) {
@@ -341,6 +341,7 @@ fn here(args: HereArgs, common: &Common) -> ExitCode {
 
     let mut api = api::Api::new(status.clone(), watcher.waker(), &root, &outbox);
     api.settings_path = settings_path;
+    api.originals = Some(originals.clone());
     api.geo = Some(geo.clone());
     api.updater = updater.clone();
     api.port.store(port, std::sync::atomic::Ordering::Relaxed);

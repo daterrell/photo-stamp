@@ -25,6 +25,12 @@ pub struct PhotoInfo {
     /// EXIF orientation (1..=8); 1 when absent.
     pub orientation: u8,
     pub already_stamped: bool,
+    /// The camera named itself (Make or Model): the photo has camera metadata at all.
+    pub camera: bool,
+    /// A date was recorded but is blank or unreadable ("0000:00:00 00:00:00": clock never set).
+    pub date_blank: bool,
+    /// The GPS position was recorded as exactly 0, 0 (no satellite fix).
+    pub gps_zero: bool,
 }
 
 pub use photo_stamp_proto::GpsPoint;
@@ -112,6 +118,8 @@ pub fn read(path: &Path) -> anyhow::Result<PhotoInfo> {
         "-Composite:GPSDateTime",
         "-Orientation",
         "-XMP-dc:Subject",
+        "-Make",
+        "-Model",
     ];
     let mut args: Vec<&OsStr> = ["-json", "-n"].iter().chain(&tags).map(|s| s.as_ref()).collect();
     args.extend(["--".as_ref(), path.as_os_str()]);
@@ -124,8 +132,9 @@ pub fn parse_json(json: &str) -> anyhow::Result<PhotoInfo> {
     let tags = &all[0];
     let text = |k: &str| tags[k].as_str().map(str::trim).filter(|s| !s.is_empty());
 
-    let (taken, embedded_offset) =
-        text("DateTimeOriginal").or_else(|| text("CreateDate")).map(parse_exif_datetime).unwrap_or_default();
+    let date_text = text("DateTimeOriginal").or_else(|| text("CreateDate"));
+    let (taken, embedded_offset) = date_text.map(parse_exif_datetime).unwrap_or_default();
+    let date_blank = date_text.is_some() && taken.is_none();
     let offset =
         text("OffsetTimeOriginal").or_else(|| text("OffsetTime")).and_then(parse_offset).or(embedded_offset);
     let gps_time = text("GPSDateTime").and_then(|s| {
@@ -133,7 +142,9 @@ pub fn parse_json(json: &str) -> anyhow::Result<PhotoInfo> {
         naive.map(|n| n.and_utc())
     });
 
-    let gps = match (tags["GPSLatitude"].as_f64(), tags["GPSLongitude"].as_f64()) {
+    let coords = (tags["GPSLatitude"].as_f64(), tags["GPSLongitude"].as_f64());
+    let gps_zero = coords == (Some(0.0), Some(0.0));
+    let gps = match coords {
         // Exactly 0,0 is what many cameras write when they have no fix.
         (Some(lat), Some(lon)) if lat.abs() <= 90.0 && lon.abs() <= 180.0 && (lat, lon) != (0.0, 0.0) => {
             Some(GpsPoint { lat, lon })
@@ -149,7 +160,9 @@ pub fn parse_json(json: &str) -> anyhow::Result<PhotoInfo> {
         _ => false,
     };
 
-    Ok(PhotoInfo { taken, offset, gps_time, gps, orientation, already_stamped })
+    let camera = text("Make").is_some() || text("Model").is_some();
+
+    Ok(PhotoInfo { taken, offset, gps_time, gps, orientation, already_stamped, camera, date_blank, gps_zero })
 }
 
 /// "2024:06:12 14:32:05", optionally followed by fractional seconds and/or "+02:00" (XMP style).
@@ -252,7 +265,9 @@ mod tests {
         )
         .unwrap();
         assert!(info.is_empty(), "{info:?}");
-        assert!(parse_json("[{}]").unwrap().is_empty());
+        assert!(info.camera && info.date_blank && info.gps_zero, "{info:?}");
+        let bare = parse_json("[{}]").unwrap();
+        assert!(bare.is_empty() && !bare.camera && !bare.date_blank && !bare.gps_zero);
     }
 
     #[test]

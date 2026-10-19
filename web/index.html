@@ -82,6 +82,7 @@
         <h2>Processed</h2>
         <span class="quiet" id="totals"></span>
         <button class="pill" id="new-rows" hidden></button>
+        <button class="ghost small results-clear" id="results-clear" hidden title="Photos also leave this list by themselves once they're moved out of the outbox">Clear history</button>
       </div>
       <div class="table-wrap" id="results-wrap">
         <table>
@@ -129,7 +130,6 @@
         <span class="quiet" id="srv-status" role="status"></span>
       </div>
       <div class="server-prefs" id="srv-prefs" hidden>
-        <label class="check"><input type="checkbox" id="srv-history"> <span>Keep a history of where this device's photos were taken <small>(on the server, for trips and the map)</small></span></label>
         <label class="field">
           <span>When the place server can't be reached</span>
           <span class="with-unit">wait up to <input type="number" id="srv-wait" min="0" max="8760"> hours, then stamp with what this PC knows</span>
@@ -140,14 +140,7 @@
 
     <section class="settings" id="updates">
       <h2>Updates</h2>
-      <p class="quiet">This is photo-stamp <span id="upd-current"></span>. New versions come from the place server; they're downloaded in the background and installed when you choose.</p>
-      <label class="field">
-        <span>Get</span>
-        <select id="upd-channel">
-          <option value="stable">Releases (stable)</option>
-          <option value="beta">Every build (beta)</option>
-        </select>
-      </label>
+      <p class="quiet">This is photo-stamp <span id="upd-current"></span>. New releases come from photo-stamp's page on GitHub; they're downloaded in the background and installed when you choose.</p>
       <div class="form-actions">
         <button class="ghost" type="button" id="upd-check">Check now</button>
         <span class="quiet" id="upd-status" role="status"></span>
@@ -203,14 +196,41 @@
   <form method="dialog" class="viewer-close"><button class="icon-btn" aria-label="Close">✕</button></form>
   <img id="viewer-img" alt="">
   <div class="viewer-meta">
-    <div class="viewer-toggle" role="group" aria-label="Show">
-      <button class="pill" data-which="after" aria-pressed="true">Stamped</button>
-      <button class="pill" data-which="before" aria-pressed="false">Original</button>
+    <div class="viewer-bar">
+      <div class="viewer-toggle" role="group" aria-label="Show">
+        <button class="pill" data-which="after" aria-pressed="true">Stamped</button>
+        <button class="pill" data-which="before" aria-pressed="false">Original</button>
+      </div>
+      <div class="viewer-nav">
+        <button type="button" class="icon-btn" id="viewer-prev" aria-label="Previous photo" title="Previous photo (←)"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <span class="quiet" id="viewer-pos"></span>
+        <button type="button" class="icon-btn" id="viewer-next" aria-label="Next photo" title="Next photo (→)"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      </div>
     </div>
     <div class="caption" id="viewer-caption"></div>
-    <div class="quiet" id="viewer-path"></div>
+    <div class="viewer-edit" id="viewer-edit" hidden>
+      <div class="edit-lines" id="edit-lines"></div>
+      <small class="quiet">One line per box; the first is drawn largest. The photo is stamped again from its original.</small>
+      <div class="form-actions">
+        <button type="button" class="ghost small" id="edit-add">Add line</button>
+        <button type="button" class="primary" id="edit-save">Stamp again</button>
+        <button type="button" class="ghost" id="edit-cancel">Cancel</button>
+        <span class="quiet" id="edit-status" role="status"></span>
+      </div>
+    </div>
+    <div class="viewer-foot">
+      <div class="quiet" id="viewer-path"></div>
+      <button type="button" class="ghost small" id="viewer-edit-btn" hidden>Edit stamp</button>
+    </div>
   </div>
 </dialog>
+
+<div class="dropzone" id="dropzone" hidden>
+  <div>
+    <strong>Drop photos to stamp them</strong>
+    <span class="quiet" id="dropzone-where"></span>
+  </div>
+</div>
 
 <div class="toast" id="toast" role="status" hidden></div>
 </body>

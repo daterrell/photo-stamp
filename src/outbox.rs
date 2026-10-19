@@ -52,6 +52,8 @@ const SKIP_DIRS: &[&str] = &[SUPPORT_DIR, "$RECYCLE.BIN", "System Volume Informa
 /// doubling up to the maximum.
 const GEO_RETRY_BASE: Duration = Duration::from_secs(60);
 const GEO_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
+/// How often to look for results whose photo has left the outbox (they're dropped from the history).
+const FORGET_GONE_EVERY: Duration = Duration::from_secs(60);
 /// A file another program has open is retried this often, this many times.
 const LOCKED_RETRY: Duration = Duration::from_secs(30);
 const LOCKED_ATTEMPTS: u32 = 20;
@@ -199,6 +201,8 @@ pub struct Outbox<'a> {
     stamp_now: HashSet<PathBuf>,
     wake_tx: mpsc::Sender<Wake>,
     wake_rx: mpsc::Receiver<Wake>,
+    /// When results whose photo left the outbox were last looked for.
+    forgot_at: Option<Instant>,
 }
 
 impl<'a> Outbox<'a> {
@@ -235,6 +239,7 @@ impl<'a> Outbox<'a> {
             stamp_now: HashSet::new(),
             wake_tx,
             wake_rx,
+            forgot_at: None,
         })
     }
 
@@ -420,6 +425,13 @@ impl<'a> Outbox<'a> {
         }
         self.status.set_health(self.geo.health());
         self.report_queue();
+        if self.forgot_at.is_none_or(|t| t.elapsed() >= FORGET_GONE_EVERY) {
+            self.forgot_at = Some(Instant::now());
+            let n = self.status.forget_gone();
+            if n > 0 {
+                info!("{n} photos have left the outbox; they're no longer listed");
+            }
+        }
         if self.status.is_paused() {
             return;
         }
@@ -862,8 +874,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 /// `dir/name`, or `dir/name (2).ext`, `(3)`… if taken. With `companion`, the name with that suffix
 /// appended (a RAW's stamped `.jpg`) must be free too.
-#[cfg(test)]
-fn free_name(dir: &Path, name: &std::ffi::OsStr, companion: Option<&str>) -> PathBuf {
+pub fn free_name(dir: &Path, name: &std::ffi::OsStr, companion: Option<&str>) -> PathBuf {
     free_name_where(dir, name, companion, |_| false)
 }
 
@@ -918,6 +929,90 @@ fn is_locked(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Stamp a photo the dashboard lists again, with the caption the person wrote, replacing its
+/// stamped copy in the outbox. The pixels come from the untouched original: the one kept in
+/// `originals`, the RAW beside its JPEG, or (for a photo moved to the outbox unstamped) the photo
+/// itself, which is first put aside in `originals`. Returns the result as it now stands.
+pub fn restamp(
+    status: &Status,
+    entry: &Entry,
+    lines: Vec<String>,
+    originals: &Path,
+    renderer: &mut Renderer,
+) -> anyhow::Result<Entry> {
+    let config = Config {
+        outbox: status.outbox().to_owned(),
+        events: false,
+        originals: Some(originals.to_owned()),
+        waiting_file: None,
+    };
+    let base = config.outbox.parent().unwrap_or(&config.outbox).to_owned();
+    let output = base.join(entry.output.as_deref().context("it isn't in the outbox")?);
+    anyhow::ensure!(output.is_file(), "it's no longer in the outbox ({})", output.display());
+    let raw_of = |jpg: &Path| {
+        let raw = PathBuf::from(jpg.as_os_str().to_string_lossy().strip_suffix(".jpg")?);
+        (formats::classify(&raw) == Some(Kind::Raw) && raw.is_file()).then_some(raw)
+    };
+    let mut original = entry.original.clone();
+    let (source, dest) = match entry.outcome {
+        Outcome::Failed => anyhow::bail!("it couldn't be processed; use Try again instead"),
+        Outcome::Stamped => match (&entry.original, raw_of(&output)) {
+            (Some(o), _) => {
+                let o = base.join(o);
+                anyhow::ensure!(o.is_file(), "its original is no longer at {}", o.display());
+                (o, output.clone())
+            }
+            (None, Some(raw)) => (raw, output.clone()),
+            (None, None) => anyhow::bail!("its original wasn't kept, so it can't be stamped again"),
+        },
+        Outcome::Unchanged => {
+            anyhow::ensure!(
+                !crate::metadata::read(&output)?.already_stamped,
+                "it was already stamped when it was dropped here, and its original isn't here"
+            );
+            if formats::classify(&output) == Some(Kind::Raw) {
+                // The RAW stays; its stamped JPEG goes beside it.
+                let jpg = output.with_file_name(formats::output_name(&output, Kind::Raw));
+                anyhow::ensure!(!jpg.exists(), "{} is already there beside it", jpg.display());
+                (output.clone(), jpg)
+            } else {
+                let rel = Path::new(&entry.path);
+                let odir = originals.join(rel.parent().unwrap_or(Path::new("")));
+                std::fs::create_dir_all(&odir)?;
+                let kept = free_name(&odir, output.file_name().context("no file name")?, None);
+                move_file(&output, &kept)?;
+                original = Some(show_out(&config, &kept));
+                (kept, output.clone())
+            }
+        }
+    };
+    let kind = formats::classify(&source).context("not a supported photo format")?;
+    let info = crate::metadata::read(&source)?;
+    let gps = entry.gps.or(info.gps.map(|g| [g.lat, g.lon]));
+    let job = crate::stamp::Job { kind, info, lines };
+    let before = std::fs::metadata(&source)?;
+    let id = entry.id;
+    let mut on_image = |picture: Picture, img: &image::DynamicImage| match picture {
+        Picture::Original => status.save_thumb(id, Which::Before, img),
+        Picture::Stamped => status.save_thumb(id, Which::After, img),
+    };
+    write_stamped_with(&source, &job, renderer, &dest, status.settings().quality, &mut on_image)?;
+    if let Err(e) = keep_times(&dest, &before) {
+        warn!("couldn't keep the file dates of {}: {e}", dest.display());
+    }
+    info!("restamped   {}: {}", show_out(&config, &dest), job.lines.join(" | "));
+    Ok(Entry {
+        outcome: Outcome::Stamped,
+        reason: None,
+        caption: job.lines,
+        output: Some(show_out(&config, &dest)),
+        thumbs: true,
+        original,
+        gps,
+        ..entry.clone()
+    })
+}
+
 /// Give the stamped photo its original's created/modified/accessed times, so photo apps that sort
 /// by date aren't disturbed.
 fn keep_times(path: &Path, before: &Metadata) -> std::io::Result<()> {
@@ -941,7 +1036,10 @@ mod tests {
     use super::*;
     use crate::geo::Place;
     use crate::settings::Settings;
-    use crate::stamp::tests::{EIFFEL_TAGS, FixedPlace, OfflineWithTown, make_photo, temp_dir};
+    use crate::stamp::{
+        self,
+        tests::{EIFFEL_TAGS, FixedPlace, OfflineWithTown, make_photo, temp_dir},
+    };
 
     /// The place server can't be reached and the person won't wait at all.
     struct OfflineNoWait;
@@ -1260,6 +1358,82 @@ mod tests {
         let mut w = Outbox::new(&root, config(&root), &OfflineNoWait, st).unwrap();
         w.scan_once();
         assert!(stamped(&root.join("outbox/b.jpg")));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The newest result the status has for `path`.
+    fn result_for(status: &Status, path: &str) -> Entry {
+        status.history(None, 100).into_iter().find(|e| e.path == path).unwrap()
+    }
+
+    #[test]
+    fn stamps_again_with_a_written_caption_from_the_original() {
+        let root = temp_dir("outbox-restamp");
+        let status = status(&root);
+        let mut w = Outbox::new(&root, config(&root), &FixedPlace, status.clone()).unwrap();
+        std::fs::create_dir_all(root.join("trip")).unwrap();
+        make_photo(&root.join("trip/a.jpg"), EIFFEL_TAGS);
+        make_photo(&root.join("bare.jpg"), &[]);
+        let bare = std::fs::read(root.join("bare.jpg")).unwrap();
+        w.scan_once();
+        let first = std::fs::read(root.join("outbox/trip/a.jpg")).unwrap();
+        let original = std::fs::read(root.join("originals/trip/a.jpg")).unwrap();
+        let mut renderer = Renderer::new();
+        let originals = root.join(ORIGINALS_DIR);
+
+        let entry = result_for(&status, "trip/a.jpg");
+        let lines = vec!["Grandma's garden".to_owned(), "Summer 2024".to_owned()];
+        let new = restamp(&status, &entry, lines.clone(), &originals, &mut renderer).unwrap();
+        status.amend(new.clone(), entry.outcome);
+        assert_eq!(new.caption, lines);
+        let again = std::fs::read(root.join("outbox/trip/a.jpg")).unwrap();
+        assert_ne!(again, first, "stamped copy replaced");
+        assert!(stamped(&root.join("outbox/trip/a.jpg")));
+        assert_eq!(std::fs::read(root.join("originals/trip/a.jpg")).unwrap(), original, "original untouched");
+        assert_eq!(result_for(&status, "trip/a.jpg").caption, lines, "the history says so");
+
+        // A photo moved unstamped can be stamped by hand: its original is put aside first.
+        let entry = result_for(&status, "bare.jpg");
+        assert_eq!(entry.outcome, Outcome::Unchanged);
+        let new = restamp(&status, &entry, vec!["Somewhere".into()], &originals, &mut renderer).unwrap();
+        status.amend(new.clone(), entry.outcome);
+        assert_eq!(new.outcome, Outcome::Stamped);
+        assert!(stamped(&root.join("outbox/bare.jpg")));
+        assert_eq!(std::fs::read(root.join("originals/bare.jpg")).unwrap(), bare);
+        status.snapshot(|s| assert_eq!((s.all_time.stamped, s.all_time.unchanged), (2, 0)));
+
+        // A photo already stamped elsewhere has no original here.
+        make_photo(&root.join("elsewhere.jpg"), EIFFEL_TAGS);
+        stamp::stamp_in_place(
+            &root.join("elsewhere.jpg"),
+            &FixedPlace,
+            &mut renderer,
+            stamp::Options { dry_run: false, quality: 90 },
+        )
+        .unwrap();
+        w.scan_once();
+        let entry = result_for(&status, "elsewhere.jpg");
+        let err = restamp(&status, &entry, vec!["x".into()], &originals, &mut renderer).unwrap_err();
+        assert!(err.to_string().contains("already stamped"), "{err:#}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn photos_moved_out_of_the_outbox_leave_the_list() {
+        let root = temp_dir("outbox-forget");
+        let status = status(&root);
+        let mut w = Outbox::new(&root, config(&root), &FixedPlace, status.clone()).unwrap();
+        make_photo(&root.join("a.jpg"), EIFFEL_TAGS);
+        make_photo(&root.join("b.jpg"), EIFFEL_TAGS);
+        w.scan_once();
+        assert_eq!(status.forget_gone(), 0, "both still in the outbox");
+        std::fs::remove_file(root.join("outbox/a.jpg")).unwrap();
+        assert_eq!(status.forget_gone(), 1);
+        let left: Vec<String> = status.history(None, 100).into_iter().map(|e| e.path).collect();
+        assert_eq!(left, ["b.jpg"]);
+        status.clear_history();
+        assert!(status.history(None, 100).is_empty());
+        status.snapshot(|s| assert_eq!(s.all_time.stamped, 2, "all-time totals are kept"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

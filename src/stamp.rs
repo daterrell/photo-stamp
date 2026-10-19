@@ -17,17 +17,66 @@ use crate::render::{Line, Renderer};
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Skip {
     Unsupported,
-    NoMetadata,
+    /// Nothing to stamp: no date or place.
+    NoMetadata(Missing),
     AlreadyStamped,
+}
+
+/// What a photo with nothing to stamp lacks, so the person can tell why.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Missing {
+    /// No camera metadata at all (screenshots, photos saved from messaging apps or the web).
+    Everything,
+    /// The camera's metadata has neither a date taken nor a GPS position.
+    DateAndPlace { date_blank: bool, gps_zero: bool },
+    /// Only the time of a GPS fix: no date taken and no position.
+    OnlyGpsTime,
+}
+
+impl Missing {
+    fn of(info: &PhotoInfo) -> Self {
+        if info.gps_time.is_some() {
+            Missing::OnlyGpsTime
+        } else if !info.camera && !info.date_blank && !info.gps_zero {
+            Missing::Everything
+        } else {
+            Missing::DateAndPlace { date_blank: info.date_blank, gps_zero: info.gps_zero }
+        }
+    }
+}
+
+impl fmt::Display for Missing {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Missing::Everything => f.write_str(
+                "no camera metadata at all (screenshots, and photos saved from messaging apps or \
+                 websites, usually have none)",
+            ),
+            Missing::DateAndPlace { date_blank, gps_zero } => {
+                let date = if date_blank {
+                    "the date taken is blank (the camera's clock wasn't set)"
+                } else {
+                    "no date taken"
+                };
+                let place = if gps_zero {
+                    "the GPS position is 0, 0 (no satellite fix)"
+                } else {
+                    "no GPS position (location may have been off)"
+                };
+                write!(f, "{date}, and {place}")
+            }
+            Missing::OnlyGpsTime => f.write_str("only the time of a GPS fix, with no date taken or position"),
+        }
+    }
 }
 
 impl fmt::Display for Skip {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(match self {
-            Skip::Unsupported => "not a supported photo format",
-            Skip::NoMetadata => "no date or location in its metadata",
-            Skip::AlreadyStamped => "already stamped",
-        })
+        match self {
+            Skip::Unsupported => f.write_str("not a supported photo format"),
+            Skip::NoMetadata(missing) => missing.fmt(f),
+            Skip::AlreadyStamped => f.write_str("already stamped"),
+        }
     }
 }
 
@@ -101,11 +150,11 @@ pub fn prepare(path: &Path, geo: &dyn Geocoder, strict_geo: bool) -> anyhow::Res
         return Ok(Prepared::Skip(Skip::AlreadyStamped));
     }
     if info.is_empty() {
-        return Ok(Prepared::Skip(Skip::NoMetadata));
+        return Ok(Prepared::Skip(Skip::NoMetadata(Missing::of(&info))));
     }
     let lines = caption_lines(&info, geo, strict_geo)?;
     if lines.is_empty() {
-        return Ok(Prepared::Skip(Skip::NoMetadata));
+        return Ok(Prepared::Skip(Skip::NoMetadata(Missing::of(&info))));
     }
     Ok(Prepared::Stamp(Job { kind, info, lines }))
 }
@@ -383,9 +432,12 @@ pub(crate) mod tests {
         let text = dir.join("notes.txt");
         std::fs::write(&text, "hi").unwrap();
 
-        for (path, why) in
-            [(&bare, Skip::NoMetadata), (&camera_only, Skip::NoMetadata), (&text, Skip::Unsupported)]
-        {
+        let camera_no_date_or_gps = Missing::DateAndPlace { date_blank: false, gps_zero: false };
+        for (path, why) in [
+            (&bare, Skip::NoMetadata(Missing::Everything)),
+            (&camera_only, Skip::NoMetadata(camera_no_date_or_gps)),
+            (&text, Skip::Unsupported),
+        ] {
             let before = std::fs::read(path).unwrap();
             assert_eq!(
                 stamp_in_place(path, &FixedPlace, &mut renderer, opts).unwrap(),
@@ -394,6 +446,23 @@ pub(crate) mod tests {
             assert_eq!(std::fs::read(path).unwrap(), before);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn says_what_is_missing() {
+        let reason = |info: PhotoInfo| Skip::NoMetadata(Missing::of(&info)).to_string();
+        assert!(reason(PhotoInfo::default()).starts_with("no camera metadata at all"));
+        let camera = PhotoInfo { camera: true, ..Default::default() };
+        assert_eq!(reason(camera.clone()), "no date taken, and no GPS position (location may have been off)");
+        assert_eq!(
+            reason(PhotoInfo { date_blank: true, gps_zero: true, ..camera }),
+            "the date taken is blank (the camera's clock wasn't set), and the GPS position is 0, 0 (no satellite fix)"
+        );
+        let gps_time = Some(chrono::DateTime::from_timestamp(1_718_195_525, 0).unwrap());
+        assert_eq!(
+            reason(PhotoInfo { gps_time, ..Default::default() }),
+            "only the time of a GPS fix, with no date taken or position"
+        );
     }
 
     #[test]

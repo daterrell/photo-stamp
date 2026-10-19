@@ -10,6 +10,11 @@
 //! - `GET  /api/events`: server-sent events as things happen
 //! - `GET  /api/results?before=<id>&limit=<n>`: older results, newest first
 //! - `GET  /api/thumb/<id>/<before|after>`: small previews of stamped photos
+//! - `POST /api/restamp` `{"id": n, "lines": ["…"]}`: stamp a listed photo again with these caption
+//!   lines (from its kept original), replacing its stamped copy; replies with its result
+//! - `POST /api/history/clear`: forget the results and previews (all-time totals stay)
+//! - `POST /api/upload?path=<path within the watched folder>`: a photo dropped on the dashboard,
+//!   as the request body; it's put in the watched folder (a free name if that one's taken)
 //! - `POST /api/pause`, `/api/resume`, `/api/stop` (quit)
 //! - `POST /api/retry` `{"path": "<path within the watched folder>"}`
 //! - `POST /api/stamp-now` `{"path": "…"}` or `{}` for every waiting photo: stop waiting for the
@@ -18,10 +23,10 @@
 //!   offline changes only apply after a restart.
 //! - `GET /api/server`, `PUT /api/server` `{"url", "key"}` (an empty key keeps the current one),
 //!   `DELETE /api/server`: the place server this PC uses; `POST /api/server/test`
-//! - `PUT /api/me` `{"history": bool, "max_wait_hours": n}`: this device's settings on the server
+//! - `PUT /api/me` `{"max_wait_hours": n}`: how long photos wait for the place server
 //! - `POST /api/update/check`; `POST /api/update/install` (installs the downloaded update: finishes
-//!   the photo in hand, then restarts as the new version); `PUT /api/update/channel`
-//!   `{"channel": "stable"|"beta"}`. The updater's state is in `/api/status` (`update`).
+//!   the photo in hand, then restarts as the new version). Updates come from GitHub releases; the
+//!   updater's state is in `/api/status` (`update`).
 
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -61,6 +66,10 @@ pub struct Api {
     pub restart: AtomicBool,
     /// Shutting down: open event streams end.
     pub closing: Arc<AtomicBool>,
+    /// Where the originals of stamped photos are kept (`None`: `originals` in the watched folder).
+    pub originals: Option<PathBuf>,
+    /// For stamping photos again from the dashboard (made when first needed: loading fonts is slow).
+    renderer: Mutex<Option<crate::render::Renderer>>,
 }
 
 /// photo-stamp's start-at-login entry: its name and the command it runs.
@@ -104,8 +113,8 @@ struct OpenBody {
 }
 
 #[derive(Deserialize)]
-struct ChannelBody {
-    channel: String,
+struct WaitBody {
+    max_wait_hours: u32,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +154,8 @@ impl Api {
             startup: None,
             restart: AtomicBool::new(false),
             closing: Arc::new(AtomicBool::new(false)),
+            originals: None,
+            renderer: Mutex::new(None),
         }
     }
 
@@ -196,6 +207,121 @@ impl Api {
 #[derive(Deserialize)]
 struct RetryBody {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct RestampBody {
+    id: u64,
+    lines: Vec<String>,
+}
+
+/// Caption lines as typed: trimmed, blank ones dropped. At least one, at most six, each of
+/// reasonable length.
+fn caption_from(lines: Vec<String>) -> Result<Vec<String>, &'static str> {
+    let lines: Vec<String> =
+        lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).map(str::to_owned).collect();
+    if lines.is_empty() {
+        return Err("write at least one line");
+    }
+    if lines.len() > 6 {
+        return Err("a stamp has at most six lines");
+    }
+    if lines.iter().any(|l| l.chars().count() > 200) {
+        return Err("a line can be at most 200 characters");
+    }
+    Ok(lines)
+}
+
+impl Api {
+    fn originals(&self) -> PathBuf {
+        self.originals.clone().unwrap_or_else(|| self.root.join(crate::outbox::ORIGINALS_DIR))
+    }
+
+    /// Stamp a listed photo again with the person's caption.
+    fn restamp(&self, body: RestampBody) -> Response {
+        let lines = match caption_from(body.lines) {
+            Ok(l) => l,
+            Err(why) => return Response::error(400, why),
+        };
+        let Some(entry) = self.status.entry(body.id) else {
+            return Response::error(404, "that photo is no longer listed");
+        };
+        let mut renderer = self.renderer.lock().unwrap();
+        let renderer = renderer.get_or_insert_with(crate::render::Renderer::new);
+        match crate::outbox::restamp(&self.status, &entry, lines, &self.originals(), renderer) {
+            Ok(new) => {
+                self.status.amend(new.clone(), entry.outcome);
+                Response::json(200, &new)
+            }
+            Err(e) => Response::error(409, &format!("Couldn't stamp {} again: {e:#}", entry.path)),
+        }
+    }
+
+    /// A photo dropped on the dashboard: put it in the watched folder for the watcher to stamp.
+    fn upload(&self, mut req: Request) -> Response {
+        let Some(rel) = req.param("path").as_deref().and_then(safe_relative) else {
+            return Response::error(400, "expected ?path=<path within the watched folder>");
+        };
+        if crate::formats::classify(&rel).is_none() {
+            return Response::error(415, "photo-stamp doesn't stamp this kind of file");
+        }
+        let dir = self.root.join(rel.parent().unwrap_or(Path::new("")));
+        // As folders, case-insensitively: "outbox2" isn't inside "outbox".
+        let lower = |p: &Path| {
+            format!("{}/", p.to_string_lossy().to_lowercase().replace('\\', "/").trim_end_matches('/'))
+        };
+        let support = self.root.join(crate::outbox::SUPPORT_DIR);
+        if [&self.outbox, &self.originals(), &support].iter().any(|d| lower(&dir).starts_with(&lower(d))) {
+            return Response::error(400, "photos can't be added to the outbox or originals folder");
+        }
+        let Some(name) = rel.file_name() else { return Response::error(400, "no file name") };
+        let expected = req.content_length();
+        let result = (|| -> anyhow::Result<PathBuf> {
+            std::fs::create_dir_all(&dir)?;
+            // Hidden and ".part": the watcher leaves it alone until it's complete and renamed.
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let tmp = dir.join(format!(
+                ".photo-stamp-upload-{}-{}.part",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let copied = (|| -> anyhow::Result<u64> {
+                let mut out = std::fs::File::create(&tmp)?;
+                let n = match req.stream.as_mut() {
+                    Some(stream) => std::io::copy(stream, &mut out)?,
+                    None => {
+                        out.write_all(&req.body)?;
+                        req.body.len() as u64
+                    }
+                };
+                out.sync_all()?;
+                Ok(n)
+            })();
+            match copied {
+                Ok(n) if n == expected => {}
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    anyhow::bail!("the upload was cut short");
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            }
+            let dest = crate::outbox::free_name(&dir, name, None);
+            std::fs::rename(&tmp, &dest)?;
+            Ok(dest)
+        })();
+        match result {
+            Ok(dest) => {
+                let shown = dest.strip_prefix(&self.root).unwrap_or(&dest).to_string_lossy().into_owned();
+                log::info!("added       {shown} (dropped on the dashboard)");
+                self.wake(Wake::Fs);
+                Response::json(200, &json!({ "path": shown }))
+            }
+            Err(e) => Response::error(500, &format!("couldn't add {}: {e:#}", rel.display())),
+        }
+    }
 }
 
 /// A path within the watched folder, without any way out of it.
@@ -270,6 +396,16 @@ pub fn handle(api: &Api, req: Request) -> Response {
                 None => Response::error(404, "no such preview"),
             }
         }
+        ("POST", ["api", "restamp"]) => match req.json::<RestampBody>() {
+            Ok(body) => api.restamp(body),
+            Err(_) => Response::error(400, "expected {\"id\": n, \"lines\": [\"…\"]}"),
+        },
+        ("POST", ["api", "history", "clear"]) => {
+            log::info!("history cleared from the dashboard");
+            api.status.clear_history();
+            Response::ok()
+        }
+        ("POST", ["api", "upload"]) => api.upload(req),
         ("POST", ["api", "pause"]) => {
             api.set_paused(true, "the dashboard");
             Response::ok()
@@ -358,9 +494,11 @@ pub fn handle(api: &Api, req: Request) -> Response {
         }
         ("PUT", ["api", "me"]) => {
             let Some(geo) = &api.geo else { return Response::error(404, "no place lookups here") };
-            let Ok(update) = req.json::<photo_stamp_proto::api::MeUpdate>() else {
-                return Response::error(400, "expected {\"history\": bool, \"max_wait_hours\": n}");
+            let Ok(body) = req.json::<WaitBody>() else {
+                return Response::error(400, "expected {\"max_wait_hours\": n}");
             };
+            let update =
+                photo_stamp_proto::api::MeUpdate { max_wait_hours: Some(body.max_wait_hours), history: None };
             match geo.update_me(&update) {
                 Ok(me) => Response::json(200, &me),
                 Err(e) => Response::error(502, &format!("{e:#}")),
@@ -380,20 +518,6 @@ pub fn handle(api: &Api, req: Request) -> Response {
                     Response::json(200, &json!({ "version": version }))
                 }
                 Err(e) => Response::error(409, &format!("{e:#}")),
-            }
-        }
-        ("PUT", ["api", "update", "channel"]) => {
-            let Some(u) = api.updater.clone() else { return Response::error(404, "no updates here") };
-            let Ok(body) = req.json::<ChannelBody>() else {
-                return Response::error(400, "expected {\"channel\": \"stable\" or \"beta\"}");
-            };
-            match u.set_channel(&body.channel) {
-                Ok(()) => {
-                    log::info!("update channel set to {}", body.channel);
-                    std::thread::spawn(move || u.check());
-                    Response::ok()
-                }
-                Err(e) => Response::error(400, &format!("{e:#}")),
             }
         }
         ("GET", ["api", "settings"]) => Response::json(200, &api.status.settings()),
@@ -510,6 +634,44 @@ mod tests {
         assert_eq!(v["root"], "/drop");
         assert_eq!(v["startup"], serde_json::Value::Null, "no start-at-login entry here");
         assert_eq!(handle(&api, req("POST", "/api/startup", r#"{"on": true}"#)).status, 404);
+    }
+
+    #[test]
+    fn written_captions_are_tidied_and_checked() {
+        let lines = |v: &[&str]| caption_from(v.iter().map(|s| s.to_string()).collect());
+        assert_eq!(lines(&["  Home ", "", "2024"]).unwrap(), ["Home", "2024"]);
+        assert!(lines(&["", "  "]).is_err());
+        assert!(lines(&["a"; 7]).is_err());
+        assert!(lines(&[&"x".repeat(201)]).is_err());
+    }
+
+    #[test]
+    fn photos_dropped_on_the_page_go_into_the_watched_folder() {
+        let root = crate::stamp::tests::temp_dir("api-upload");
+        let (tx, rx) = channel();
+        let status = Arc::new(Status::new(&root, &root.join("outbox"), None, "k", Settings::default()));
+        let api = Api::new(status, tx, &root, &root.join("outbox"));
+        let upload = |path: &str, body: &str| {
+            let mut r = req("POST", "/api/upload", body);
+            r.query = format!("path={path}");
+            r.headers.push(("content-length".into(), body.len().to_string()));
+            handle(&api, r)
+        };
+        let r = upload("trip%2Fday%201%2Fa.jpg", "jpeg bytes");
+        assert_eq!(r.status, 200);
+        assert_eq!(std::fs::read_to_string(root.join("trip/day 1/a.jpg")).unwrap(), "jpeg bytes");
+        assert!(matches!(rx.try_recv(), Ok(Wake::Fs)), "the watcher is told");
+        assert_eq!(upload("trip%2Fday%201%2Fa.jpg", "more").status, 200);
+        assert_eq!(
+            std::fs::read_to_string(root.join("trip/day 1/a (2).jpg")).unwrap(),
+            "more",
+            "never replaced"
+        );
+        assert_eq!(upload("notes.txt", "hi").status, 415);
+        assert_eq!(upload("outbox%2Fa.jpg", "x").status, 400);
+        assert_eq!(upload("..%2Fescape.jpg", "x").status, 400);
+        assert!(!root.join("outbox/a.jpg").exists() && !root.join("notes.txt").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

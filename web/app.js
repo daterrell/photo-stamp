@@ -89,7 +89,9 @@ function since(t) {
   return duration((Date.now() - t) / 1000);
 }
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-const thumb = (id, which) => svc(`thumb/${id}/${which}`);
+// Previews change when a photo is stamped again: a new address gets past the browser's cache.
+const thumbVersion = {};
+const thumb = (id, which) => svc(`thumb/${id}/${which}`) + (thumbVersion[id] ? `?v=${thumbVersion[id]}` : "");
 
 // ------------------------------------------------------------------ connecting
 
@@ -193,6 +195,7 @@ async function refresh() {
     state.etaAt = Date.now();
     hideEmpty();
     renderAll();
+    if ($("viewer").open && !viewer.editing) showViewer();
   } catch (e) {
     loadApp();
   }
@@ -272,6 +275,10 @@ function apply(ev) {
     case "health":
       s.health = ev.health;
       renderHealth();
+      break;
+    case "history":
+      // Results were cleared, changed or dropped (photos moved out of the outbox): reload them.
+      refresh();
       break;
     case "log":
       s.log.push(ev.line);
@@ -372,7 +379,7 @@ function renderNow() {
     $("now-placeholder").hidden = false;
     $("now-placeholder").textContent = s.paused
       ? "Paused. New photos are noticed but wait until you resume."
-      : `Drop photos into ${s.root} to stamp them.`;
+      : `Drag photos here, or drop them into ${s.root}, to stamp them.`;
     $("now-path").textContent = "";
     $("now-caption").replaceChildren();
   }
@@ -444,6 +451,7 @@ function renderResults() {
   body.replaceChildren(...state.results.map(resultRow));
   $("results-empty").hidden = state.results.length > 0;
   $("results-more").hidden = state.results.length < 100;
+  $("results-clear").hidden = state.results.length === 0;
   state.pendingRows = [];
   $("new-rows").hidden = true;
 }
@@ -462,6 +470,7 @@ function addResult(e) {
   row.classList.add("fresh");
   $("results").prepend(row);
   $("results-empty").hidden = true;
+  $("results-clear").hidden = false;
 }
 
 $("new-rows").onclick = () => {
@@ -471,15 +480,25 @@ $("new-rows").onclick = () => {
 $("results-wrap").addEventListener("mouseenter", () => (state.hoveringTable = true));
 $("results-wrap").addEventListener("mouseleave", () => (state.hoveringTable = false));
 
-$("results-more").onclick = async () => {
-  if (!state.oldestLoaded) return;
+// Load the next 100 older results; returns how many came.
+async function loadOlder() {
+  if (!state.oldestLoaded || $("results-more").hidden) return 0;
+  const older = (await api(svc(`results?before=${state.oldestLoaded}&limit=100`))).map(norm);
+  state.results.push(...older);
+  if (older.length) state.oldestLoaded = older[older.length - 1].id;
+  $("results").append(...older.map(resultRow));
+  $("results-more").hidden = older.length < 100;
+  renderExceptions();
+  return older.length;
+}
+
+$("results-more").onclick = () => loadOlder().catch((e) => toast(e.message));
+
+$("results-clear").onclick = async () => {
+  if (!confirm("Clear the list of processed photos and their previews? Your photos aren't touched, and the all-time totals are kept.")) return;
   try {
-    const older = (await api(svc(`results?before=${state.oldestLoaded}&limit=100`))).map(norm);
-    state.results.push(...older);
-    if (older.length) state.oldestLoaded = older[older.length - 1].id;
-    $("results").append(...older.map(resultRow));
-    $("results-more").hidden = older.length < 100;
-    renderExceptions();
+    await api(svc("history/clear"), { method: "POST", body: {} });
+    toast("History cleared");
   } catch (e) {
     toast(e.message);
   }
@@ -499,21 +518,176 @@ function renderTotals() {
 
 // ------------------------------------------------------------------ viewer
 
+// The photo shown (by id, as the list around it can change), which picture, and whether its
+// caption is being edited.
+const viewer = { id: null, which: "after", editing: false };
+
+function viewerIndex() {
+  return state.results.findIndex((e) => e.id === viewer.id);
+}
+
 function openViewer(e) {
+  viewer.id = e.id;
+  viewer.which = "after";
+  stopEditing();
+  showViewer();
+  if (!$("viewer").open) $("viewer").showModal();
+}
+
+// Photos that can be stamped (again) with a caption the person writes: stamped ones, and ones
+// moved to the outbox unstamped, unless they were stamped elsewhere before.
+function canEdit(e) {
+  return !!e.output && (e.outcome === "stamped" || (e.outcome === "unchanged" && e.reason !== "already stamped"));
+}
+
+function showViewer() {
   const d = $("viewer");
-  const show = (which) => {
-    $("viewer-img").src = thumb(e.id, which);
-    for (const b of d.querySelectorAll("[data-which]")) b.setAttribute("aria-pressed", String(b.dataset.which === which));
-  };
-  for (const b of d.querySelectorAll("[data-which]")) b.onclick = () => show(b.dataset.which);
+  const i = viewerIndex();
+  if (i < 0) {
+    if (d.open) d.close();
+    return;
+  }
+  const e = state.results[i];
   d.querySelector(".viewer-toggle").hidden = !e.thumbs;
   $("viewer-img").hidden = !e.thumbs;
-  if (e.thumbs) show("after");
+  if (e.thumbs) {
+    $("viewer-img").src = thumb(e.id, viewer.which);
+    for (const b of d.querySelectorAll("[data-which]")) b.setAttribute("aria-pressed", String(b.dataset.which === viewer.which));
+  }
+  $("viewer-caption").hidden = viewer.editing;
   $("viewer-caption").replaceChildren(...(e.caption.length ? e.caption : [outcomeLabel(e) + (e.reason ? `: ${e.reason}` : "")]).map((l) => el("div", {}, l)));
   const where = e.output ? `Saved as ${e.output}` : `Still at ${e.path} in the watched folder`;
   $("viewer-path").textContent = `${where}. Took ${ms(e.ms)}${e.downloaded ? `, downloading ${mb(e.downloaded)} of map data` : ""}.`;
-  d.showModal();
+  const more = !$("results-more").hidden;
+  $("viewer-pos").textContent = `${i + 1} of ${state.results.length}${more ? "+" : ""}`;
+  $("viewer-prev").disabled = viewer.editing || i === 0;
+  $("viewer-next").disabled = viewer.editing || (i === state.results.length - 1 && !more);
+  $("viewer-edit-btn").hidden = viewer.editing || !canEdit(e);
+  $("viewer-edit-btn").textContent = e.outcome === "stamped" ? "Edit stamp" : "Stamp by hand";
 }
+
+for (const b of $("viewer").querySelectorAll("[data-which]")) {
+  b.onclick = () => {
+    viewer.which = b.dataset.which;
+    showViewer();
+  };
+}
+
+// Move through the list: -1 is newer (left), +1 older (right), loading older results as needed.
+async function step(delta) {
+  if (viewer.editing) return;
+  let j = viewerIndex() + delta;
+  if (j >= state.results.length) {
+    try {
+      await loadOlder();
+    } catch (e) {
+      $("viewer-path").textContent = e.message;
+      return;
+    }
+  }
+  if (j < 0 || j >= state.results.length) return;
+  viewer.id = state.results[j].id;
+  showViewer();
+}
+
+$("viewer-prev").onclick = () => step(-1);
+$("viewer-next").onclick = () => step(1);
+// On the document: focus can leave the dialog (e.g. when the button pressed is hidden).
+document.addEventListener("keydown", (ev) => {
+  if (!$("viewer").open || viewer.editing || ev.altKey || ev.ctrlKey || ev.metaKey) return;
+  if (ev.key === "ArrowLeft") {
+    ev.preventDefault();
+    step(-1);
+  } else if (ev.key === "ArrowRight") {
+    ev.preventDefault();
+    step(1);
+  }
+});
+$("viewer").addEventListener("close", () => stopEditing());
+
+const MAX_LINES = 6;
+
+function editLine(text) {
+  const row = el("div", { class: "edit-line" },
+    el("input", { type: "text", value: text, maxlength: 200, "aria-label": "Caption line", spellcheck: "false",
+      placeholder: $("edit-lines").children.length ? "Another line, e.g. the date" : "Where, e.g. Grandma's garden" }),
+    el("button", { type: "button", class: "icon-btn", "aria-label": "Remove this line", title: "Remove this line" }, "\u2715"));
+  row.querySelector("button").onclick = () => {
+    if ($("edit-lines").children.length > 1) row.remove();
+    else row.querySelector("input").value = "";
+    $("edit-add").disabled = false;
+  };
+  row.querySelector("input").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      saveEdit();
+    }
+  });
+  return row;
+}
+
+function startEditing() {
+  const e = state.results[viewerIndex()];
+  if (!e) return;
+  viewer.editing = true;
+  $("edit-lines").replaceChildren();
+  for (const line of e.caption.length ? e.caption : [""]) $("edit-lines").append(editLine(line));
+  $("edit-add").disabled = $("edit-lines").children.length >= MAX_LINES;
+  $("edit-status").textContent = "";
+  $("viewer-edit").hidden = false;
+  showViewer();
+  $("edit-lines").querySelector("input").focus();
+}
+
+function stopEditing() {
+  viewer.editing = false;
+  $("viewer-edit").hidden = true;
+}
+
+async function saveEdit() {
+  const e = state.results[viewerIndex()];
+  if (!e) return;
+  const lines = [...$("edit-lines").querySelectorAll("input")].map((i) => i.value.trim()).filter(Boolean);
+  if (!lines.length) {
+    $("edit-status").textContent = "Write at least one line.";
+    return;
+  }
+  const save = $("edit-save");
+  save.disabled = true;
+  $("edit-status").textContent = "Stamping";
+  try {
+    const updated = norm(await api(svc("restamp"), { method: "POST", body: { id: e.id, lines } }));
+    thumbVersion[e.id] = Date.now();
+    const i = state.results.findIndex((x) => x.id === e.id);
+    if (i >= 0) state.results[i] = updated;
+    if (state.lastNow && state.lastNow.id === e.id) state.lastNow = updated;
+    stopEditing();
+    viewer.which = "after";
+    showViewer();
+    renderResults();
+    renderExceptions();
+    renderNow();
+  } catch (err) {
+    $("edit-status").textContent = err.message;
+  } finally {
+    save.disabled = false;
+  }
+}
+
+$("viewer-edit-btn").onclick = startEditing;
+$("edit-cancel").onclick = () => {
+  stopEditing();
+  showViewer();
+};
+$("edit-save").onclick = saveEdit;
+$("edit-add").onclick = () => {
+  const lines = $("edit-lines");
+  if (lines.children.length >= MAX_LINES) return;
+  const row = editLine("");
+  lines.append(row);
+  row.querySelector("input").focus();
+  $("edit-add").disabled = lines.children.length >= MAX_LINES;
+};
 
 // ------------------------------------------------------------------ exceptions
 
@@ -543,7 +717,14 @@ function renderExceptions() {
       el("ul", {}, list.map((e) => el("li", {},
         el("span", { class: "path" }, e.path),
         el("span", { class: "why" }, e.outcome === "failed" ? e.reason : e.output ? `In ${e.output}` : ""),
-        e.outcome === "failed" ? el("button", { class: "ghost small", onclick: (ev) => retry(e, ev.target) }, "Try again") : null))))));
+        e.outcome === "failed" ? el("button", { class: "ghost small", onclick: (ev) => retry(e, ev.target) }, "Try again")
+          : canEdit(e) ? el("button", { class: "ghost small", title: "Write the place and date yourself", onclick: () => stampByHand(e) }, "Stamp by hand") : null))))));
+}
+
+// Open a photo in the viewer with its caption ready to write.
+function stampByHand(e) {
+  openViewer(e);
+  startEditing();
 }
 
 async function retry(e, button) {
@@ -592,7 +773,6 @@ function renderHealth() {
       p.user ? ["Signed in as", `${p.user}, ${p.device}`] : null,
       p.overture_release ? ["Map data", `Overture ${p.overture_release}`] : null,
       p.places_built ? ["Place names", `Built ${p.places_built}`] : null,
-      p.history != null ? ["History", p.history ? "Kept (for trips and the map)" : "Not kept"] : null,
       p.max_wait_hours != null ? ["Wait up to", plural(p.max_wait_hours, "hour", "hours")] : null,
       ["Remembered", `${p.cached_answers.toLocaleString()} spots${asked ? `, ${Math.round((100 * p.cache_hits) / asked)}% answered here` : ""}`],
     ], null, "wide"));
@@ -733,7 +913,6 @@ function renderUpdate() {
   }
   const i = u.info;
   $("upd-current").textContent = u.current;
-  if (document.activeElement !== $("upd-channel")) $("upd-channel").value = u.channel;
   const status = {
     off: () => `Updates aren't available here: ${i.reason}.`,
     idle: () => "",
@@ -746,7 +925,6 @@ function renderUpdate() {
   }[i.state];
   $("upd-status").textContent = status ? status() : "";
   $("upd-check").disabled = i.state === "off" || i.state === "checking" || i.state === "downloading" || i.state === "installing";
-  $("upd-channel").disabled = i.state === "off";
   banner.hidden = !(i.state === "ready" || i.state === "installing");
   if (i.state === "ready") {
     $("update-text").textContent = `photo-stamp ${i.version} is ready.`;
@@ -776,15 +954,6 @@ $("upd-check").onclick = async () => {
   }
 };
 
-$("upd-channel").addEventListener("change", async (e) => {
-  try {
-    await api(svc("update/channel"), { method: "PUT", body: { channel: e.target.value } });
-    toast(e.target.value === "beta" ? "Getting every build (beta)" : "Getting releases only");
-  } catch (err) {
-    toast(err.message);
-  }
-});
-
 // ------------------------------------------------------------------ place server
 
 async function renderServer() {
@@ -804,7 +973,6 @@ async function renderServer() {
   $("srv-remove").hidden = !v.url;
   $("srv-prefs").hidden = !(p && p.user);
   if (p && p.user) {
-    $("srv-history").checked = !!p.history;
     $("srv-wait").value = p.max_wait_hours;
     $("srv-status").textContent = p.connected === false ? `Can't connect: ${p.last_error}` : `Connected as ${p.user}, ${p.device}`;
   } else if (v.url) {
@@ -843,14 +1011,122 @@ $("srv-remove").onclick = async () => {
 
 async function savePrefs() {
   try {
-    await api(svc("me"), { method: "PUT", body: { history: $("srv-history").checked, max_wait_hours: Number($("srv-wait").value) } });
+    await api(svc("me"), { method: "PUT", body: { max_wait_hours: Number($("srv-wait").value) } });
     $("srv-status").textContent = "Saved on the place server";
   } catch (err) {
     $("srv-status").textContent = err.message;
   }
 }
-$("srv-history").addEventListener("change", savePrefs);
 $("srv-wait").addEventListener("change", savePrefs);
+
+// ------------------------------------------------------------------ drag and drop
+
+// What photo-stamp can stamp (as src/formats.rs); anything else dropped is left out.
+const PHOTO_EXTENSIONS = new Set([
+  "jpg", "jpeg", "jpe", "png", "webp", "tif", "tiff", "heic", "heif", "hif", "avif",
+  "3fr", "arw", "cr2", "cr3", "crw", "dcr", "dng", "erf", "iiq", "k25", "kdc", "mef", "mos", "mrw", "nef",
+  "nrw", "orf", "pef", "raf", "raw", "rw2", "rwl", "sr2", "srf", "srw", "x3f",
+]);
+const isPhoto = (name) => name.includes(".") && PHOTO_EXTENSIONS.has(name.split(".").pop().toLowerCase());
+const draggingFiles = (ev) => !!ev.dataTransfer && [...ev.dataTransfer.types].includes("Files");
+let dragDepth = 0;
+
+function showDropZone(on) {
+  $("dropzone").hidden = !on;
+  if (on) $("dropzone-where").textContent = state.app ? `They're copied into ${state.app.root}` : "";
+}
+
+document.addEventListener("dragenter", (ev) => {
+  if (!draggingFiles(ev)) return;
+  ev.preventDefault();
+  dragDepth += 1;
+  showDropZone(true);
+});
+document.addEventListener("dragover", (ev) => {
+  if (!draggingFiles(ev)) return;
+  ev.preventDefault();
+  ev.dataTransfer.dropEffect = "copy";
+});
+document.addEventListener("dragleave", (ev) => {
+  if (!draggingFiles(ev)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) showDropZone(false);
+});
+document.addEventListener("drop", async (ev) => {
+  if (!draggingFiles(ev)) return;
+  ev.preventDefault();
+  dragDepth = 0;
+  showDropZone(false);
+  if (!state.app) {
+    toast("Photo Stamp isn't running, so photos can't be added right now.");
+    return;
+  }
+  // Entries must be taken before anything is awaited: the drop's data goes away after.
+  const entries = [...ev.dataTransfer.items].map((i) => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  const plain = [...ev.dataTransfer.files];
+  try {
+    await addPhotos(entries.length ? await filesIn(entries) : plain.map((file) => ({ file, path: file.name })));
+  } catch (e) {
+    toast(e.message);
+  }
+});
+
+// Every file in the dropped files and folders, with its path (folders kept: "trip/day 1/a.jpg").
+async function filesIn(entries) {
+  const out = [];
+  async function walk(entry, prefix) {
+    if (entry.isFile) {
+      out.push({ file: await new Promise((ok, fail) => entry.file(ok, fail)), path: prefix + entry.name });
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      for (;;) {
+        const batch = await new Promise((ok, fail) => reader.readEntries(ok, fail));
+        if (!batch.length) break;
+        for (const e of batch) await walk(e, `${prefix}${entry.name}/`);
+      }
+    }
+  }
+  for (const e of entries) await walk(e, "");
+  return out;
+}
+
+// Copy dropped photos into the watched folder, two at a time; the watcher takes it from there.
+async function addPhotos(items) {
+  const photos = items.filter((i) => isPhoto(i.path));
+  const left = items.length - photos.length;
+  if (!photos.length) {
+    toast(items.length ? "None of those are photos Photo Stamp can stamp." : "Nothing to add.");
+    return;
+  }
+  let next = 0, done = 0, failed = 0, why = "";
+  const worker = async () => {
+    while (next < photos.length) {
+      const { file, path } = photos[next++];
+      try {
+        const res = await fetch(svc(`upload?path=${encodeURIComponent(path)}`), {
+          method: "POST",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: file,
+        });
+        if (!res.ok) {
+          failed += 1;
+          why = ((await res.json().catch(() => null)) || {}).error || res.statusText;
+        }
+      } catch (e) {
+        failed += 1;
+        why = e.message;
+      }
+      done += 1;
+      if (done < photos.length) toast(`Adding photos: ${done} of ${photos.length}`);
+    }
+  };
+  toast(`Adding ${plural(photos.length, "photo", "photos")}`);
+  await Promise.all([worker(), worker()]);
+  let text = `Added ${plural(done - failed, "photo", "photos")}`;
+  if (left) text += `; ${plural(left, "other file was", "other files were")} left out`;
+  if (failed) text += `. ${failed} couldn't be added: ${why}`;
+  toast(text);
+}
 
 // ------------------------------------------------------------------ tabs and buttons
 
