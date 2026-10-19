@@ -53,9 +53,10 @@ them, and "Edit stamp" changes what's written on it.
 
 UPDATES
 
-New releases come from photo-stamp's page on GitHub. photo-stamp checks every few hours,
-downloads a newer one in the background, and the dashboard offers "Install and restart". If the
-new version doesn't start, the old one is put back automatically.
+New versions come through your place server. photo-stamp checks every few hours, downloads a
+newer one in the background, and the dashboard offers "Install and restart". If the new version
+doesn't start, the old one is put back automatically. Settings > Updates chooses releases only
+(the default) or every build.
 
 COMMANDS (from a terminal in Photo Stamp's program folder, %LOCALAPPDATA%\Programs\Photo Stamp)
 

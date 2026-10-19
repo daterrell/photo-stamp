@@ -913,6 +913,7 @@ function renderUpdate() {
   }
   const i = u.info;
   $("upd-current").textContent = u.current;
+  if (document.activeElement !== $("upd-channel")) $("upd-channel").value = u.channel;
   const status = {
     off: () => `Updates aren't available here: ${i.reason}.`,
     idle: () => "",
@@ -925,6 +926,7 @@ function renderUpdate() {
   }[i.state];
   $("upd-status").textContent = status ? status() : "";
   $("upd-check").disabled = i.state === "off" || i.state === "checking" || i.state === "downloading" || i.state === "installing";
+  $("upd-channel").disabled = i.state === "off";
   banner.hidden = !(i.state === "ready" || i.state === "installing");
   if (i.state === "ready") {
     $("update-text").textContent = `photo-stamp ${i.version} is ready.`;
@@ -953,6 +955,15 @@ $("upd-check").onclick = async () => {
     toast(e.message);
   }
 };
+
+$("upd-channel").addEventListener("change", async (e) => {
+  try {
+    await api(svc("update/channel"), { method: "PUT", body: { channel: e.target.value } });
+    toast(e.target.value === "beta" ? "Getting every build (beta)" : "Getting releases only");
+  } catch (err) {
+    toast(err.message);
+  }
+});
 
 // ------------------------------------------------------------------ place server
 

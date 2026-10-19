@@ -24,9 +24,10 @@ keep their zip as an Actions artifact for 3 days. Each CI job removes what it cr
 removes leftovers of cancelled runs and keeps the shared caches bounded (Docker build cache 20 GB, `main`'s
 cargo target 25 GB).
 
-**Updates** reach Windows installs from the [GitHub releases](https://github.com/daterrell/photo-stamp/releases):
-no place server or key is needed. A client checks the latest release every 6 hours (or with **Check now** in the
-dashboard), downloads its Windows zip, checks it against the SHA-256 GitHub records for it, and offers it: **Install and restart** finishes the photo in hand, swaps the program files (the old ones
+**Updates** reach Windows installs through the place server: it relays the builds from the package registry, so
+clients need nothing but their device key. A client checks every 6 hours (or with **Check now** in the
+dashboard), downloads a newer build on its channel (Settings > Updates: releases, or every build), checks its
+SHA-256, and offers it: **Install and restart** finishes the photo in hand, swaps the program files (the old ones
 are kept as `*.old`), and starts the new version, restarting the dashboard server too. If the new version doesn't
 come up within 90 s, the old files are put back and the old version starts again. Two minutes after a successful
 update the `.old` files and the download are removed.

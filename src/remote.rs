@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
-use photo_stamp_proto::api::{Me, MeUpdate, PlaceReply, PlaceRequest};
+use photo_stamp_proto::api::{ClientUpdate, Me, MeUpdate, PlaceReply, PlaceRequest};
 use photo_stamp_proto::places::{PlacesDb, TOWNS_FILE_NAME, locate};
 use photo_stamp_proto::{GpsPoint, Place};
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,9 @@ pub struct ClientConfig {
     pub server: Option<ServerConfig>,
     #[serde(default)]
     pub last_me: Option<Me>,
+    /// Which builds to update to: "stable" (releases) or "beta" (every build of main).
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 impl ClientConfig {
@@ -150,6 +153,76 @@ impl RemoteGeocoder {
     fn towns_path(&self) -> Option<PathBuf> {
         let downloaded = self.data.as_ref().map(|d| d.join(TOWNS_FILE_NAME)).filter(|p| p.is_file());
         downloaded.or_else(|| locate(TOWNS_FILE_NAME, "PHOTO_STAMP_TOWNS_DB"))
+    }
+
+    /// The update channel: "stable" (the default) or "beta".
+    pub fn channel(&self) -> String {
+        self.config.read().unwrap().channel.clone().unwrap_or_else(|| "stable".into())
+    }
+
+    pub fn set_channel(&self, channel: &str) {
+        self.config.write().unwrap().channel = Some(channel.to_owned());
+        self.save_config();
+    }
+
+    /// The newest build on this device's channel, if the server offers updates.
+    pub fn latest_update(&self) -> anyhow::Result<Option<ClientUpdate>> {
+        let server = self.server().context("no place server set up")?;
+        let bytes =
+            self.call(&server, "GET", &format!("/v1/client/latest?channel={}", self.channel()), None)?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    /// Download `path` from the server into `dest`, reporting progress; returns its SHA-256 (hex).
+    pub fn download(
+        &self,
+        path: &str,
+        dest: &Path,
+        progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> anyhow::Result<String> {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Write};
+        let server = self.server().context("no place server set up")?;
+        // Big and slow is fine here; stalled isn't.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_body(Some(Duration::from_secs(60)))
+            .user_agent(format!("photo-stamp/{}", photo_stamp_http::VERSION))
+            .build()
+            .into();
+        let mut resp = agent
+            .get(&format!("{}{path}", server.url))
+            .header("Authorization", &format!("Bearer {}", server.key))
+            .call()
+            .with_context(|| format!("can't reach the place server at {}", server.url))?;
+        anyhow::ensure!(
+            resp.status() == 200,
+            "the place server answered HTTP {} for the download",
+            resp.status()
+        );
+        let total =
+            resp.headers().get("content-length").and_then(|h| h.to_str().ok()).and_then(|s| s.parse().ok());
+        let mut body = resp.body_mut().with_config().limit(1 << 30).reader();
+        let mut out = std::fs::File::create(dest)?;
+        let mut hash = Sha256::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut done = 0u64;
+        loop {
+            let n = body.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n])?;
+            hash.update(&buf[..n]);
+            done += n as u64;
+            progress(done, total);
+        }
+        out.flush()?;
+        Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
     }
 
     /// Let go of the towns database file (so an update can replace it); [`Self::open_towns`]
@@ -535,8 +608,8 @@ mod tests {
             url: fake_server(Arc::new(AtomicU64::new(0))),
             key: "psk_test_key".into(),
         }));
-        // A request this server doesn't know (404): it's still up.
-        assert!(geo.call(&geo.server().unwrap(), "GET", "/v1/nothing-here", None).is_err());
+        // This server doesn't offer client updates (404): it's still up.
+        assert!(geo.latest_update().is_err());
         assert_eq!(geo.health().server.unwrap().connected, Some(true));
         assert_eq!(geo.place(GpsPoint { lat: 3.0, lon: 4.0 }).unwrap().unwrap().primary, "Somewhere");
         std::fs::remove_dir_all(&data).unwrap();

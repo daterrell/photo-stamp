@@ -140,7 +140,14 @@
 
     <section class="settings" id="updates">
       <h2>Updates</h2>
-      <p class="quiet">This is photo-stamp <span id="upd-current"></span>. New releases come from photo-stamp's page on GitHub; they're downloaded in the background and installed when you choose.</p>
+      <p class="quiet">This is photo-stamp <span id="upd-current"></span>. New versions come from the place server; they're downloaded in the background and installed when you choose.</p>
+      <label class="field">
+        <span>Get</span>
+        <select id="upd-channel">
+          <option value="stable">Releases (stable)</option>
+          <option value="beta">Every build (beta)</option>
+        </select>
+      </label>
       <div class="form-actions">
         <button class="ghost" type="button" id="upd-check">Check now</button>
         <span class="quiet" id="upd-status" role="status"></span>

@@ -25,8 +25,8 @@
 //!   `DELETE /api/server`: the place server this PC uses; `POST /api/server/test`
 //! - `PUT /api/me` `{"max_wait_hours": n}`: how long photos wait for the place server
 //! - `POST /api/update/check`; `POST /api/update/install` (installs the downloaded update: finishes
-//!   the photo in hand, then restarts as the new version). Updates come from GitHub releases; the
-//!   updater's state is in `/api/status` (`update`).
+//!   the photo in hand, then restarts as the new version); `PUT /api/update/channel`
+//!   `{"channel": "stable"|"beta"}`. The updater's state is in `/api/status` (`update`).
 
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -110,6 +110,11 @@ struct StartupBody {
 struct OpenBody {
     #[serde(default)]
     which: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChannelBody {
+    channel: String,
 }
 
 #[derive(Deserialize)]
@@ -330,6 +335,14 @@ fn safe_relative(p: &str) -> Option<PathBuf> {
     path.components().all(|c| matches!(c, Component::Normal(_))).then(|| path.to_owned())
 }
 
+/// Updates come through the place server: when it changes, check again, so the dashboard
+/// doesn't keep saying there's none set up.
+fn recheck_updates(api: &Api) {
+    if let Some(u) = api.updater.clone() {
+        std::thread::spawn(move || u.check());
+    }
+}
+
 pub fn handle(api: &Api, req: Request) -> Response {
     if let Err(why) = crate::dashboard::allowed(api.port.load(Ordering::Relaxed), &req) {
         return Response::error(403, why);
@@ -468,6 +481,7 @@ pub fn handle(api: &Api, req: Request) -> Response {
             log::info!("place server set to {url}");
             geo.set_server(Some(ServerConfig { url, key }));
             let test = geo.refresh_me();
+            recheck_updates(api);
             let mut v = server_view(geo);
             v["test"] = match test {
                 Ok(me) => json!({ "ok": true, "user": me.user, "device": me.device }),
@@ -480,6 +494,7 @@ pub fn handle(api: &Api, req: Request) -> Response {
             let Some(geo) = &api.geo else { return Response::error(404, "no place lookups here") };
             log::info!("place server removed: naming places from this PC's towns database only");
             geo.set_server(None);
+            recheck_updates(api);
             Response::json(200, &server_view(geo))
         }
         ("POST", ["api", "server", "test"]) => {
@@ -518,6 +533,20 @@ pub fn handle(api: &Api, req: Request) -> Response {
                     Response::json(200, &json!({ "version": version }))
                 }
                 Err(e) => Response::error(409, &format!("{e:#}")),
+            }
+        }
+        ("PUT", ["api", "update", "channel"]) => {
+            let Some(u) = api.updater.clone() else { return Response::error(404, "no updates here") };
+            let Ok(body) = req.json::<ChannelBody>() else {
+                return Response::error(400, "expected {\"channel\": \"stable\" or \"beta\"}");
+            };
+            match u.set_channel(&body.channel) {
+                Ok(()) => {
+                    log::info!("update channel set to {}", body.channel);
+                    std::thread::spawn(move || u.check());
+                    Response::ok()
+                }
+                Err(e) => Response::error(400, &format!("{e:#}")),
             }
         }
         ("GET", ["api", "settings"]) => Response::json(200, &api.status.settings()),

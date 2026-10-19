@@ -1,7 +1,7 @@
-//! Updating photo-stamp from its releases on GitHub (Windows installs).
+//! Updating photo-stamp from the place server (Windows installs).
 //!
-//! 1. **Check** (every 6 hours, or when asked): GitHub says what the newest release is (tagged,
-//!    not a draft or prerelease), with the SHA-256 of its Windows zip.
+//! 1. **Check** (every 6 hours, or when asked): the server says what the newest build on this
+//!    device's channel is ("stable": releases; "beta": every build of main).
 //! 2. **Download** a newer one in the background, check its SHA-256 and unpack it into
 //!    `<data>/updates/<version>/`. The dashboard then offers to install it.
 //! 3. **Install** (only when asked, from the dashboard): the watcher finishes the photo in hand and
@@ -31,108 +31,6 @@ const SETTLED_AFTER: Duration = Duration::from_secs(120);
 pub const CHECK_EVERY: Duration = Duration::from_secs(6 * 3600);
 /// The folder inside the Windows zip.
 const PACKAGE_DIR: &str = "photo-stamp-windows";
-/// The newest release, from GitHub's API. `PHOTO_STAMP_RELEASES_URL` points elsewhere (tests).
-const RELEASES_URL: &str = "https://api.github.com/repos/daterrell/photo-stamp/releases/latest";
-
-/// What GitHub says about a release (the parts used).
-#[derive(Debug, Deserialize)]
-struct Release {
-    tag_name: String,
-    #[serde(default)]
-    assets: Vec<Asset>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Asset {
-    name: String,
-    browser_download_url: String,
-    /// "sha256:<hex>".
-    #[serde(default)]
-    digest: Option<String>,
-}
-
-/// A release's Windows build: its version, where to download the zip, and the zip's SHA-256.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Offer {
-    pub version: String,
-    pub url: String,
-    pub sha256: String,
-}
-
-impl Release {
-    fn offer(self) -> anyhow::Result<Offer> {
-        let version = self.tag_name.trim_start_matches('v').to_owned();
-        let zip = self
-            .assets
-            .into_iter()
-            .find(|a| a.name.starts_with("photo-stamp-windows-") && a.name.ends_with(".zip"))
-            .with_context(|| format!("release {} has no Windows zip", self.tag_name))?;
-        let sha256 = zip
-            .digest
-            .as_deref()
-            .and_then(|d| d.strip_prefix("sha256:"))
-            .with_context(|| format!("release {} doesn't say the checksum of its zip", self.tag_name))?
-            .to_owned();
-        Ok(Offer { version, url: zip.browser_download_url, sha256 })
-    }
-}
-
-fn agent(recv_timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .timeout_recv_body(Some(recv_timeout))
-        .user_agent(format!("photo-stamp/{}", photo_stamp_http::VERSION))
-        .build()
-        .into()
-}
-
-/// The newest release's Windows build (`None`: nothing released yet).
-pub fn latest_release() -> anyhow::Result<Option<Offer>> {
-    let url = std::env::var("PHOTO_STAMP_RELEASES_URL").unwrap_or_else(|_| RELEASES_URL.to_owned());
-    let mut resp = agent(Duration::from_secs(30))
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .call()
-        .context("can't reach GitHub to check for updates")?;
-    match resp.status().as_u16() {
-        200 => {}
-        404 => return Ok(None),
-        403 | 429 => bail!("GitHub is limiting update checks right now; it'll be tried again later"),
-        status => bail!("GitHub answered HTTP {status} when checking for updates"),
-    }
-    let release: Release = serde_json::from_slice(&resp.body_mut().read_to_vec()?)
-        .context("GitHub's answer about the latest release didn't make sense")?;
-    release.offer().map(Some)
-}
-
-/// Download `url` into `dest`, reporting progress; returns its SHA-256 (hex).
-fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(u64, Option<u64>)) -> anyhow::Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::{Read, Write};
-    // Big and slow is fine here; stalled isn't.
-    let mut resp = agent(Duration::from_secs(60)).get(url).call().context("can't download the update")?;
-    anyhow::ensure!(resp.status() == 200, "the download answered HTTP {}", resp.status());
-    let total =
-        resp.headers().get("content-length").and_then(|h| h.to_str().ok()).and_then(|s| s.parse().ok());
-    let mut body = resp.body_mut().with_config().limit(1 << 30).reader();
-    let mut out = std::fs::File::create(dest)?;
-    let mut hash = Sha256::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut done = 0u64;
-    loop {
-        let n = body.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        out.write_all(&buf[..n])?;
-        hash.update(&buf[..n]);
-        done += n as u64;
-        progress(done, total);
-    }
-    out.flush()?;
-    Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
-}
 
 /// What the updater is doing, for the dashboard.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -318,22 +216,39 @@ impl Updater {
     fn publish(&self) {
         let state = match &self.unsupported {
             Some(r) => State::Off { reason: r.clone() },
+            None if self.geo.server().is_none() => State::Off { reason: "no place server set up".into() },
             None => self.state.lock().unwrap().clone(),
         };
-        self.status.set_update(json!({ "current": photo_stamp_http::VERSION, "info": state }));
+        self.status.set_update(json!({
+            "current": photo_stamp_http::VERSION,
+            "channel": self.geo.channel(),
+            "info": state,
+        }));
     }
 
     pub fn state(&self) -> State {
         self.state.lock().unwrap().clone()
     }
 
+    pub fn set_channel(&self, channel: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(matches!(channel, "stable" | "beta"), "the channel is stable or beta");
+        self.geo.set_channel(channel);
+        // What was downloaded may not be on the new channel.
+        if matches!(self.state(), State::Ready { .. }) {
+            self.set(State::Idle);
+        } else {
+            self.publish();
+        }
+        Ok(())
+    }
+
     fn manifest_path(&self) -> PathBuf {
         self.dir.join("install.json")
     }
 
-    /// Ask GitHub; download and unpack a newer release. Returns the state after.
+    /// Ask the server; download and unpack a newer build. Returns the state after.
     pub fn check(&self) -> State {
-        if self.unsupported.is_some() {
+        if self.unsupported.is_some() || self.geo.server().is_none() {
             self.publish();
             return self.state();
         }
@@ -344,11 +259,11 @@ impl Updater {
         self.set(State::Checking);
         let result = (|| -> anyhow::Result<State> {
             let current = Version::parse(photo_stamp_http::VERSION).context("this build has no version")?;
-            let Some(update) = latest_release()? else {
+            let Some(update) = self.geo.latest_update()? else {
                 return Ok(State::UpToDate { checked: now_ms() });
             };
-            let newest = Version::parse(&update.version)
-                .with_context(|| format!("the latest release ({}) isn't a version", update.version))?;
+            let newest =
+                Version::parse(&update.version).context("the server offered a build with no version")?;
             if newest <= current {
                 return Ok(State::UpToDate { checked: now_ms() });
             }
@@ -368,11 +283,11 @@ impl Updater {
                     }
                 }
             }
-            log::info!("downloading photo-stamp {}", update.version);
+            log::info!("downloading photo-stamp {} ({} channel)", update.version, self.geo.channel());
             let zip = self.dir.join(format!("{}.zip", update.version));
             let version = update.version.clone();
             let mut last = 0u64;
-            let sha = download(&update.url, &zip, &mut |done, total| {
+            let sha = self.geo.download(&update.path, &zip, &mut |done, total| {
                 // Tell the dashboard every few MB.
                 if done - last >= 4 << 20 || Some(done) == total {
                     last = done;
@@ -497,30 +412,6 @@ mod tests {
     fn write(p: &Path, text: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, text).unwrap();
-    }
-
-    #[test]
-    fn reads_a_github_release() {
-        let release: Release = serde_json::from_str(
-            r#"{"tag_name": "v0.8.0", "prerelease": false, "assets": [
-                {"name": "photo-stamp-setup-v0.8.0.exe", "browser_download_url": "https://x/setup.exe",
-                 "digest": "sha256:dd78"},
-                {"name": "photo-stamp-windows-v0.8.0.zip", "browser_download_url": "https://x/w.zip",
-                 "digest": "sha256:224c"}]}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            release.offer().unwrap(),
-            Offer { version: "0.8.0".into(), url: "https://x/w.zip".into(), sha256: "224c".into() }
-        );
-        let unchecked: Release = serde_json::from_str(
-            r#"{"tag_name": "v0.9.0", "assets": [{"name": "photo-stamp-windows-v0.9.0.zip",
-                "browser_download_url": "https://x/w.zip"}]}"#,
-        )
-        .unwrap();
-        assert!(unchecked.offer().unwrap_err().to_string().contains("checksum"));
-        let no_zip: Release = serde_json::from_str(r#"{"tag_name": "v1.0.0"}"#).unwrap();
-        assert!(no_zip.offer().is_err());
     }
 
     #[test]
