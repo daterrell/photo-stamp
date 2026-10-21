@@ -5,8 +5,10 @@
 //! - `POST /v1/places` [`BatchRequest`] → [`BatchReply`] (up to [`MAX_BATCH`] points)
 //! - `GET  /v1/me` → [`Me`]; `PUT /v1/me` [`MeUpdate`] → [`Me`]
 //! - `GET  /v1/towns.sqlite`: the small towns database clients keep for previews and fallbacks
-//! - `GET  /v1/client/latest?channel=stable|beta` → [`ClientUpdate`] (204: none published)
-//! - `GET  /v1/client/download/<version>`: that build's Windows zip
+//! - `GET  /v1/client/latest?channel=stable|beta[&app=screensaver]` → [`ClientUpdate`] (204: none
+//!   published). Without `app`, photo-stamp's builds.
+//! - `GET  /v1/client/download/<version>[?app=screensaver]`: that build's Windows zip (the
+//!   screensaver's: its `.scr`); [`ClientUpdate::path`] has the whole path
 //! - `GET  /healthz` (no key): `ok`
 
 use serde::{Deserialize, Serialize};
